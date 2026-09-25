@@ -1,6 +1,7 @@
 package kapps_test
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/klever-io/klever-go/common"
@@ -165,6 +166,104 @@ func TestKDAData_GetTransferRoyaltyByAmount(t *testing.T) {
 				assert.NoError(t, err)
 				assert.Equal(t, tt.expectedRoyalty, result)
 			}
+		})
+	}
+}
+
+func TestKDAData_IsOwnerOrAdmin(t *testing.T) {
+	owner := bytes.Repeat([]byte{1}, 32)
+	admin := bytes.Repeat([]byte{2}, 32)
+	other := bytes.Repeat([]byte{3}, 32)
+
+	tests := []struct {
+		name                 string
+		ownerAddress         []byte
+		adminAddress         []byte
+		address              []byte
+		expectedOwner        bool
+		expectedOwnerOrAdmin bool
+	}{
+		{name: "owner", ownerAddress: owner, adminAddress: admin, address: owner, expectedOwner: true, expectedOwnerOrAdmin: true},
+		{name: "admin", ownerAddress: owner, adminAddress: admin, address: admin, expectedOwner: false, expectedOwnerOrAdmin: true},
+		{name: "other address", ownerAddress: owner, adminAddress: admin, address: other, expectedOwner: false, expectedOwnerOrAdmin: false},
+		{name: "nil address with unset admin", ownerAddress: owner, adminAddress: nil, address: nil, expectedOwner: false, expectedOwnerOrAdmin: false},
+		{name: "empty address with unset admin", ownerAddress: owner, adminAddress: nil, address: []byte{}, expectedOwner: false, expectedOwnerOrAdmin: false},
+		{name: "nil address with unset owner and admin", ownerAddress: nil, adminAddress: nil, address: nil, expectedOwner: false, expectedOwnerOrAdmin: false},
+		{name: "empty address with empty owner and admin", ownerAddress: []byte{}, adminAddress: []byte{}, address: []byte{}, expectedOwner: false, expectedOwnerOrAdmin: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kda := &kapps.KDAData{
+				OwnerAddress: tt.ownerAddress,
+				AdminAddress: tt.adminAddress,
+			}
+
+			assert.Equal(t, tt.expectedOwner, kda.IsOwner(tt.address))
+			assert.Equal(t, tt.expectedOwnerOrAdmin, kda.IsOwnerOrAdmin(tt.address))
+		})
+	}
+}
+
+func TestKDAData_GetRoleByAddress(t *testing.T) {
+	owner := bytes.Repeat([]byte{1}, 32)
+	admin := bytes.Repeat([]byte{2}, 32)
+	holder := bytes.Repeat([]byte{3}, 32)
+	holderRole := &kapps.RolesData{Address: holder, HasRoleTransfer: true}
+
+	tests := []struct {
+		name          string
+		ownerAddress  []byte
+		adminAddress  []byte
+		address       []byte
+		expectedRole  *kapps.RolesData
+		expectedError error
+	}{
+		{
+			name:         "owner has every role",
+			ownerAddress: owner,
+			adminAddress: admin,
+			address:      owner,
+			expectedRole: &kapps.RolesData{Address: owner, HasRoleMint: true, HasRoleSetITOPrices: true, HasRoleDeposit: true, HasRoleTransfer: true},
+		},
+		{
+			name:         "admin has every role",
+			ownerAddress: owner,
+			adminAddress: admin,
+			address:      admin,
+			expectedRole: &kapps.RolesData{Address: admin, HasRoleMint: true, HasRoleSetITOPrices: true, HasRoleDeposit: true, HasRoleTransfer: true},
+		},
+		{
+			name:         "role holder gets its role",
+			ownerAddress: owner,
+			address:      holder,
+			expectedRole: holderRole,
+		},
+		{
+			name:          "nil address has no role when admin is unset",
+			ownerAddress:  owner,
+			address:       nil,
+			expectedError: common.ErrRoleNotFound,
+		},
+		{
+			name:          "empty address has no role when owner and admin are unset",
+			address:       []byte{},
+			expectedError: common.ErrRoleNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kda := &kapps.KDAData{
+				OwnerAddress: tt.ownerAddress,
+				AdminAddress: tt.adminAddress,
+				Roles:        []*kapps.RolesData{holderRole},
+			}
+
+			role, err := kda.GetRoleByAddress(tt.address)
+
+			assert.Equal(t, tt.expectedError, err)
+			assert.Equal(t, tt.expectedRole, role)
 		})
 	}
 }

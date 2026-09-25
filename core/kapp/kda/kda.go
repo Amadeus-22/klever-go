@@ -259,7 +259,7 @@ func (k *kdaKapp) Burn(sender []byte, tc *transaction.AssetTriggerContract) (tra
 	}
 
 	if tc.GetTriggerType() == transaction.AssetTriggerContract_Wipe {
-		if !bytes.Equal(kda.OwnerAddress, sender) && !bytes.Equal(kda.AdminAddress, sender) {
+		if !kda.IsOwnerOrAdmin(sender) {
 			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 			return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 		}

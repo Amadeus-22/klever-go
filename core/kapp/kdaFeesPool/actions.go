@@ -38,7 +38,7 @@ func (v *kdaFeesPoolKApp) UpdatePool(poolID []byte, assetOwner []byte, sender []
 	}
 
 	if pool == nil {
-		if !bytes.Equal(assetOwner, sender) {
+		if !kapps.MatchesAddress(assetOwner, sender) {
 			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 			return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 		}
@@ -50,7 +50,7 @@ func (v *kdaFeesPoolKApp) UpdatePool(poolID []byte, assetOwner []byte, sender []
 		}
 	}
 
-	if !bytes.Equal(sender, pool.AdminAddress) && !bytes.Equal(sender, assetOwner) {
+	if !kapps.MatchesAddress(pool.AdminAddress, sender) && !kapps.MatchesAddress(assetOwner, sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -126,7 +126,7 @@ func (v *kdaFeesPoolKApp) ChangePoolOwner(assetID []byte, sender []byte, newOwne
 		return transaction.Transaction_KAPPError, err
 	}
 
-	if !bytes.Equal(sender, pool.OwnerAddress) {
+	if !kapps.MatchesAddress(pool.OwnerAddress, sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -214,7 +214,7 @@ func (v *kdaFeesPoolKApp) Deposit(sender []byte, tc *transaction.DepositContract
 		return transaction.Transaction_AmountInvalid, common.ErrAssetPoolAmountError
 	}
 
-	isPoolOwnerOrAdmin := bytes.Equal(sender, pool.AdminAddress) || bytes.Equal(sender, pool.OwnerAddress)
+	isPoolOwnerOrAdmin := kapps.MatchesAddress(pool.AdminAddress, sender) || kapps.MatchesAddress(pool.OwnerAddress, sender)
 
 	if !isPoolOwnerOrAdmin {
 		if !v.forkController.EnableSmartContracts() {
@@ -345,7 +345,7 @@ func (v *kdaFeesPoolKApp) Withdraw(sender []byte, tc *transaction.WithdrawContra
 	}
 
 	// check if addressTo is allowed to withdraw
-	if !bytes.Equal(sender, pool.AdminAddress) && !bytes.Equal(sender, pool.OwnerAddress) {
+	if !kapps.MatchesAddress(pool.AdminAddress, sender) && !kapps.MatchesAddress(pool.OwnerAddress, sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAssetPoolInvalidAddress.Error())
 		return transaction.Transaction_KAPPError, common.ErrAssetPoolInvalidAddress
 	}

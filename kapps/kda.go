@@ -39,9 +39,21 @@ func (kda *KDAData) IsTransferAllowed(sender []byte, destination []byte) bool {
 	return false
 }
 
+func MatchesAddress(expected []byte, address []byte) bool {
+	return len(address) > 0 && bytes.Equal(expected, address)
+}
+
+func (kda *KDAData) IsOwner(address []byte) bool {
+	return MatchesAddress(kda.OwnerAddress, address)
+}
+
+func (kda *KDAData) IsOwnerOrAdmin(address []byte) bool {
+	return kda.IsOwner(address) || MatchesAddress(kda.AdminAddress, address)
+}
+
 // GetRoleByAddress return the role of the given address into the kda or error if doesnt exist
 func (kda *KDAData) GetRoleByAddress(address []byte) (*RolesData, error) {
-	if bytes.Equal(kda.OwnerAddress, address) || bytes.Equal(kda.AdminAddress, address) {
+	if kda.IsOwnerOrAdmin(address) {
 		return &RolesData{
 			Address:             address,
 			HasRoleMint:         true,

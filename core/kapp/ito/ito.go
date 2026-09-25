@@ -622,7 +622,7 @@ func (i *itoKapp) Config(sender []byte, tc *transaction.ConfigITOContract) (tran
 		return transaction.Transaction_AssetTypeInvalid, common.ErrInvalidValue
 	}
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1213,7 +1213,7 @@ func (i *itoKapp) SetITOPrices(triggerContract *transaction.ITOTriggerContract, 
 func (i *itoKapp) UpdateStatus(triggerContract *transaction.ITOTriggerContract, kdaKapp state.KAppAccountHandler, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1266,7 +1266,7 @@ func (i *itoKapp) UpdateStatus(triggerContract *transaction.ITOTriggerContract, 
 func (i *itoKapp) UpdateReceiverAddress(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1284,7 +1284,7 @@ func (i *itoKapp) UpdateReceiverAddress(triggerContract *transaction.ITOTriggerC
 func (i *itoKapp) UpdateMaxAmount(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1307,7 +1307,7 @@ func (i *itoKapp) UpdateMaxAmount(triggerContract *transaction.ITOTriggerContrac
 func (i *itoKapp) UpdateDefaultLimitPerAddress(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1325,7 +1325,7 @@ func (i *itoKapp) UpdateDefaultLimitPerAddress(triggerContract *transaction.ITOT
 func (i *itoKapp) UpdateTimes(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1346,7 +1346,7 @@ func (i *itoKapp) UpdateTimes(triggerContract *transaction.ITOTriggerContract, i
 func (i *itoKapp) AddToWhitelist(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte, whitelistData map[string]*kapps.WhitelistData) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1391,7 +1391,7 @@ func (i *itoKapp) AddToWhitelist(triggerContract *transaction.ITOTriggerContract
 func (i *itoKapp) RemoveFromWhitelist(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte, whitelistData map[string]*kapps.WhitelistData) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1436,7 +1436,7 @@ func (i *itoKapp) RemoveFromWhitelist(triggerContract *transaction.ITOTriggerCon
 func (i *itoKapp) UpdateWhitelistTimes(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1457,7 +1457,7 @@ func (i *itoKapp) UpdateWhitelistTimes(triggerContract *transaction.ITOTriggerCo
 func (i *itoKapp) UpdateWhitelistStatus(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
