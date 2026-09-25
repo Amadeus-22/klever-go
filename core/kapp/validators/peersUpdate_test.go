@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"strings"
 	"testing"
 
@@ -1144,6 +1145,227 @@ func TestUpdateValidatorInfoOnSuccessfulBlock(t *testing.T) {
 
 		err := v.UpdateValidatorInfoOnSuccessfulBlock(validatorList, signingBitmap, accumulatedFees)
 		assert.Equal(t, common.ErrNilTrie, err)
+	})
+}
+
+func TestUpdateValidatorInfoOnSuccessfulBlock_FeeSplit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		leaderPercent   uint64
+		accumulatedFees int64
+		leaderFees      int64
+		validatorFees   int64
+	}{
+		{"30% leader gets the exact floor the float split lost", 3000, 90, 27, 63},
+		{"60% leader default", 6000, 508001, 304801, 203200},
+		{"leader percent above 100% is clamped to 100%", 12000, 90, 90, 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			v, validatorList := setupFeeSplitKApp(t, tc.leaderPercent, 2)
+
+			err := v.UpdateValidatorInfoOnSuccessfulBlock(validatorList, []byte{0b00000011}, tc.accumulatedFees)
+			require.NoError(t, err)
+
+			leaderFees, validatorFees := feeSplitAccumulatedFees(t, v, validatorList)
+			assert.Equal(t, tc.leaderFees, leaderFees)
+			assert.Equal(t, tc.validatorFees, validatorFees)
+		})
+	}
+
+	t.Run("non-signers get nothing and the signers share the rest", func(t *testing.T) {
+		t.Parallel()
+
+		v, validatorList := setupFeeSplitKApp(t, 6000, 5)
+		accumulatedFees := int64(1001)
+
+		// leader and validators 1, 3 and 4 signed; validator 2 did not
+		err := v.UpdateValidatorInfoOnSuccessfulBlock(validatorList, []byte{0b00011011}, accumulatedFees)
+		require.NoError(t, err)
+
+		fees := make([]int64, len(validatorList))
+		for i := range validatorList {
+			acc, err := v.accountsCacher.GetExistingPeer(validatorList[i].PubKey())
+			require.NoError(t, err)
+			fees[i] = acc.GetAccumulatedFees()
+		}
+
+		// 40% of 1001 = 400.4 -> 400, over 3 signers = 133 each, leader keeps 1001 - 399
+		assert.Equal(t, []int64{602, 133, 0, 133, 133}, fees)
+
+		total := int64(0)
+		for _, f := range fees {
+			total += f
+		}
+		assert.Equal(t, accumulatedFees, total)
+	})
+}
+
+// setupFeeSplitKApp returns a validators kApp with numPeers peers loaded (the first is the leader),
+// the given LeaderValidatorRewardsPercentage and a rater that leaves ratings unchanged
+func setupFeeSplitKApp(t *testing.T, leaderPercent uint64, numPeers int) (*validatorsKApp, []sharding.Validator) {
+	v := setupValidatorsKApp(t)
+	addFunctionalCacher(t, v)
+	v.KAppController = &stub.KAppControllerStub{
+		GetProposalControllerCalled: func() kapps.ActiveProposalController {
+			return &mock.ProposalControllerStub{
+				GetParameterUintCalled: func(param kapps.EnumParameter) uint64 {
+					if param == kapps.EnumParameter_LeaderValidatorRewardsPercentage {
+						return leaderPercent
+					}
+					return 0
+				},
+			}
+		},
+	}
+	v.rater = &mock.RaterMock{
+		ComputeIncreaseProposerCalled:  func(previous uint32) uint32 { return previous },
+		ComputeIncreaseValidatorCalled: func(previous uint32) uint32 { return previous },
+	}
+
+	validatorList := make([]sharding.Validator, numPeers)
+	for i := range validatorList {
+		pk := []byte(fmt.Sprintf("validator%d", i))
+		validatorList[i] = &mock.ValidatorMock{PubKeyCalled: func() []byte { return pk }}
+		_, err := v.accountsCacher.LoadPeer(pk)
+		require.NoError(t, err)
+	}
+
+	return v, validatorList
+}
+
+// feeSplitAccumulatedFees returns the accumulated fees of the leader and of the validator
+func feeSplitAccumulatedFees(t *testing.T, v *validatorsKApp, validatorList []sharding.Validator) (int64, int64) {
+	leaderAcc, err := v.accountsCacher.GetExistingPeer(validatorList[0].PubKey())
+	require.NoError(t, err)
+	validatorAcc, err := v.accountsCacher.GetExistingPeer(validatorList[1].PubKey())
+	require.NoError(t, err)
+
+	return leaderAcc.GetAccumulatedFees(), validatorAcc.GetAccumulatedFees()
+}
+
+// ratFloorValidatorFees is floor(fees * validatorPercent / (HundredPercent * numValidators)) computed
+// with big.Rat, independently of the integer formula splitAccumulatedFees uses
+func ratFloorValidatorFees(accumulatedFees int64, validatorPercent uint32, numValidators int64) int64 {
+	share := new(big.Rat).SetFrac(
+		new(big.Int).Mul(big.NewInt(accumulatedFees), big.NewInt(int64(validatorPercent))),
+		big.NewInt(int64(core.HundredPercent)*numValidators),
+	)
+	return new(big.Int).Quo(share.Num(), share.Denom()).Int64()
+}
+
+// legacyFloatValidatorFees is the float64 split splitAccumulatedFees replaced
+func legacyFloatValidatorFees(accumulatedFees int64, validatorPercent uint32, numValidators int64) int64 {
+	parsedValidatorPercent := float64(validatorPercent) / float64(core.HundredPercent)
+	return int64(float64(accumulatedFees) * parsedValidatorPercent / float64(numValidators))
+}
+
+func TestSplitAccumulatedFees(t *testing.T) {
+	t.Parallel()
+
+	t.Run("matches hand-computed splits", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			fees, leaderPercent, numValidators, leader, validator int64
+		}{
+			{90, 3000, 1, 27, 63},       // 63 exactly
+			{100, 6000, 3, 61, 13},      // 40 / 3 = 13.33
+			{9999, 6666, 2, 6667, 1666}, // 3333.67 -> 3333, / 2 = 1666.5
+			{1, 0, 1, 0, 1},             // leader takes nothing
+			{20000, 10000, 4, 20000, 0}, // leader takes everything
+		}
+		for _, tc := range tests {
+			validatorPercent := core.HundredPercent - uint32(tc.leaderPercent)
+			leader, validator, err := splitAccumulatedFees(tc.fees, validatorPercent, tc.numValidators)
+			require.NoError(t, err)
+			assert.Equal(t, tc.leader, leader, "fees=%d leader%%=%d validators=%d", tc.fees, tc.leaderPercent, tc.numValidators)
+			assert.Equal(t, tc.validator, validator, "fees=%d leader%%=%d validators=%d", tc.fees, tc.leaderPercent, tc.numValidators)
+		}
+	})
+
+	t.Run("matches the exact rational floor and conserves the total", func(t *testing.T) {
+		t.Parallel()
+
+		for _, leaderPercent := range []uint32{0, 3000, 6000, 6666, 7000, 10000} {
+			validatorPercent := core.HundredPercent - leaderPercent
+			for numValidators := int64(1); numValidators <= 5; numValidators++ {
+				for fees := int64(0); fees <= 20000; fees++ {
+					leader, validator, err := splitAccumulatedFees(fees, validatorPercent, numValidators)
+					require.NoError(t, err)
+
+					exact := ratFloorValidatorFees(fees, validatorPercent, numValidators)
+					require.Equal(t, exact, validator, "fees=%d leader%%=%d validators=%d", fees, leaderPercent, numValidators)
+					require.Equal(t, fees, leader+validator*numValidators)
+				}
+			}
+		}
+	})
+
+	// The split is not fork-gated, so replaying history must give the same result as the float
+	// split it replaced. LeaderValidatorRewardsPercentage has only ever been the 6000 genesis
+	// default on mainnet and testnet, and a missing parameter reads as 0.
+	t.Run("matches the legacy float split at the percentages the networks have used", func(t *testing.T) {
+		t.Parallel()
+
+		for _, leaderPercent := range []uint32{6000, 0} {
+			validatorPercent := core.HundredPercent - leaderPercent
+			for numValidators := int64(1); numValidators <= 100; numValidators++ {
+				for fees := int64(0); fees <= 20000; fees++ {
+					_, validator, err := splitAccumulatedFees(fees, validatorPercent, numValidators)
+					require.NoError(t, err)
+					require.Equal(t, legacyFloatValidatorFees(fees, validatorPercent, numValidators), validator,
+						"fees=%d leader%%=%d validators=%d", fees, leaderPercent, numValidators)
+				}
+
+				// worst case for the float split: fees whose exact share sits 1/b below an integer,
+				// where share = fees*a/b in lowest terms, up to 10^15 units (10^9 KLV) in one block
+				numerator := big.NewInt(int64(validatorPercent))
+				denominator := big.NewInt(int64(core.HundredPercent) * numValidators)
+				gcd := new(big.Int).GCD(nil, nil, numerator, denominator)
+				a := new(big.Int).Quo(numerator, gcd).Int64()
+				b := new(big.Int).Quo(denominator, gcd).Int64()
+				if b == 1 {
+					continue
+				}
+				inverse := new(big.Int).ModInverse(big.NewInt(a%b), big.NewInt(b)).Int64()
+				residue := (b - inverse) % b
+				for scale := int64(1_000_000); scale <= 1_000_000_000_000_000; scale *= 10 {
+					fees := scale/b*b + residue
+					_, validator, err := splitAccumulatedFees(fees, validatorPercent, numValidators)
+					require.NoError(t, err)
+					require.Equal(t, legacyFloatValidatorFees(fees, validatorPercent, numValidators), validator,
+						"fees=%d leader%%=%d validators=%d", fees, leaderPercent, numValidators)
+				}
+			}
+		}
+	})
+
+	t.Run("fixes the float truncation at a 30% leader", func(t *testing.T) {
+		t.Parallel()
+
+		leader, validator, err := splitAccumulatedFees(90, 7000, 1)
+		require.NoError(t, err)
+		assert.Equal(t, int64(62), legacyFloatValidatorFees(90, 7000, 1))
+		assert.Equal(t, int64(63), validator)
+		assert.Equal(t, int64(27), leader)
+	})
+
+	t.Run("does not overflow on huge fees", func(t *testing.T) {
+		t.Parallel()
+
+		leader, validator, err := splitAccumulatedFees(math.MaxInt64, 7000, 3)
+		require.NoError(t, err)
+
+		expected := new(big.Int).Mul(big.NewInt(math.MaxInt64), big.NewInt(7000))
+		expected.Quo(expected, big.NewInt(30000))
+		assert.Equal(t, expected.Int64(), validator)
+		assert.Equal(t, int64(math.MaxInt64), leader+validator*3)
 	})
 }
 

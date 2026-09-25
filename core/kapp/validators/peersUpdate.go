@@ -756,12 +756,17 @@ func (v *validatorsKApp) UpdateValidatorInfoOnSuccessfulBlock(
 	leaderAccumulatedFees := accumulatedFees
 	validatorAccumulatedFees := int64(0)
 	if totalSigned > 1 {
-		validatorPercent := core.HundredPercent - tools.SafeU64ToU32(
+		// the proposal caps the parameter at HundredPercent; clamp on read so the subtraction can't underflow
+		leaderPercent := min(
 			v.KAppController.GetProposalController().GetParameterUint(kapps.EnumParameter_LeaderValidatorRewardsPercentage),
+			uint64(core.HundredPercent),
 		)
-		ParsedValidatorPercent := float64(validatorPercent) / float64(core.HundredPercent)
-		validatorAccumulatedFees = int64(float64(accumulatedFees) * ParsedValidatorPercent / float64(totalSigned-1))
-		leaderAccumulatedFees = accumulatedFees - int64(validatorAccumulatedFees*(int64(totalSigned)-1))
+		leaderAccumulatedFees, validatorAccumulatedFees, err = splitAccumulatedFees(
+			accumulatedFees, core.HundredPercent-uint32(leaderPercent), int64(totalSigned)-1, // #nosec G115
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	for i := 0; i < len(validatorList); i++ {
@@ -801,4 +806,21 @@ func (v *validatorsKApp) UpdateValidatorInfoOnSuccessfulBlock(
 	}
 
 	return v.accountsCacher.SaveAll()
+}
+
+// splitAccumulatedFees splits the accumulated fees between the leader and the signing validators
+// with exact integer arithmetic. The leader receives the remainder, so
+// leaderFees + validatorFees*numValidators == accumulatedFees
+func splitAccumulatedFees(
+	accumulatedFees int64,
+	validatorPercent uint32,
+	numValidators int64,
+) (leaderFees int64, validatorFees int64, err error) {
+	share, err := tools.ComputePercentageI64(accumulatedFees, int64(validatorPercent), true)
+	if err != nil {
+		return 0, 0, err
+	}
+	validatorFees = share / numValidators
+
+	return accumulatedFees - validatorFees*numValidators, validatorFees, nil
 }
