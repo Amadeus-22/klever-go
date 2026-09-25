@@ -13,6 +13,7 @@ import (
 	"github.com/klever-io/klever-go/tools/check"
 	"github.com/klever-io/klever-go/tools/debug/antiflood"
 	"github.com/klever-io/klever-go/tools/marshal"
+	libp2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
 )
 
 type networkComponentsFactory struct {
@@ -22,6 +23,7 @@ type networkComponentsFactory struct {
 	listenAddress string
 	marshalizer   marshal.Marshalizer
 	syncer        p2p.SyncTimer
+	p2pPrivateKey libp2pCrypto.PrivKey
 }
 
 // NewNetworkComponentsFactory returns a new instance of a network components factory
@@ -30,12 +32,16 @@ func NewNetworkComponentsFactory(
 	statusHandler core.AppStatusHandler,
 	marshalizer marshal.Marshalizer,
 	syncer p2p.SyncTimer,
+	p2pPrivateKey libp2pCrypto.PrivKey,
 ) (*networkComponentsFactory, error) {
 	if check.IfNil(statusHandler) {
 		return nil, common.ErrNilStatusHandler
 	}
 	if check.IfNil(marshalizer) {
 		return nil, fmt.Errorf("%w in NewNetworkComponentsFactory", common.ErrNilMarshalizer)
+	}
+	if check.IfNilReflect(p2pPrivateKey) {
+		return nil, fmt.Errorf("%w in NewNetworkComponentsFactory", p2p.ErrNilP2pPrivateKey)
 	}
 
 	return &networkComponentsFactory{
@@ -45,6 +51,7 @@ func NewNetworkComponentsFactory(
 		statusHandler: statusHandler,
 		listenAddress: libp2p.ListenAddrWithIp4AndTcp,
 		syncer:        syncer,
+		p2pPrivateKey: p2pPrivateKey,
 	}, nil
 }
 
@@ -55,6 +62,7 @@ func (ncf *networkComponentsFactory) Create() (*NetworkComponents, error) {
 		ListenAddress: ncf.listenAddress,
 		P2pConfig:     ncf.p2pConfig,
 		SyncTimer:     ncf.syncer,
+		P2pPrivateKey: ncf.p2pPrivateKey,
 	}
 
 	netMessenger, err := libp2p.NewNetworkMessenger(arg)

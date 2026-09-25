@@ -48,6 +48,7 @@ import (
 	"github.com/klever-io/klever-go/health"
 	"github.com/klever-io/klever-go/indexer"
 	indexerFactory "github.com/klever-io/klever-go/indexer/factory"
+	"github.com/klever-io/klever-go/network/p2p/libp2p/p2pkey"
 	"github.com/klever-io/klever-go/ntp"
 	"github.com/klever-io/klever-go/sharding"
 	storageFactory "github.com/klever-io/klever-go/storage/factory"
@@ -191,10 +192,6 @@ func startNode(ctx *cli.Context, log logger.Logger, version string) error {
 
 	if ctx.IsSet(port.Name) {
 		cfg.P2P.Node.Port = ctx.GlobalString(port.Name)
-	}
-
-	if ctx.IsSet(p2pSeed.Name) {
-		cfg.P2P.Node.Seed = ctx.GlobalString(p2pSeed.Name)
 	}
 
 	if !check.IfNil(fileLogging) {
@@ -394,12 +391,27 @@ func startNode(ctx *cli.Context, log logger.Logger, version string) error {
 		return fmt.Errorf("%w: not able to init slot manager", err)
 	}
 
+	p2pKeyFile := p2pKeyFileToLoad(
+		ctx.GlobalString(p2pKeyPemFile.Name),
+		ctx.IsSet(p2pKeyPemFile.Name),
+		cfg.Preferences.RedundancyLevel,
+	)
+	p2pPrivateKey, p2pKeyFromFile, err := p2pkey.LoadOrGenerate(p2pKeyFile)
+	if err != nil {
+		return err
+	}
+	if p2pKeyFromFile && cfg.Preferences.RedundancyLevel > 0 {
+		log.Warn("backup node is using a p2p key file: it must not be a copy of the main machine's key",
+			"file", p2pKeyFile, "redundancy level", cfg.Preferences.RedundancyLevel)
+	}
+
 	log.Trace("creating network components")
 	networkComponentFactory, err := factory.NewNetworkComponentsFactory(
 		cfg,
 		statusHandlersInfo.StatusHandler,
 		internalMarshalizer,
 		syncer,
+		p2pPrivateKey,
 	)
 	if err != nil {
 		return err

@@ -150,11 +150,15 @@ VERSION:
 		Value: facade.DefaultRestInterface,
 	}
 
-	// p2pSeed defines a flag to be used as a seed when generating P2P credentials. Useful for seed nodes.
-	p2pSeed = cli.StringFlag{
-		Name:  "p2p-seed",
-		Usage: "P2P seed will be used when generating credentials for p2p component. Can be any string.",
-		Value: "",
+	// p2pKeyPemFile defines a flag for the path to the p2p identity key
+	p2pKeyPemFile = cli.StringFlag{
+		Name: "p2p-key-pem-file",
+		Usage: "The `filepath` for the PEM file which contains the p2p identity key. " +
+			"If the file does not exist, a new random key is used for this run only and is not saved. " +
+			"Create the file with `keygenerator --key-type p2p` only when a stable peer ID is needed; " +
+			"every machine, including redundancy backups, must use its own key file. " +
+			"A backup (redundancy level > 0) ignores the default path and loads a key file only when this flag is set.",
+		Value: "./config/node/p2pKey.pem",
 	}
 
 	// restAPIDebug defines a flag for starting the rest API engine in debug mode
@@ -370,7 +374,7 @@ func main() {
 		nodeDisplayName,
 		identityFlagName,
 		restAPIInterface,
-		p2pSeed,
+		p2pKeyPemFile,
 		restAPIDebug,
 		disableAnsiColor,
 		bootstrapSlotIndex,

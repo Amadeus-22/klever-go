@@ -11,7 +11,6 @@ import (
 	"github.com/klever-io/klever-go/storage"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsub_pb "github.com/libp2p/go-libp2p-pubsub/pb"
-	libp2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -139,11 +138,6 @@ func (ds *directSender) Counter() uint64 {
 
 func (mh *MutexHolder) Mutexes() storage.Cacher {
 	return mh.mutexes
-}
-
-// CreateP2PPrivKey exports createP2PPrivKey for testing.
-func CreateP2PPrivKey(seed string, legacySeed bool) (libp2pCrypto.PrivKey, error) {
-	return createP2PPrivKey(seed, legacySeed)
 }
 
 // BuildAddressFactory exports buildAddressFactory for testing.

@@ -16,9 +16,20 @@ import (
 	"github.com/klever-io/klever-go/genesis/parsing"
 	"github.com/klever-io/klever-go/kapps"
 	"github.com/klever-io/klever-go/network/p2p/libp2p"
+	"github.com/klever-io/klever-go/network/p2p/libp2p/p2pkey"
 	"github.com/klever-io/klever-go/sharding"
+	libp2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/stretchr/testify/assert"
 )
+
+func createP2pPrivateKey() libp2pCrypto.PrivKey {
+	sk, err := p2pkey.Generate()
+	if err != nil {
+		panic(err)
+	}
+
+	return sk
+}
 
 func createMockHexPubkeyConverter() *mock.PubkeyConverterStub {
 	return &mock.PubkeyConverterStub{
@@ -32,7 +43,6 @@ func getNetworkComponents() *factory.NetworkComponents {
 	p2pConfig := config.P2PConfig{
 		Node: config.NodeConfig{
 			Port: "0",
-			Seed: "seed",
 		},
 		KadDhtPeerDiscovery: config.KadDhtPeerDiscoveryConfig{
 			Enabled:                          false,
@@ -65,6 +75,7 @@ func getNetworkComponents() *factory.NetworkComponents {
 		&mock.AppStatusHandlerMock{},
 		&mock.MarshalizerMock{},
 		&libp2p.LocalSyncTimer{},
+		createP2pPrivateKey(),
 	)
 
 	ncf.SetListenAddress(libp2p.ListenLocalhostAddrWithIp4AndTcp)

@@ -16,12 +16,14 @@ import (
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/network/p2p"
 	"github.com/klever-io/klever-go/network/p2p/libp2p"
+	"github.com/klever-io/klever-go/network/p2p/libp2p/p2pkey"
 	"github.com/klever-io/klever-go/tools"
 	"github.com/klever-io/klever-go/tools/check"
 	"github.com/klever-io/klever-go/tools/display"
 	"github.com/klever-io/klever-go/tools/logging"
 	"github.com/klever-io/klever-go/tools/marshal"
 	factoryMarshalizer "github.com/klever-io/klever-go/tools/marshal/factory"
+	libp2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/urfave/cli"
 )
 
@@ -61,11 +63,14 @@ VERSION:
 			"To bind to all available interfaces, set this flag to :8080. If set to `off` then the API won't be available",
 		Value: facade.DefaultRestInterface,
 	}
-	// p2pSeed defines a flag to be used as a seed when generating P2P credentials. Useful for seed nodes.
-	p2pSeed = cli.StringFlag{
-		Name:  "p2p-seed",
-		Usage: "P2P seed will be used when generating credentials for p2p component. Can be any string.",
-		Value: "seed",
+	// p2pKeyPemFile defines a flag for the path to the p2p identity key
+	p2pKeyPemFile = cli.StringFlag{
+		Name: "p2p-key-pem-file",
+		Usage: "The `filepath` for the PEM file which contains the p2p identity key. " +
+			"If the file does not exist, a new random key is generated and saved there. " +
+			"Saving needs a filesystem with hard-link support; otherwise create the file with " +
+			"`keygenerator --key-type p2p` and copy it here before startup.",
+		Value: "./config/p2pKey.pem",
 	}
 	// logLevel defines the logger level
 	logLevel = cli.StringFlag{
@@ -109,7 +114,7 @@ func main() {
 	app.Flags = []cli.Flag{
 		port,
 		restAPIInterfaceFlag,
-		p2pSeed,
+		p2pKeyPemFile,
 		logLevel,
 		logSaveFile,
 		configurationFile,
@@ -189,16 +194,18 @@ func startNode(ctx *cli.Context) error {
 	if ctx.IsSet(port.Name) {
 		cfg.P2P.Node.Port = ctx.GlobalString(port.Name)
 	}
-	if ctx.IsSet(p2pSeed.Name) {
-		cfg.P2P.Node.Seed = ctx.GlobalString(p2pSeed.Name)
-	}
 
 	err = checkExpectedPeerCount(cfg.P2P)
 	if err != nil {
 		return err
 	}
 
-	messenger, err := createNode(cfg.P2P, internalMarshalizer)
+	p2pPrivateKey, err := p2pkey.LoadOrCreate(ctx.GlobalString(p2pKeyPemFile.Name))
+	if err != nil {
+		return err
+	}
+
+	messenger, err := createNode(cfg.P2P, internalMarshalizer, p2pPrivateKey)
 	if err != nil {
 		return err
 	}
@@ -244,12 +251,17 @@ func mainLoop(messenger p2p.Messenger, stop chan os.Signal) {
 	}
 }
 
-func createNode(p2pConfig config.P2PConfig, marshalizer marshal.Marshalizer) (p2p.Messenger, error) {
+func createNode(
+	p2pConfig config.P2PConfig,
+	marshalizer marshal.Marshalizer,
+	p2pPrivateKey libp2pCrypto.PrivKey,
+) (p2p.Messenger, error) {
 	arg := libp2p.ArgsNetworkMessenger{
 		Marshalizer:   marshalizer,
 		ListenAddress: libp2p.ListenAddrWithIp4AndTcp,
 		P2pConfig:     p2pConfig,
 		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: p2pPrivateKey,
 		IsSeedNode:    true,
 	}
 

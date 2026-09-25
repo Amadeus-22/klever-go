@@ -7,9 +7,19 @@ import (
 	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/config"
+	"github.com/klever-io/klever-go/network/p2p"
 	"github.com/klever-io/klever-go/network/p2p/libp2p"
+	"github.com/klever-io/klever-go/network/p2p/libp2p/p2pkey"
+	libp2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/stretchr/testify/require"
 )
+
+func createP2pPrivateKey(t *testing.T) libp2pCrypto.PrivKey {
+	sk, err := p2pkey.Generate()
+	require.NoError(t, err)
+
+	return sk
+}
 
 func TestNewNetworkComponentsFactory_NilStatusHandlerShouldErr(t *testing.T) {
 	t.Parallel()
@@ -21,6 +31,7 @@ func TestNewNetworkComponentsFactory_NilStatusHandlerShouldErr(t *testing.T) {
 		nil,
 		&mock.MarshalizerMock{},
 		&libp2p.LocalSyncTimer{},
+		createP2pPrivateKey(t),
 	)
 	require.Nil(t, ncf)
 	require.Equal(t, common.ErrNilStatusHandler, err)
@@ -36,9 +47,43 @@ func TestNewNetworkComponentsFactory_NilMarshalizerShouldErr(t *testing.T) {
 		&mock.AppStatusHandlerMock{},
 		nil,
 		&libp2p.LocalSyncTimer{},
+		createP2pPrivateKey(t),
 	)
 	require.Nil(t, ncf)
 	require.True(t, errors.Is(err, common.ErrNilMarshalizer))
+}
+
+func TestNewNetworkComponentsFactory_NilP2pPrivateKeyShouldErr(t *testing.T) {
+	t.Parallel()
+
+	ncf, err := NewNetworkComponentsFactory(
+		config.Config{
+			P2P: config.P2PConfig{},
+		},
+		&mock.AppStatusHandlerMock{},
+		&mock.MarshalizerMock{},
+		&libp2p.LocalSyncTimer{},
+		nil,
+	)
+	require.Nil(t, ncf)
+	require.True(t, errors.Is(err, p2p.ErrNilP2pPrivateKey))
+}
+
+func TestNewNetworkComponentsFactory_TypedNilP2pPrivateKeyShouldErr(t *testing.T) {
+	t.Parallel()
+
+	var typedNil *libp2pCrypto.Secp256k1PrivateKey
+	ncf, err := NewNetworkComponentsFactory(
+		config.Config{
+			P2P: config.P2PConfig{},
+		},
+		&mock.AppStatusHandlerMock{},
+		&mock.MarshalizerMock{},
+		&libp2p.LocalSyncTimer{},
+		typedNil,
+	)
+	require.Nil(t, ncf)
+	require.True(t, errors.Is(err, p2p.ErrNilP2pPrivateKey))
 }
 
 func TestNewNetworkComponentsFactory_OkValsShouldWork(t *testing.T) {
@@ -51,6 +96,7 @@ func TestNewNetworkComponentsFactory_OkValsShouldWork(t *testing.T) {
 		&mock.AppStatusHandlerMock{},
 		&mock.MarshalizerMock{},
 		&libp2p.LocalSyncTimer{},
+		createP2pPrivateKey(t),
 	)
 	require.NoError(t, err)
 	require.NotNil(t, ncf)
@@ -64,6 +110,7 @@ func TestNetworkComponentsFactory_Create_ShouldErrDueToBadConfig(t *testing.T) {
 		&mock.AppStatusHandlerMock{},
 		&mock.MarshalizerMock{},
 		&libp2p.LocalSyncTimer{},
+		createP2pPrivateKey(t),
 	)
 
 	nc, err := ncf.Create()
@@ -75,7 +122,6 @@ func TestNetworkComponentsFactory_Create_ShouldWork(t *testing.T) {
 	p2pConfig := config.P2PConfig{
 		Node: config.NodeConfig{
 			Port: "0",
-			Seed: "seed",
 		},
 		KadDhtPeerDiscovery: config.KadDhtPeerDiscoveryConfig{
 			Enabled:                          false,
@@ -108,6 +154,7 @@ func TestNetworkComponentsFactory_Create_ShouldWork(t *testing.T) {
 		&mock.AppStatusHandlerMock{},
 		&mock.MarshalizerMock{},
 		&libp2p.LocalSyncTimer{},
+		createP2pPrivateKey(t),
 	)
 
 	ncf.SetListenAddress(libp2p.ListenLocalhostAddrWithIp4AndTcp)

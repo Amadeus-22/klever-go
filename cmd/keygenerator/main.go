@@ -81,6 +81,15 @@ var rootCmd = &cobra.Command{
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if argsConfig.keyType == p2pType {
+			err := checkP2PKeyPassword(pwd, pwdFilePath)
+			if err != nil {
+				return err
+			}
+
+			return outputP2PKeys(argsConfig.numKeys, argsConfig.consoleOut, argsConfig.noSplit)
+		}
+
 		validatorKeys, walletKeys, err := generateKeys(argsConfig.keyType, argsConfig.numKeys)
 		if err != nil {
 			return err
@@ -94,7 +103,7 @@ var rootCmd = &cobra.Command{
 		return outputKeys(validatorKeys, walletKeys, argsConfig.consoleOut, argsConfig.noSplit, pwd)
 	},
 	Long: fmt.Sprintf(`
-This binary will generate a validatorKey.pem and walletKey.pem, each containing private key(s)
+This binary will generate a validatorKey.pem, walletKey.pem or p2pKey.pem, each containing private key(s)
 
 %s`, g("type 'keygenerator --help' for details")),
 }
@@ -104,10 +113,11 @@ func main() {
 	rootCmd.Flags().IntVarP(&argsConfig.numKeys, "num-keys", "n", 1, "How many keys should generate. Example: 1")
 	// keyType defines a flag for setting what keys should generate
 	rootCmd.Flags().StringVarP(&argsConfig.keyType, "key-type", "t", "validator", fmt.Sprintf(
-		"What kind of keys should generate. Available options: %s, %s, %s",
+		"What kind of keys should generate. Available options: %s, %s, %s, %s",
 		validatorType,
 		walletType,
-		bothType))
+		bothType,
+		p2pType))
 	// consoleOut is the flag that, if active, will print everything on the console, not on a physical file
 	rootCmd.Flags().BoolVarP(&argsConfig.consoleOut, "console-out", "c", false, "Boolean option that will enable printing the generated keys directly on the console")
 	// noSplit is the flag that, if active, will generate the keys in the same file

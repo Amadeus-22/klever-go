@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/big"
 	"net/netip"
 	"runtime/debug"
 	"sort"
@@ -17,7 +16,6 @@ import (
 
 	"github.com/shirou/gopsutil/v4/mem"
 
-	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	logging "github.com/ipfs/go-log/v2"
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/common/types"
@@ -31,7 +29,6 @@ import (
 	discoveryFactory "github.com/klever-io/klever-go/network/p2p/libp2p/discovery/factory"
 	"github.com/klever-io/klever-go/network/p2p/libp2p/metrics"
 	"github.com/klever-io/klever-go/network/p2p/libp2p/networksharding/factory"
-	randFactory "github.com/klever-io/klever-go/network/p2p/libp2p/rand/factory"
 	"github.com/klever-io/klever-go/network/p2p/loadBalancer"
 	"github.com/klever-io/klever-go/tools/check"
 	p2pDebug "github.com/klever-io/klever-go/tools/debug/p2p"
@@ -57,6 +54,8 @@ const ListenLocalhostAddrWithIp4AndTcp = "/ip4/127.0.0.1/tcp/"
 
 // DirectSendID represents the protocol ID for sending and receiving direct P2P messages
 const DirectSendID = protocol.ID("/klv/directsend/1.0.0")
+
+const errFmtCreatingMessenger = "%w when creating a new network messenger"
 
 const durationBetweenSends = time.Microsecond * 10
 const durationCheckConnections = time.Second
@@ -132,6 +131,8 @@ type ArgsNetworkMessenger struct {
 	Marshalizer   p2p.Marshalizer
 	P2pConfig     config.P2PConfig
 	SyncTimer     p2p.SyncTimer
+	// P2pPrivateKey is the node's libp2p identity key (see the p2pkey package)
+	P2pPrivateKey libp2pCrypto.PrivKey
 	// IsSeedNode replaces libp2p's default BasicConnMgr with NullConnMgr.
 	// ResourceManager is configured separately via P2pConfig.ResourceManager.
 	IsSeedNode bool
@@ -140,15 +141,14 @@ type ArgsNetworkMessenger struct {
 // NewNetworkMessenger creates a libP2P messenger by opening a port on the current machine
 func NewNetworkMessenger(args ArgsNetworkMessenger) (*networkMessenger, error) {
 	if check.IfNil(args.Marshalizer) {
-		return nil, fmt.Errorf("%w when creating a new network messenger", p2p.ErrNilMarshalizer)
+		return nil, fmt.Errorf(errFmtCreatingMessenger, p2p.ErrNilMarshalizer)
 	}
 	if check.IfNil(args.SyncTimer) {
-		return nil, fmt.Errorf("%w when creating a new network messenger", p2p.ErrNilSyncTimer)
+		return nil, fmt.Errorf(errFmtCreatingMessenger, p2p.ErrNilSyncTimer)
 	}
 
-	p2pPrivKey, err := createP2PPrivKey(args.P2pConfig.Node.Seed, args.P2pConfig.Node.LegacySeed)
-	if err != nil {
-		return nil, err
+	if check.IfNilReflect(args.P2pPrivateKey) {
+		return nil, fmt.Errorf(errFmtCreatingMessenger, p2p.ErrNilP2pPrivateKey)
 	}
 
 	port, err := getPort(args.P2pConfig.Node.Port, checkFreePort)
@@ -166,7 +166,7 @@ func NewNetworkMessenger(args ArgsNetworkMessenger) (*networkMessenger, error) {
 
 	opts := []libp2p.Option{
 		libp2p.ListenAddrs(sourceMultiAddr),
-		libp2p.Identity(p2pPrivKey),
+		libp2p.Identity(args.P2pPrivateKey),
 		libp2p.AddrsFactory(addressFactory),
 		libp2p.DefaultMuxers,
 		libp2p.DefaultSecurity,
@@ -240,58 +240,6 @@ func setupExternalP2PLoggers() {
 
 		_ = logging.SetLogLevel(external, "DEBUG")
 	}
-}
-
-func createP2PPrivKey(seed string, legacySeed bool) (libp2pCrypto.PrivKey, error) {
-	if seed == "" || !legacySeed {
-		randReader, err := randFactory.NewRandFactory(seed)
-		if err != nil {
-			return nil, err
-		}
-
-		prvKey, err := secp256k1.GeneratePrivateKeyFromRand(randReader)
-		if err != nil {
-			return nil, err
-		}
-
-		k := (*libp2pCrypto.Secp256k1PrivateKey)(prvKey)
-		return k, nil
-	}
-
-	// Legacy path: replicate Go 1.18's ecdsa.GenerateKey(btcec.S256(), randReader)
-	// behavior using the frozen PRNG. Go 1.18's randFieldElement reads
-	// BitSize/8 + 8 = 40 bytes, then computes k = (bytes mod (N-1)) + 1.
-	// This is needed because the code was later changed from ecdsa.GenerateKey
-	// to secp256k1.GeneratePrivateKeyFromRand (which reads 32 bytes),
-	// and both the reader and key derivation must match the original.
-	randReader, err := randFactory.NewLegacyRandFactory(seed)
-	if err != nil {
-		return nil, err
-	}
-
-	b := make([]byte, 40) // secp256k1 BitSize/8 + 8 = 32 + 8
-	if _, err := io.ReadFull(randReader, b); err != nil {
-		return nil, err
-	}
-
-	// secp256k1 curve order from the already-imported package
-	secp256k1N := secp256k1.Params().N
-	one := big.NewInt(1)
-	k := new(big.Int).SetBytes(b)
-	nMinusOne := new(big.Int).Sub(secp256k1N, one)
-	k.Mod(k, nMinusOne)
-	k.Add(k, one)
-
-	// Pad to 32 bytes
-	keyBytes := k.Bytes()
-	if len(keyBytes) < 32 {
-		padded := make([]byte, 32)
-		copy(padded[32-len(keyBytes):], keyBytes)
-		keyBytes = padded
-	}
-
-	privKey := secp256k1.PrivKeyFromBytes(keyBytes)
-	return (*libp2pCrypto.Secp256k1PrivateKey)(privKey), nil
 }
 
 func createMessenger(

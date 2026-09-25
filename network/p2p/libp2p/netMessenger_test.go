@@ -18,12 +18,14 @@ import (
 	"github.com/klever-io/klever-go/network/p2p"
 	"github.com/klever-io/klever-go/network/p2p/data"
 	"github.com/klever-io/klever-go/network/p2p/libp2p"
+	"github.com/klever-io/klever-go/network/p2p/libp2p/p2pkey"
 	"github.com/klever-io/klever-go/network/p2p/message"
 	"github.com/klever-io/klever-go/network/p2p/mock"
 	"github.com/klever-io/klever-go/tools/check"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsub_pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/connmgr"
+	libp2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
@@ -88,8 +90,18 @@ func createMockNetworkArgs() libp2p.ArgsNetworkMessenger {
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
+}
+
+func createP2pPrivateKey() libp2pCrypto.PrivKey {
+	sk, err := p2pkey.Generate()
+	if err != nil {
+		panic(err)
+	}
+
+	return sk
 }
 
 func createMockNetworkOf2() (mocknet.Mocknet, p2p.Messenger, p2p.Messenger) {
@@ -159,6 +171,38 @@ func TestNewNetworkMessenger_NilSyncTimerShouldErr(t *testing.T) {
 
 	assert.True(t, check.IfNil(mes))
 	assert.True(t, errors.Is(err, p2p.ErrNilSyncTimer))
+}
+
+func TestNewNetworkMessenger_NilP2pPrivateKeyShouldErr(t *testing.T) {
+	arg := createMockNetworkArgs()
+	arg.P2pPrivateKey = nil
+	mes, err := libp2p.NewNetworkMessenger(arg)
+
+	assert.True(t, check.IfNil(mes))
+	assert.True(t, errors.Is(err, p2p.ErrNilP2pPrivateKey))
+}
+
+func TestNewNetworkMessenger_TypedNilP2pPrivateKeyShouldErr(t *testing.T) {
+	arg := createMockNetworkArgs()
+	var typedNil *libp2pCrypto.Secp256k1PrivateKey
+	arg.P2pPrivateKey = typedNil
+	mes, err := libp2p.NewNetworkMessenger(arg)
+
+	assert.True(t, check.IfNil(mes))
+	assert.True(t, errors.Is(err, p2p.ErrNilP2pPrivateKey))
+}
+
+func TestNewNetworkMessenger_UsesProvidedP2pPrivateKey(t *testing.T) {
+	arg := createMockNetworkArgs()
+	mes, err := libp2p.NewNetworkMessenger(arg)
+	require.Nil(t, err)
+	defer func() {
+		_ = mes.Close()
+	}()
+
+	expectedID, err := peer.IDFromPrivateKey(arg.P2pPrivateKey)
+	require.Nil(t, err)
+	assert.Equal(t, core.PeerID(expectedID), mes.ID())
 }
 
 func TestNewNetworkMessenger_WithDeactivatedKadDiscovererShouldWork(t *testing.T) {
@@ -1376,7 +1420,8 @@ func TestNetworkMessenger_PreventReprocessingShouldWork(t *testing.T) {
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
@@ -1439,7 +1484,8 @@ func TestNetworkMessenger_PubsubCallbackNotMessageNotValidShouldNotCallHandler(t
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
@@ -1509,7 +1555,8 @@ func TestNetworkMessenger_PubsubCallbackReturnsFalseIfHandlerErrors(t *testing.T
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
@@ -1572,7 +1619,8 @@ func TestNetworkMessenger_PubsubCallbackRecoversFromHandlerPanic(t *testing.T) {
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
@@ -1663,7 +1711,8 @@ func TestNetworkMessenger_DirectMessageHandlerRecoversFromPanic(t *testing.T) {
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
@@ -1740,7 +1789,8 @@ func TestNetworkMessenger_UnjoinAllTopicsShouldWork(t *testing.T) {
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
