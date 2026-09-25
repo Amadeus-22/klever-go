@@ -570,34 +570,18 @@ func snapshotEpochTrigger(trigger process.EpochStartTriggerHandler) func() {
 // later in the same baseProcessEpochStartBlock run. Holding it back would change
 // how many FPR buckets are rolled and burned, which moves the KApp trie root.
 // So the write stays where it is and is undone on failure instead.
+//
+// Both the snapshot and the restore go through the controller so they are
+// serialized against the API and fee readers on other goroutines.
 func snapshotProposalParameters(controller kapps.ActiveProposalController) func() {
 	if check.IfNil(controller) {
 		return nil
 	}
 
-	live := controller.GetActiveParameters()
-	snapshot := make(map[int32]*kapps.Parameter, len(live))
-	for key, param := range live {
-		if param == nil {
-			continue
-		}
-
-		value := make([]byte, len(param.Value))
-		copy(value, param.Value)
-		snapshot[key] = &kapps.Parameter{Type: param.Type, Value: value}
-	}
+	snapshot := controller.GetActiveParameters()
 
 	return func() {
-		live := controller.GetActiveParameters()
-		// UpdateParameters only overwrites and adds, so parameters a settled
-		// proposal introduced have to be dropped before merging the snapshot back.
-		for key := range live {
-			if _, ok := snapshot[key]; !ok {
-				delete(live, key)
-			}
-		}
-
-		controller.UpdateParameters(snapshot)
+		controller.RestoreParameters(snapshot)
 	}
 }
 

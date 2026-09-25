@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1159,12 +1161,19 @@ func TestMetaProcessor_RejectedEpochStartMustRollBackProposalParameters(t *testi
 		})
 	}
 
-	newProcessor := func(t *testing.T) *blproc.MetaProcessorForTests {
+	// onRevert, when set, runs inside the accounts revert, which the rejection
+	// path calls right before it restores the proposal parameters
+	newProcessor := func(t *testing.T, onRevert func()) (*blproc.MetaProcessorForTests, kapps.ActiveProposalController) {
 		arguments := createMockMetaArguments()
 		arguments.AccountsDB[state.UserAccountsState] = &mock.AccountsStub{
-			JournalLenCalled:       func() int { return 0 },
-			RootHashCalled:         func() ([]byte, error) { return []byte("roothash"), nil },
-			RevertToSnapshotCalled: func(_ int) error { return nil },
+			JournalLenCalled: func() int { return 0 },
+			RootHashCalled:   func() ([]byte, error) { return []byte("roothash"), nil },
+			RevertToSnapshotCalled: func(_ int) error {
+				if onRevert != nil {
+					onRevert()
+				}
+				return nil
+			},
 		}
 
 		mpp, err := blproc.NewMetaProcessor(arguments)
@@ -1179,12 +1188,12 @@ func TestMetaProcessor_RejectedEpochStartMustRollBackProposalParameters(t *testi
 
 		SetProposal(t, mp, seedActiveProposal)
 
-		return mp
+		return mp, controller
 	}
 
 	// settling applies the parameter immediately: readers later in the same
 	// epoch start run depend on seeing it
-	mp := newProcessor(t)
+	mp, _ := newProcessor(t, nil)
 	initialValue := mp.GetActiveParameters()[paramKey].Value
 	require.NotEqual(t, settledValue, initialValue, "the test parameter must actually change")
 
@@ -1194,12 +1203,93 @@ func TestMetaProcessor_RejectedEpochStartMustRollBackProposalParameters(t *testi
 		"settling must apply the parameter in place for the rest of the run")
 
 	// but a block rejected afterwards must leave nothing behind
-	mp = newProcessor(t)
+	mp, _ = newProcessor(t, nil)
 	err = mp.ProcessBlock(newHeader(), haveTime)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), process.ErrRootStateDoesNotMatch.Error())
 	assert.Equal(t, initialValue, mp.GetActiveParameters()[paramKey].Value,
 		"a rejected epoch start block must not leave settled parameters behind")
+
+	// KLR-18 residual: the rollback is a write to the same set the API and the
+	// fee path read from other goroutines. Readers must never see a partially
+	// restored set, nor a value that was never live. Meaningful under -race.
+	t.Run("concurrent API and fee reads during the rollback", func(t *testing.T) {
+		// The accounts revert runs right before the restore, with the settled
+		// set still live. Holding it until the readers are looping guarantees
+		// they overlap the restore instead of relying on the scheduler.
+		const minReadsBeforeRestore = 100
+		var reads, readsAtRevert atomic.Int64
+		waitForReaders := func() {
+			deadline := time.Now().Add(5 * time.Second)
+			for reads.Load() < minReadsBeforeRestore && time.Now().Before(deadline) {
+				runtime.Gosched()
+			}
+			readsAtRevert.CompareAndSwap(0, reads.Load())
+		}
+
+		mp, controller := newProcessor(t, waitForReaders)
+		fullLen := len(mp.GetActiveParameters())
+		initialInt := controller.GetParameterInt(kapps.EnumParameter(paramKey))
+		settledInt := int64(1234)
+
+		// keep only the first failure: the readers loop until ProcessBlock
+		// returns, so reporting each one would repeat it thousands of times
+		var firstFailure atomic.Pointer[string]
+		fail := func(format string, args ...any) {
+			msg := fmt.Sprintf(format, args...)
+			firstFailure.CompareAndSwap(nil, &msg)
+		}
+
+		done := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+
+					// API path (Node.GetProposalParameters)
+					params := mp.GetActiveParameters()
+					if len(params) != fullLen {
+						fail("API read returned %d parameters, want %d", len(params), fullLen)
+						return
+					}
+					param := params[paramKey]
+					if param == nil || (!bytes.Equal(param.Value, initialValue) && !bytes.Equal(param.Value, settledValue)) {
+						fail("API read returned parameter %d = %v, want %q or %q", paramKey, param, initialValue, settledValue)
+						return
+					}
+
+					// fee path (EconomicsData.GetParameterInt)
+					value := controller.GetParameterInt(kapps.EnumParameter(paramKey))
+					if value != initialInt && value != settledInt {
+						fail("fee read returned %d, want %d or %d", value, initialInt, settledInt)
+						return
+					}
+
+					reads.Add(1)
+				}
+			}()
+		}
+
+		err := mp.ProcessBlock(newHeader(), haveTime)
+		close(done)
+		wg.Wait()
+
+		if msg := firstFailure.Load(); msg != nil {
+			t.Fatal(*msg)
+		}
+		require.GreaterOrEqual(t, readsAtRevert.Load(), int64(minReadsBeforeRestore),
+			"the readers must already be running when the rollback restores the parameters")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), process.ErrRootStateDoesNotMatch.Error())
+		assert.Equal(t, initialValue, mp.GetActiveParameters()[paramKey].Value)
+	})
 }
 
 // Round trip over an epoch start block: the proposer applies the side effects

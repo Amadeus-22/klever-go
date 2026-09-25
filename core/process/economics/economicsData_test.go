@@ -40,7 +40,7 @@ func createProposalController(params map[int32]*kapps.Parameter) kapps.ActivePro
 
 	pc, _ := kapps.NewProposalController(forkController)
 
-	pc.ActiveParameters = params
+	pc.RestoreParameters(params)
 
 	return pc
 }

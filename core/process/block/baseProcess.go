@@ -866,11 +866,7 @@ func (mp *metaProcessor) getProposalController() (state.KAppAccountHandler, *kap
 		return nil, nil, err
 	}
 
-	initialProposal, err := kapps.NewProposalController(mp.forkController)
-	if err != nil {
-		return nil, nil, err
-	}
-
+	initialProposal := kapps.NewInitialProposalController(mp.forkController)
 	if len(initialProposal.ActiveParameters) > len(currentProposal.ActiveParameters) {
 		for key, v := range currentProposal.ActiveParameters {
 			initialProposal.ActiveParameters[key] = v

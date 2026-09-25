@@ -3,6 +3,7 @@ package kapps_test
 import (
 	"reflect"
 	strconv "strconv"
+	"sync"
 	"testing"
 
 	"github.com/klever-io/klever-go/common"
@@ -19,6 +20,14 @@ func NewProposalControllerForTests() kapps.ActiveProposalController {
 	return controller
 }
 
+// setParams edits the live set through the controller: GetActiveParameters
+// hands out copies, so writing into the returned map alone changes nothing.
+func setParams(controller kapps.ActiveProposalController, edit func(map[int32]*kapps.Parameter)) {
+	params := controller.GetActiveParameters()
+	edit(params)
+	controller.RestoreParameters(params)
+}
+
 func TestNewProposalController(t *testing.T) {
 	mockForks := mock.NewForkControllerStub()
 
@@ -26,14 +35,15 @@ func TestNewProposalController(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, controller)
-	assert.NotNil(t, controller.ProposalController)
-	assert.Equal(t, uint64(0), controller.ProposalCount)
-	assert.NotNil(t, controller.ActiveParameters)
-	assert.NotNil(t, controller.ActiveProposals)
+	pc := kapps.ProposalControllerOf(controller)
+	assert.NotNil(t, pc)
+	assert.Equal(t, uint64(0), pc.ProposalCount)
+	assert.NotNil(t, pc.ActiveParameters)
+	assert.NotNil(t, pc.ActiveProposals)
 }
 
 func TestUpdateParameters(t *testing.T) {
-	controller := NewProposalControllerForTests()
+	controller, _ := kapps.NewProposalController(mock.NewForkControllerStub())
 
 	newParams := map[int32]*kapps.Parameter{
 		int32(kapps.EnumParameter_FeePerDataByte): {
@@ -46,8 +56,9 @@ func TestUpdateParameters(t *testing.T) {
 	updatedParam := controller.GetParameterUint(kapps.EnumParameter_FeePerDataByte)
 	assert.Equal(t, uint64(5000), updatedParam)
 
-	// update parameter not registered
-	controller.GetActiveParameters()[int32(kapps.EnumParameter_FeePerDataByte)] = nil
+	// update parameter not registered: a nil entry, as a trie-loaded controller
+	// can hold. Written on the wrapped map since the copying API drops nils.
+	kapps.ProposalControllerOf(controller).ActiveParameters[int32(kapps.EnumParameter_FeePerDataByte)] = nil
 
 	updatedParam = controller.GetParameterUint(kapps.EnumParameter_FeePerDataByte)
 	assert.Equal(t, uint64(0), updatedParam)
@@ -73,32 +84,39 @@ func TestGetParameterInt(t *testing.T) {
 	assert.Equal(t, int64(4000), value)
 
 	// parse negative value
-	activeParam := controller.GetActiveParameters()
-	activeParam[int32(kapps.EnumParameter_FeePerDataByte)] = &kapps.Parameter{
-		Type:  kapps.EnumType_Int64,
-		Value: []byte("-1000"),
-	}
+	setParams(controller, func(p map[int32]*kapps.Parameter) {
+		p[int32(kapps.EnumParameter_FeePerDataByte)] = &kapps.Parameter{
+			Type:  kapps.EnumType_Int64,
+			Value: []byte("-1000"),
+		}
+	})
 	assert.Equal(t, int64(-1000), controller.GetParameterInt(kapps.EnumParameter_FeePerDataByte))
 
 	// update param if it doesn't exist
-	delete(activeParam, int32(kapps.EnumParameter_FeePerDataByte))
+	setParams(controller, func(p map[int32]*kapps.Parameter) {
+		delete(p, int32(kapps.EnumParameter_FeePerDataByte))
+	})
 	assert.Equal(t,
 		int64(0),
 		controller.GetParameterInt(kapps.EnumParameter_FeePerDataByte),
 	)
 
 	// parse error
-	activeParam[int32(kapps.EnumParameter_FeePerDataByte)] = &kapps.Parameter{
-		Type:  kapps.EnumType_Int64,
-		Value: []byte("invalid"),
-	}
+	setParams(controller, func(p map[int32]*kapps.Parameter) {
+		p[int32(kapps.EnumParameter_FeePerDataByte)] = &kapps.Parameter{
+			Type:  kapps.EnumType_Int64,
+			Value: []byte("invalid"),
+		}
+	})
 	assert.Equal(t, int64(0), controller.GetParameterInt(kapps.EnumParameter_FeePerDataByte))
 
 	// parse invalid type
-	activeParam[int32(kapps.EnumParameter_FeePerDataByte)] = &kapps.Parameter{
-		Type:  99,
-		Value: []byte("5000"),
-	}
+	setParams(controller, func(p map[int32]*kapps.Parameter) {
+		p[int32(kapps.EnumParameter_FeePerDataByte)] = &kapps.Parameter{
+			Type:  99,
+			Value: []byte("5000"),
+		}
+	})
 	assert.Equal(t, int64(0), controller.GetParameterInt(kapps.EnumParameter_FeePerDataByte))
 }
 
@@ -109,8 +127,9 @@ func TestGetParameterUint(t *testing.T) {
 	assert.Equal(t, uint64(6000), value)
 
 	// update param if it doesn't exist
-	activeParam := controller.GetActiveParameters()
-	delete(activeParam, int32(kapps.EnumParameter_LeaderValidatorRewardsPercentage))
+	setParams(controller, func(p map[int32]*kapps.Parameter) {
+		delete(p, int32(kapps.EnumParameter_LeaderValidatorRewardsPercentage))
+	})
 	// should be zero as it doesn't exist
 	assert.Equal(t,
 		uint64(0),
@@ -118,17 +137,21 @@ func TestGetParameterUint(t *testing.T) {
 	)
 
 	// parse error
-	activeParam[int32(kapps.EnumParameter_LeaderValidatorRewardsPercentage)] = &kapps.Parameter{
-		Type:  kapps.EnumType_Int64,
-		Value: []byte("invalid"),
-	}
+	setParams(controller, func(p map[int32]*kapps.Parameter) {
+		p[int32(kapps.EnumParameter_LeaderValidatorRewardsPercentage)] = &kapps.Parameter{
+			Type:  kapps.EnumType_Int64,
+			Value: []byte("invalid"),
+		}
+	})
 	assert.Equal(t, int64(0), controller.GetParameterInt(kapps.EnumParameter_LeaderValidatorRewardsPercentage))
 
 	// parse invalid type
-	activeParam[int32(kapps.EnumParameter_LeaderValidatorRewardsPercentage)] = &kapps.Parameter{
-		Type:  99,
-		Value: []byte("5000"),
-	}
+	setParams(controller, func(p map[int32]*kapps.Parameter) {
+		p[int32(kapps.EnumParameter_LeaderValidatorRewardsPercentage)] = &kapps.Parameter{
+			Type:  99,
+			Value: []byte("5000"),
+		}
+	})
 	assert.Equal(t, int64(0), controller.GetParameterInt(kapps.EnumParameter_LeaderValidatorRewardsPercentage))
 }
 
@@ -182,14 +205,106 @@ func TestParseParamAndValidate_InvalidTypes(t *testing.T) {
 	mockForks := mock.NewForkControllerStub()
 
 	// overwriting the parameter with a different type
-	controller.GetActiveParameters()[int32(kapps.EnumParameter_LeaderValidatorRewardsPercentage)] = &kapps.Parameter{
-		Type:  99,
-		Value: []byte("5000"),
-	}
+	setParams(controller, func(p map[int32]*kapps.Parameter) {
+		p[int32(kapps.EnumParameter_LeaderValidatorRewardsPercentage)] = &kapps.Parameter{
+			Type:  99,
+			Value: []byte("5000"),
+		}
+	})
 
 	_, err := controller.ParseParamAndValidate(kapps.EnumParameter_LeaderValidatorRewardsPercentage, []byte("5000"), mockForks)
 	assert.Error(t, err)
+}
 
+// GetActiveParameters hands out copies: neither editing an entry nor dropping
+// one from the returned map may reach the live set.
+func TestActiveProposalController_ReturnsCopies(t *testing.T) {
+	t.Parallel()
+
+	controller := NewProposalControllerForTests()
+	feeKey := int32(kapps.EnumParameter_FeePerDataByte)
+	rewardsKey := int32(kapps.EnumParameter_LeaderValidatorRewardsPercentage)
+
+	leaked := controller.GetActiveParameters()
+	leaked[feeKey].Value[0] = 'X'
+	leaked[feeKey] = nil
+	delete(leaked, rewardsKey)
+
+	assert.Equal(t, int64(4000), controller.GetParameterInt(kapps.EnumParameter_FeePerDataByte))
+	assert.Equal(t, uint64(6000), controller.GetParameterUint(kapps.EnumParameter_LeaderValidatorRewardsPercentage))
+
+	fresh := controller.GetActiveParameters()
+	assert.Equal(t, []byte("4000"), fresh[feeKey].Value)
+	assert.Contains(t, fresh, rewardsKey)
+
+	// the same holds for what is passed in: the caller keeps ownership
+	incoming := map[int32]*kapps.Parameter{feeKey: {Type: kapps.EnumType_Int64, Value: []byte("7000")}}
+	controller.UpdateParameters(incoming)
+	incoming[feeKey].Value[0] = '9'
+	assert.Equal(t, int64(7000), controller.GetParameterInt(kapps.EnumParameter_FeePerDataByte))
+
+	controller.RestoreParameters(fresh)
+	fresh[feeKey].Value[0] = '9'
+	assert.Equal(t, int64(4000), controller.GetParameterInt(kapps.EnumParameter_FeePerDataByte))
+}
+
+// KLR-18 residual: the epoch start rollback rewrites the live set while API and
+// fee readers run on other goroutines. Every reader must see a complete set,
+// never a half-restored one. Meaningful under -race.
+func TestActiveProposalController_ConcurrentReadersDuringRestore(t *testing.T) {
+	t.Parallel()
+
+	controller := NewProposalControllerForTests()
+	mockForks := mock.NewForkControllerStub()
+	feeKey := int32(kapps.EnumParameter_FeePerDataByte)
+
+	initial := controller.GetActiveParameters()
+	settled := controller.GetActiveParameters()
+	settled[feeKey] = &kapps.Parameter{Type: kapps.EnumType_Int64, Value: []byte("1234")}
+	// a settled proposal may also introduce a key the snapshot never had
+	settled[999] = &kapps.Parameter{Type: kapps.EnumType_Int64, Value: []byte("1")}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				// API read: one copy is either the initial or the settled set, never a mix
+				params := controller.GetActiveParameters()
+				assert.GreaterOrEqual(t, len(params), len(initial))
+				fee := string(params[feeKey].GetValue())
+				_, has999 := params[999]
+				assert.True(t, (fee == "4000" && !has999) || (fee == "1234" && has999),
+					"torn parameter set: fee=%s has999=%v", fee, has999)
+
+				// fee reads: only the values that were ever written
+				value := controller.GetParameterInt(kapps.EnumParameter_FeePerDataByte)
+				assert.Contains(t, []int64{4000, 1234}, value)
+				assert.Equal(t, uint64(6000), controller.GetParameterUint(kapps.EnumParameter_LeaderValidatorRewardsPercentage))
+				_, err := controller.ParseParamAndValidate(kapps.EnumParameter_FeePerDataByte, []byte("1"), mockForks)
+				assert.NoError(t, err)
+			}
+		}()
+	}
+
+	for i := 0; i < 200; i++ {
+		controller.UpdateParameters(settled)
+		controller.RestoreParameters(initial)
+	}
+
+	close(done)
+	wg.Wait()
+
+	assert.Equal(t, int64(4000), controller.GetParameterInt(kapps.EnumParameter_FeePerDataByte))
+	assert.NotContains(t, controller.GetActiveParameters(), int32(999))
 }
 
 func TestParseParamAndValidate_MaxGasPerTX_ForkAware(t *testing.T) {

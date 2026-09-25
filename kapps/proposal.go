@@ -2,6 +2,7 @@ package kapps
 
 import (
 	reflect "reflect"
+	"sync"
 
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/common"
@@ -10,8 +11,15 @@ import (
 
 var log = logger.GetOrCreate("kapps/proposal")
 
+// activeProposalController is the live, node-wide parameter set. The block
+// processor writes it during epoch start while API handlers and the fee path
+// read it from other goroutines, so every access goes through mu and callers
+// only ever get copies. pc is a named, unexported field rather than an embedded
+// one so that neither the map nor the proto's lock-free methods are reachable
+// from outside.
 type activeProposalController struct {
-	*ProposalController
+	mu sync.RWMutex
+	pc *ProposalController
 }
 
 type ActiveProposalController interface {
@@ -21,29 +29,114 @@ type ActiveProposalController interface {
 	GetParameterUint(parameter EnumParameter) uint64
 	ParseParamAndValidate(parameter EnumParameter, value []byte, fc core.ForkController) (reflect.Value, error)
 	UpdateParameters(map[int32]*Parameter)
+	RestoreParameters(map[int32]*Parameter)
 }
 
+// NewProposalController returns a live controller holding the initial parameters for forks.
 func NewProposalController(forks core.ForkController) (*activeProposalController, error) {
-	return &activeProposalController{
-		ProposalController: &ProposalController{
-			ProposalCount:    0,
-			ActiveParameters: InitialProposalParameters(forks),
-			ActiveProposals:  make(map[uint32]*ActiveProposals),
-		}}, nil
+	return NewActiveProposalController(NewInitialProposalController(forks)), nil
 }
 
+// NewInitialProposalController returns the proposal state a fresh chain starts from.
+func NewInitialProposalController(forks core.ForkController) *ProposalController {
+	return &ProposalController{
+		ProposalCount:    0,
+		ActiveParameters: InitialProposalParameters(forks),
+		ActiveProposals:  make(map[uint32]*ActiveProposals),
+	}
+}
+
+// NewActiveProposalController wraps pc as the live controller and takes ownership
+// of it: the caller must not read or write pc afterwards.
+func NewActiveProposalController(pc *ProposalController) *activeProposalController {
+	if pc == nil {
+		pc = &ProposalController{}
+	}
+	if pc.ActiveParameters == nil {
+		pc.ActiveParameters = make(map[int32]*Parameter)
+	}
+
+	return &activeProposalController{pc: pc}
+}
+
+// GetActiveParameters returns a deep copy: mutating it never touches the live set.
+func (a *activeProposalController) GetActiveParameters() map[int32]*Parameter {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	return cloneParameters(a.pc.ActiveParameters)
+}
+
+func (a *activeProposalController) GetParameterInt(parameter EnumParameter) int64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	return a.pc.GetParameterInt(parameter)
+}
+
+func (a *activeProposalController) GetParameterUint(parameter EnumParameter) uint64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	return a.pc.GetParameterUint(parameter)
+}
+
+func (a *activeProposalController) ParseParamAndValidate(parameter EnumParameter, value []byte, fc core.ForkController) (reflect.Value, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	return a.pc.ParseParamAndValidate(parameter, value, fc)
+}
+
+// UpdateParameters merges params into the live set. Each entry replaces the
+// whole live Parameter (Type and Value), and nil entries are skipped. Values are
+// copied in, so the caller's objects (typically the trie-loaded controller) are
+// never aliased.
 func (a *activeProposalController) UpdateParameters(params map[int32]*Parameter) {
-	//After All processing, updates block activeParams instance
-	for key, p := range params {
-		param := a.ActiveParameters[key]
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for key, param := range params {
 		if param == nil {
-			a.ActiveParameters[key] = p
 			continue
 		}
 
-		param.Value = make([]byte, len(p.Value))
-		copy(a.ActiveParameters[key].Value, p.Value)
+		a.pc.ActiveParameters[key] = cloneParameter(param)
 	}
+}
+
+// RestoreParameters replaces the whole live set in one step, so a concurrent
+// reader sees either the previous set or params, never a mix.
+func (a *activeProposalController) RestoreParameters(params map[int32]*Parameter) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.pc.ActiveParameters = cloneParameters(params)
+}
+
+// IsInterfaceNil returns true if there is no value under the interface
+func (a *activeProposalController) IsInterfaceNil() bool {
+	return a == nil
+}
+
+func cloneParameters(params map[int32]*Parameter) map[int32]*Parameter {
+	clone := make(map[int32]*Parameter, len(params))
+	for key, param := range params {
+		if param == nil {
+			continue
+		}
+
+		clone[key] = cloneParameter(param)
+	}
+
+	return clone
+}
+
+func cloneParameter(param *Parameter) *Parameter {
+	value := make([]byte, len(param.Value))
+	copy(value, param.Value)
+
+	return &Parameter{Type: param.Type, Value: value}
 }
 
 func InitialProposalParameters(forks core.ForkController) map[int32]*Parameter {

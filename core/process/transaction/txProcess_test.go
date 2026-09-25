@@ -95,10 +95,12 @@ func createProposalController() kapps.ActiveProposalController {
 
 	pc, _ := kapps.NewProposalController(forkController)
 
-	pc.ActiveParameters[int32(kapps.EnumParameter_MinKLVBucketAmount)] = &kapps.Parameter{
-		Type:  kapps.EnumType_Int64,
-		Value: []byte(fmt.Sprintf("%d", MinFreezeAmount)),
-	}
+	pc.UpdateParameters(map[int32]*kapps.Parameter{
+		int32(kapps.EnumParameter_MinKLVBucketAmount): {
+			Type:  kapps.EnumType_Int64,
+			Value: []byte(fmt.Sprintf("%d", MinFreezeAmount)),
+		},
+	})
 
 	return pc
 }
@@ -413,19 +415,16 @@ func initProposalKapp(proposalKapp state.KAppAccountHandler) kapps.ActiveProposa
 		KdaFpr:                0,
 	}, epochNotifier)
 
-	pc, _ := kapps.NewProposalController(forkController)
+	initial := kapps.NewInitialProposalController(forkController)
 	minAmount := fmt.Sprintf("%d", MinFreezeAmount)
-	pc.UpdateParameters(
-		map[int32]*kapps.Parameter{
-			int32(kapps.EnumParameter_MinKLVBucketAmount):      {Type: kapps.EnumType_Int64, Value: []byte(minAmount)},
-			int32(kapps.EnumParameter_MinSelfDelegatedAmount):  {Type: kapps.EnumType_Int64, Value: []byte("0")},
-			int32(kapps.EnumParameter_MinTotalDelegatedAmount): {Type: kapps.EnumType_Int64, Value: []byte("0")},
-		})
-	controllerData, _ := marshalizer.Marshal(pc.ProposalController)
+	initial.ActiveParameters[int32(kapps.EnumParameter_MinKLVBucketAmount)] = &kapps.Parameter{Type: kapps.EnumType_Int64, Value: []byte(minAmount)}
+	initial.ActiveParameters[int32(kapps.EnumParameter_MinSelfDelegatedAmount)] = &kapps.Parameter{Type: kapps.EnumType_Int64, Value: []byte("0")}
+	initial.ActiveParameters[int32(kapps.EnumParameter_MinTotalDelegatedAmount)] = &kapps.Parameter{Type: kapps.EnumType_Int64, Value: []byte("0")}
+	controllerData, _ := marshalizer.Marshal(initial)
 
 	_ = proposalKapp.DataTrieTracker().SaveKeyValue(proposalKey, controllerData)
 
-	return pc
+	return kapps.NewActiveProposalController(initial)
 }
 
 func initMarketplaceKapp(marketplaceKapp state.KAppAccountHandler) {

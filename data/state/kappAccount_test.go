@@ -1196,12 +1196,10 @@ func TestKAppAccount_StartProposalsKApp_MergePathTriggered(t *testing.T) {
 	forksWithoutKdaFpr := mock.NewForkControllerStub()
 	forksWithoutKdaFpr.KdaFprValue = false
 
-	initialController, err := kapps.NewProposalController(forksWithoutKdaFpr)
-	require.NoError(t, err)
+	initialController := kapps.NewInitialProposalController(forksWithoutKdaFpr)
+	paramsBefore := len(initialController.ActiveParameters)
 
-	paramsBefore := len(initialController.GetActiveParameters())
-
-	controllerData, err := marshalizer.Marshal(initialController.ProposalController)
+	controllerData, err := marshalizer.Marshal(initialController)
 	require.NoError(t, err)
 
 	err = acc.SetStorage(kdautils.ProposalControllerKey, controllerData)
