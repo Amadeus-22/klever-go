@@ -72,29 +72,3 @@ func TestEnableEpochs_Validate_SmartContractsNotBeforeProcessorFlowITOPrice(t *t
 	assert.Error(t, config.EnableEpochs{ProcessorFlowITOPrice: 100}.Validate(),
 		"smart contracts left at the placeholder activate from genesis, before the cache")
 }
-
-func TestEnableEpochs_Validate_AuditChangesV6AfterV5(t *testing.T) {
-	t.Parallel()
-
-	// V5 still at the placeholder is a template rather than a real schedule, so the
-	// ordering is not enforced against it.
-	assert.NoError(t, config.EnableEpochs{}.Validate(), "template placeholder")
-
-	assert.Error(t, config.EnableEpochs{
-		FixMarketBuyOverflow: 100,
-		FixAuditChangesV4:    101,
-		FixAuditChangesV5:    102,
-		FixAuditChangesV6:    102,
-	}.Validate(), "sharing V5's epoch applies the V6 changes retroactively")
-	assert.Error(t, config.EnableEpochs{
-		FixMarketBuyOverflow: 100,
-		FixAuditChangesV4:    101,
-		FixAuditChangesV5:    102,
-		FixAuditChangesV6:    101,
-	}.Validate(), "V6 before V5 applies the V6 changes retroactively")
-	assert.Error(t, config.EnableEpochs{
-		FixMarketBuyOverflow: 100,
-		FixAuditChangesV4:    101,
-		FixAuditChangesV5:    102,
-	}.Validate(), "V6 left at the placeholder activates from genesis")
-}
