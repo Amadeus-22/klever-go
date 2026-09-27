@@ -9,6 +9,8 @@ import (
 	"math/big"
 	"testing"
 
+	blockchainConfig "github.com/klever-io/klever-go/config"
+
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp/builtInFunctions"
@@ -1148,50 +1150,69 @@ func callCustomSCAndGetGasUsed(t *testing.T, locals uint64) (uint64, *config.Gas
 	return gasUsed, gasSchedule
 }
 
+// forEachFixAuditChangesV6 runs a gas scenario with FixAuditChangesV6 off and on. Off, it must use exactly
+// its historical gas, so blocks from before the fork replay unchanged; on, the caller also pays nameCopyGas
+// for the function names it copies into its indirect calls, which were free before the fork
+func forEachFixAuditChangesV6(
+	t *testing.T,
+	nameCopyGas uint64,
+	run func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64),
+) {
+	t.Run("before FixAuditChangesV6", func(t *testing.T) {
+		run(t, blockchainConfig.EnableEpochs{FixAuditChangesV6: 1_000_000}, 0)
+	})
+	t.Run("from FixAuditChangesV6", func(t *testing.T) {
+		run(t, blockchainConfig.EnableEpochs{}, nameCopyGas)
+	})
+}
+
 func TestExecution_ExecuteOnSameContext_Simple(t *testing.T) {
-	parentGasUsed := uint64(521)
-	childGasUsed := uint64(6870)
-	executionCost := parentGasUsed + childGasUsed
+	forEachFixAuditChangesV6(t, 26, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		parentGasUsed := uint64(521) + nameCopyGas
+		childGasUsed := uint64(6870)
+		executionCost := parentGasUsed + childGasUsed
 
-	var returnData [][]byte
+		var returnData [][]byte
 
-	returnData = append(returnData, []byte("child"))
-	returnData = append(returnData, []byte{})
-	for i := 1; i < 100; i++ {
-		returnData = append(returnData, []byte{byte(i)})
-	}
-	returnData = append(returnData, []byte{})
-	returnData = append(returnData, []byte("child"))
-	returnData = append(returnData, []byte{})
-	for i := 1; i < 100; i++ {
-		returnData = append(returnData, []byte{byte(i)})
-	}
-	returnData = append(returnData, []byte{})
-	returnData = append(returnData, []byte("parent"))
+		returnData = append(returnData, []byte("child"))
+		returnData = append(returnData, []byte{})
+		for i := 1; i < 100; i++ {
+			returnData = append(returnData, []byte{byte(i)})
+		}
+		returnData = append(returnData, []byte{})
+		returnData = append(returnData, []byte("child"))
+		returnData = append(returnData, []byte{})
+		for i := 1; i < 100; i++ {
+			returnData = append(returnData, []byte{byte(i)})
+		}
+		returnData = append(returnData, []byte{})
+		returnData = append(returnData, []byte("parent"))
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-same-ctx-simple-parent", "../../")).
-				WithBalance(1000),
-			test.CreateInstanceContract(test.ChildAddress).
-				WithCode(test.GetTestSCCode("exec-same-ctx-simple-child", "../../")).
-				WithBalance(1000)).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction(parentFunctionChildCall).
-			WithGasProvided(test.GasProvided).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				Balance(host, test.ParentAddress, 1000).
-				GasUsed(test.ParentAddress, parentGasUsed+childGasUsed).
-				Balance(host, test.ChildAddress, 1000).
-				GasUsed(test.ChildAddress, 0).
-				// other
-				GasRemaining(test.GasProvided - executionCost).
-				ReturnData(returnData...)
-		})
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-same-ctx-simple-parent", "../../")).
+					WithBalance(1000),
+				test.CreateInstanceContract(test.ChildAddress).
+					WithCode(test.GetTestSCCode("exec-same-ctx-simple-child", "../../")).
+					WithBalance(1000)).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction(parentFunctionChildCall).
+				WithGasProvided(test.GasProvided).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					Balance(host, test.ParentAddress, 1000).
+					GasUsed(test.ParentAddress, parentGasUsed+childGasUsed).
+					Balance(host, test.ChildAddress, 1000).
+					GasUsed(test.ChildAddress, 0).
+					// other
+					GasRemaining(test.GasProvided - executionCost).
+					ReturnData(returnData...)
+			})
+	})
 }
 
 func TestExecution_Call_Breakpoints(t *testing.T) {
@@ -1443,178 +1464,187 @@ func TestExecution_ExecuteOnSameContext_OutOfGas(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnSameContext_Successful(t *testing.T) {
-	executeAPICost := uint64(894313)
-	childExecutionCost := uint64(437 - 22)
-	parentGasBeforeExecuteAPI := uint64(172 - 9)
-	finalCost := uint64(134)
+	forEachFixAuditChangesV6(t, 13, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		executeAPICost := uint64(894313) + nameCopyGas
+		childExecutionCost := uint64(437 - 22)
+		parentGasBeforeExecuteAPI := uint64(172 - 9)
+		finalCost := uint64(134)
 
-	parentAccountBalance := int64(10000)
-	parentAccountBalanceAfter := int64(8550)
+		parentAccountBalance := int64(10000)
+		parentAccountBalanceAfter := int64(8550)
 
-	returnData := [][]byte{test.ParentFinishA, test.ParentFinishB, []byte("succ")}
-	returnData = append(returnData, test.ChildFinish, test.ParentDataA)
-	for _, c := range test.ParentDataA {
-		returnData = append(returnData, []byte{c})
-	}
-	returnData = append(returnData, test.ParentDataB)
-	for _, c := range test.ParentDataB {
-		returnData = append(returnData, []byte{c})
-	}
-	returnData = append(returnData, []byte("child ok"), []byte("succ"), []byte("succ"))
+		returnData := [][]byte{test.ParentFinishA, test.ParentFinishB, []byte("succ")}
+		returnData = append(returnData, test.ChildFinish, test.ParentDataA)
+		for _, c := range test.ParentDataA {
+			returnData = append(returnData, []byte{c})
+		}
+		returnData = append(returnData, test.ParentDataB)
+		for _, c := range test.ParentDataB {
+			returnData = append(returnData, []byte{c})
+		}
+		returnData = append(returnData, []byte("child ok"), []byte("succ"), []byte("succ"))
 
-	// Call parentFunctionChildCall() of the parent SC, which will call the child
-	// SC and pass some arguments using executeOnSameContext().
+		// Call parentFunctionChildCall() of the parent SC, which will call the child
+		// SC and pass some arguments using executeOnSameContext().
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-same-ctx-parent", "../../")).
-				WithBalance(parentAccountBalance),
-			test.CreateInstanceContract(test.ChildAddress).
-				WithCode(test.GetTestSCCode("exec-same-ctx-child", "../../")).
-				WithBalance(10000)).
-		WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
-			stubBlockchainHook.ProcessBuiltInFunctionCalled = BaseDummyProcessBuiltInFunction(100_000)
-			host.SetBuiltInFunctionsContainer(getBaseDummyrBuiltinFunctionsContainer())
-		}).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction(parentFunctionChildCall).
-			WithGasProvided(test.GasProvided).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.WithTrace().Ok().
-				// test.ParentAddress
-				Balance(host, test.ParentAddress, parentAccountBalanceAfter).
-				GasUsed(test.ParentAddress, 906609).
-				GasUsed(test.ChildAddress, 0).
-				// others
-				GasRemaining(test.GasProvided-
-					test.ParentCompilationCostSameCtx-
-					parentGasBeforeExecuteAPI-
-					executeAPICost-
-					test.ChildCompilationCostSameCtx-
-					childExecutionCost-
-					finalCost).
-				ReturnData(returnData...).
-				Storage(
-					test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyA).WithValue(test.ParentDataA),
-					test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyB).WithValue(test.ParentDataB),
-					test.CreateStoreEntry(test.ParentAddress).WithKey(test.ChildKey).WithValue(test.ChildData),
-				)
-			// Transfers(
-			// 	*test.CreateTransferEntry(test.ParentAddress, test.ParentTransferReceiver),
-			// 	// WithData(test.ParentTransferData).
-			// 	// WithValue(big.NewInt(test.ParentTransferValue)),
-			// 	*test.CreateTransferEntry(test.ParentAddress, test.ChildTransferReceiver),
-			// 	// WithData([]byte("qwerty")).
-			// 	// WithValue(big.NewInt(96)),
-			// )
-		})
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-same-ctx-parent", "../../")).
+					WithBalance(parentAccountBalance),
+				test.CreateInstanceContract(test.ChildAddress).
+					WithCode(test.GetTestSCCode("exec-same-ctx-child", "../../")).
+					WithBalance(10000)).
+			WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
+				stubBlockchainHook.ProcessBuiltInFunctionCalled = BaseDummyProcessBuiltInFunction(100_000)
+				host.SetBuiltInFunctionsContainer(getBaseDummyrBuiltinFunctionsContainer())
+			}).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction(parentFunctionChildCall).
+				WithGasProvided(test.GasProvided).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.WithTrace().Ok().
+					// test.ParentAddress
+					Balance(host, test.ParentAddress, parentAccountBalanceAfter).
+					GasUsed(test.ParentAddress, 906609+nameCopyGas).
+					GasUsed(test.ChildAddress, 0).
+					// others
+					GasRemaining(test.GasProvided-
+						test.ParentCompilationCostSameCtx-
+						parentGasBeforeExecuteAPI-
+						executeAPICost-
+						test.ChildCompilationCostSameCtx-
+						childExecutionCost-
+						finalCost).
+					ReturnData(returnData...).
+					Storage(
+						test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyA).WithValue(test.ParentDataA),
+						test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyB).WithValue(test.ParentDataB),
+						test.CreateStoreEntry(test.ParentAddress).WithKey(test.ChildKey).WithValue(test.ChildData),
+					)
+				// Transfers(
+				// 	*test.CreateTransferEntry(test.ParentAddress, test.ParentTransferReceiver),
+				// 	// WithData(test.ParentTransferData).
+				// 	// WithValue(big.NewInt(test.ParentTransferValue)),
+				// 	*test.CreateTransferEntry(test.ParentAddress, test.ChildTransferReceiver),
+				// 	// WithData([]byte("qwerty")).
+				// 	// WithValue(big.NewInt(96)),
+				// )
+			})
+	})
 }
 
 func TestExecution_ExecuteOnSameContext_Successful_BigInts(t *testing.T) {
-	// Call parentFunctionChildCall_BigInts() of the parent SC, which will call a
-	// method of the child SC that takes some big Int references as arguments and
-	// produce a new big Int out of the arguments.
+	forEachFixAuditChangesV6(t, 21, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		// Call parentFunctionChildCall_BigInts() of the parent SC, which will call a
+		// method of the child SC that takes some big Int references as arguments and
+		// produce a new big Int out of the arguments.
 
-	childExecutionCost := uint64(102)
-	parentGasBeforeExecuteAPI := uint64(114)
-	executeAPICost := uint64(25)
-	finalCost := uint64(63)
+		childExecutionCost := uint64(102)
+		parentGasBeforeExecuteAPI := uint64(114)
+		executeAPICost := uint64(25) + nameCopyGas
+		finalCost := uint64(63)
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-same-ctx-parent", "../../")).
-				WithBalance(1000),
-			test.CreateInstanceContract(test.ChildAddress).
-				WithCode(test.GetTestSCCode("exec-same-ctx-child", "../../")).
-				WithBalance(1000)).
-		WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
-			stubBlockchainHook.ProcessBuiltInFunctionCalled = BaseDummyProcessBuiltInFunction(100_000)
-			host.SetBuiltInFunctionsContainer(getBaseDummyrBuiltinFunctionsContainer())
-		}).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction("parentFunctionChildCall_BigInts").
-			WithGasProvided(test.GasProvided).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				// test.ParentAddress
-				Balance(host, test.ParentAddress, 1000).
-				GasUsed(test.ParentAddress, 6050+test.ChildCompilationCostSameCtx+childExecutionCost).
-				// test.ChildAddress
-				GasUsed(test.ChildAddress, 0).
-				// others
-				GasRemaining(test.GasProvided-
-					test.ParentCompilationCostSameCtx-
-					parentGasBeforeExecuteAPI-
-					executeAPICost-
-					test.ChildCompilationCostSameCtx-
-					childExecutionCost-
-					finalCost).
-				ReturnData([]byte("child ok"), []byte("succ"), []byte("succ"))
-		})
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-same-ctx-parent", "../../")).
+					WithBalance(1000),
+				test.CreateInstanceContract(test.ChildAddress).
+					WithCode(test.GetTestSCCode("exec-same-ctx-child", "../../")).
+					WithBalance(1000)).
+			WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
+				stubBlockchainHook.ProcessBuiltInFunctionCalled = BaseDummyProcessBuiltInFunction(100_000)
+				host.SetBuiltInFunctionsContainer(getBaseDummyrBuiltinFunctionsContainer())
+			}).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction("parentFunctionChildCall_BigInts").
+				WithGasProvided(test.GasProvided).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					// test.ParentAddress
+					Balance(host, test.ParentAddress, 1000).
+					GasUsed(test.ParentAddress, 6050+nameCopyGas+test.ChildCompilationCostSameCtx+childExecutionCost).
+					// test.ChildAddress
+					GasUsed(test.ChildAddress, 0).
+					// others
+					GasRemaining(test.GasProvided-
+						test.ParentCompilationCostSameCtx-
+						parentGasBeforeExecuteAPI-
+						executeAPICost-
+						test.ChildCompilationCostSameCtx-
+						childExecutionCost-
+						finalCost).
+					ReturnData([]byte("child ok"), []byte("succ"), []byte("succ"))
+			})
+	})
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Direct(t *testing.T) {
-	// Scenario:
-	// SC has a method "callRecursive" which takes a byte as argument (number of recursive calls)
-	// callRecursive() saves to storage "keyNNN" → "valueNNN", where NNN is the argument
-	// callRecursive() saves to storage a counter starting at 1, increased by every recursive call
-	// callRecursive() creates a bigInt and increments it with every iteration
-	// callRecursive() finishes "finishNNN" in each iteration
-	// callRecursive() calls itself using executeOnSameContext(), with the argument decremented
-	// callRecursive() handles argument == 0 as follows: saves to storage the
-	//		value of the bigInt counter, then exits without recursive call
-	// Assertions: the VMOutput must contain as many StorageUpdates as the argument requires
-	// Assertions: the VMOutput must contain as many finished values as the argument requires
-	// Assertions: there must be a StorageUpdate with the value of the bigInt counter
+	forEachFixAuditChangesV6(t, 65, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		// Scenario:
+		// SC has a method "callRecursive" which takes a byte as argument (number of recursive calls)
+		// callRecursive() saves to storage "keyNNN" → "valueNNN", where NNN is the argument
+		// callRecursive() saves to storage a counter starting at 1, increased by every recursive call
+		// callRecursive() creates a bigInt and increments it with every iteration
+		// callRecursive() finishes "finishNNN" in each iteration
+		// callRecursive() calls itself using executeOnSameContext(), with the argument decremented
+		// callRecursive() handles argument == 0 as follows: saves to storage the
+		//		value of the bigInt counter, then exits without recursive call
+		// Assertions: the VMOutput must contain as many StorageUpdates as the argument requires
+		// Assertions: the VMOutput must contain as many finished values as the argument requires
+		// Assertions: there must be a StorageUpdate with the value of the bigInt counter
 
-	recursiveCalls := 5
-	var returnData [][]byte
+		recursiveCalls := 5
+		var returnData [][]byte
 
-	for i := recursiveCalls; i >= 0; i-- {
-		finishString := fmt.Sprintf("Rfinish%03d", i)
-		returnData = append(returnData, []byte(finishString))
-	}
-	for i := recursiveCalls - 1; i >= 0; i-- {
-		returnData = append(returnData, []byte("succ"))
-	}
+		for i := recursiveCalls; i >= 0; i-- {
+			finishString := fmt.Sprintf("Rfinish%03d", i)
+			returnData = append(returnData, []byte(finishString))
+		}
+		for i := recursiveCalls - 1; i >= 0; i-- {
+			returnData = append(returnData, []byte("succ"))
+		}
 
-	var storeEntries []test.StoreEntry
+		var storeEntries []test.StoreEntry
 
-	for i := 0; i <= recursiveCalls; i++ {
-		key := fmt.Sprintf("Rkey%03d.........................", i)
-		value := fmt.Sprintf("Rvalue%03d", i)
-		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
-	}
+		for i := 0; i <= recursiveCalls; i++ {
+			key := fmt.Sprintf("Rkey%03d.........................", i)
+			value := fmt.Sprintf("Rvalue%03d", i)
+			storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
+		}
 
-	storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(recursiveCalls + 1)}))
-	storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
+		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(recursiveCalls + 1)}))
+		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-same-ctx-recursive", "../../")).
-				WithBalance(1000)).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction(callRecursive).
-			WithGasProvided(test.GasProvided).
-			WithArguments([]byte{byte(recursiveCalls)}).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				Balance(host, test.ParentAddress, 1000).
-				GasUsed(test.ParentAddress, 52513).
-				ReturnData(returnData...).
-				Storage(storeEntries...)
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-same-ctx-recursive", "../../")).
+					WithBalance(1000)).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction(callRecursive).
+				WithGasProvided(test.GasProvided).
+				WithArguments([]byte{byte(recursiveCalls)}).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					Balance(host, test.ParentAddress, 1000).
+					GasUsed(test.ParentAddress, 52513+nameCopyGas).
+					ReturnData(returnData...).
+					Storage(storeEntries...)
 
-			require.Equal(t, int64(1), host.ManagedTypes().GetBigIntOrCreate(16).Int64())
-		})
+				require.Equal(t, int64(1), host.ManagedTypes().GetBigIntOrCreate(16).Int64())
+			})
+	})
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Direct_ErrMaxInstances(t *testing.T) {
@@ -1639,155 +1669,161 @@ func TestExecution_ExecuteOnSameContext_Recursive_Direct_ErrMaxInstances(t *test
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Mutual_Methods(t *testing.T) {
-	// Scenario:
-	// SC has a method "callRecursiveMutualMethods" which takes a byte as
-	//		argument (number of recursive calls)
-	// callRecursiveMutualMethods() sets the finish value "start recursive mutual calls"
-	// callRecursiveMutualMethods() calls recursiveMethodA() on the same context,
-	//		passing the argument
+	forEachFixAuditChangesV6(t, 96, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		// Scenario:
+		// SC has a method "callRecursiveMutualMethods" which takes a byte as
+		//		argument (number of recursive calls)
+		// callRecursiveMutualMethods() sets the finish value "start recursive mutual calls"
+		// callRecursiveMutualMethods() calls recursiveMethodA() on the same context,
+		//		passing the argument
 
-	// recursiveMethodA() saves to storage "AkeyNNN" → "AvalueNNN", where NNN is the argument
-	// recursiveMethodA() saves to storage a counter starting at 1, increased by every recursive call
-	// recursiveMethodA() creates a bigInt and increments it with every iteration
-	// recursiveMethodA() finishes "AfinishNNN" in each iteration
-	// recursiveMethodA() calls recursiveMethodB() with the argument decremented
-	// recursiveMethodB() is a copy of recursiveMethodA()
-	// when argument == 0, either of them will save to storage the
-	//		value of the bigInt counter, then exits without recursive call
-	// callRecursiveMutualMethods() sets the finish value "end recursive mutual calls" and exits
-	// Assertions: the VMOutput must contain as many StorageUpdates as the argument requires
-	// Assertions: the VMOutput must contain as many finished values as the argument requires
-	// Assertions: there must be a StorageUpdate with the value of the bigInt counter
+		// recursiveMethodA() saves to storage "AkeyNNN" → "AvalueNNN", where NNN is the argument
+		// recursiveMethodA() saves to storage a counter starting at 1, increased by every recursive call
+		// recursiveMethodA() creates a bigInt and increments it with every iteration
+		// recursiveMethodA() finishes "AfinishNNN" in each iteration
+		// recursiveMethodA() calls recursiveMethodB() with the argument decremented
+		// recursiveMethodB() is a copy of recursiveMethodA()
+		// when argument == 0, either of them will save to storage the
+		//		value of the bigInt counter, then exits without recursive call
+		// callRecursiveMutualMethods() sets the finish value "end recursive mutual calls" and exits
+		// Assertions: the VMOutput must contain as many StorageUpdates as the argument requires
+		// Assertions: the VMOutput must contain as many finished values as the argument requires
+		// Assertions: there must be a StorageUpdate with the value of the bigInt counter
 
-	recursiveCalls := 5
+		recursiveCalls := 5
 
-	var returnData [][]byte
-	var storeEntries []test.StoreEntry
+		var returnData [][]byte
+		var storeEntries []test.StoreEntry
 
-	storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(recursiveCalls + 1)}))
-	storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
+		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(recursiveCalls + 1)}))
+		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
 
-	returnData = append(returnData, []byte("start recursive mutual calls"))
+		returnData = append(returnData, []byte("start recursive mutual calls"))
 
-	for i := 0; i <= recursiveCalls; i++ {
-		var finishData string
-		var key string
-		var value string
-		iteration := recursiveCalls - i
-		if i%2 == 0 {
-			finishData = fmt.Sprintf("Afinish%03d", iteration)
-			key = fmt.Sprintf("Akey%03d.........................", iteration)
-			value = fmt.Sprintf("Avalue%03d", iteration)
-		} else {
-			finishData = fmt.Sprintf("Bfinish%03d", iteration)
-			key = fmt.Sprintf("Bkey%03d.........................", iteration)
-			value = fmt.Sprintf("Bvalue%03d", iteration)
+		for i := 0; i <= recursiveCalls; i++ {
+			var finishData string
+			var key string
+			var value string
+			iteration := recursiveCalls - i
+			if i%2 == 0 {
+				finishData = fmt.Sprintf("Afinish%03d", iteration)
+				key = fmt.Sprintf("Akey%03d.........................", iteration)
+				value = fmt.Sprintf("Avalue%03d", iteration)
+			} else {
+				finishData = fmt.Sprintf("Bfinish%03d", iteration)
+				key = fmt.Sprintf("Bkey%03d.........................", iteration)
+				value = fmt.Sprintf("Bvalue%03d", iteration)
+			}
+			storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
+			returnData = append(returnData, []byte(finishData))
 		}
-		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
-		returnData = append(returnData, []byte(finishData))
-	}
 
-	for i := recursiveCalls; i >= 0; i-- {
-		returnData = append(returnData, []byte("succ"))
-	}
+		for i := recursiveCalls; i >= 0; i-- {
+			returnData = append(returnData, []byte("succ"))
+		}
 
-	returnData = append(returnData, []byte("end recursive mutual calls"))
+		returnData = append(returnData, []byte("end recursive mutual calls"))
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-same-ctx-recursive", "../../")).
-				WithBalance(1000)).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction("callRecursiveMutualMethods").
-			WithGasProvided(test.GasProvided).
-			WithArguments([]byte{byte(recursiveCalls)}).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				Balance(host, test.ParentAddress, 1000).
-				GasUsed(test.ParentAddress, 58642).
-				ReturnData(returnData...).
-				Storage(storeEntries...)
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-same-ctx-recursive", "../../")).
+					WithBalance(1000)).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction("callRecursiveMutualMethods").
+				WithGasProvided(test.GasProvided).
+				WithArguments([]byte{byte(recursiveCalls)}).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					Balance(host, test.ParentAddress, 1000).
+					GasUsed(test.ParentAddress, 58642+nameCopyGas).
+					ReturnData(returnData...).
+					Storage(storeEntries...)
 
-			require.Equal(t, int64(0), host.ManagedTypes().GetBigIntOrCreate(16).Int64())
-		})
+				require.Equal(t, int64(0), host.ManagedTypes().GetBigIntOrCreate(16).Int64())
+			})
+	})
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Mutual_SCs(t *testing.T) {
-	// Scenario:
-	// Parent has method parentCallChild()
-	// Child has method childCallParent()
-	// The two methods are identical, just named differently
-	// The methods do the following:
-	//		parent: save to storage "PkeyNNN" → "PvalueNNN"
-	//		parent:	finish "PfinishNNN"
-	//		child:	save to storage "CkeyNNN" → "CvalueNNN"
-	//		child:	finish "CfinishNNN"
-	//		both:		increment a shared bigInt counter
-	//		both:		whoever exits must save the shared bigInt counter to storage
+	forEachFixAuditChangesV6(t, 64, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		// Scenario:
+		// Parent has method parentCallChild()
+		// Child has method childCallParent()
+		// The two methods are identical, just named differently
+		// The methods do the following:
+		//		parent: save to storage "PkeyNNN" → "PvalueNNN"
+		//		parent:	finish "PfinishNNN"
+		//		child:	save to storage "CkeyNNN" → "CvalueNNN"
+		//		child:	finish "CfinishNNN"
+		//		both:		increment a shared bigInt counter
+		//		both:		whoever exits must save the shared bigInt counter to storage
 
-	// Call parentFunctionChildCall() of the parent SC, which will call the child
-	// SC and pass some arguments using executeOnDestContext().
+		// Call parentFunctionChildCall() of the parent SC, which will call the child
+		// SC and pass some arguments using executeOnDestContext().
 
-	recursiveCalls := 4
+		recursiveCalls := 4
 
-	var returnData [][]byte
-	var storeEntries []test.StoreEntry
+		var returnData [][]byte
+		var storeEntries []test.StoreEntry
 
-	for i := 0; i <= recursiveCalls; i++ {
-		var finishData string
-		var key string
-		var value string
-		iteration := recursiveCalls - i
-		if i%2 == 0 {
-			finishData = fmt.Sprintf("Pfinish%03d", iteration)
-			key = fmt.Sprintf("Pkey%03d.........................", iteration)
-			value = fmt.Sprintf("Pvalue%03d", iteration)
-		} else {
-			finishData = fmt.Sprintf("Cfinish%03d", iteration)
-			key = fmt.Sprintf("Ckey%03d.........................", iteration)
-			value = fmt.Sprintf("Cvalue%03d", iteration)
+		for i := 0; i <= recursiveCalls; i++ {
+			var finishData string
+			var key string
+			var value string
+			iteration := recursiveCalls - i
+			if i%2 == 0 {
+				finishData = fmt.Sprintf("Pfinish%03d", iteration)
+				key = fmt.Sprintf("Pkey%03d.........................", iteration)
+				value = fmt.Sprintf("Pvalue%03d", iteration)
+			} else {
+				finishData = fmt.Sprintf("Cfinish%03d", iteration)
+				key = fmt.Sprintf("Ckey%03d.........................", iteration)
+				value = fmt.Sprintf("Cvalue%03d", iteration)
+			}
+			storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
+			returnData = append(returnData, []byte(finishData))
 		}
-		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
-		returnData = append(returnData, []byte(finishData))
-	}
 
-	for i := recursiveCalls - 1; i >= 0; i-- {
-		returnData = append(returnData, []byte("succ"))
-	}
+		for i := recursiveCalls - 1; i >= 0; i-- {
+			returnData = append(returnData, []byte("succ"))
+		}
 
-	storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(recursiveCalls + 1)}))
-	storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
+		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(recursiveCalls + 1)}))
+		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-same-ctx-recursive-parent", "../../")).
-				WithBalance(1000),
-			test.CreateInstanceContract(test.ChildAddress).
-				WithCode(test.GetTestSCCode("exec-same-ctx-recursive-child", "../../")).
-				WithBalance(1000)).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction(parentCallsChild).
-			WithGasProvided(test.GasProvided).
-			WithArguments([]byte{byte(recursiveCalls)}).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				// test.ParentAddress
-				Balance(host, test.ParentAddress, 1000).
-				GasUsed(test.ParentAddress, 34097).
-				// test.ChildAddress
-				GasUsed(test.ChildAddress, 0).
-				// other
-				ReturnData(returnData...).
-				Storage(storeEntries...)
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-same-ctx-recursive-parent", "../../")).
+					WithBalance(1000),
+				test.CreateInstanceContract(test.ChildAddress).
+					WithCode(test.GetTestSCCode("exec-same-ctx-recursive-child", "../../")).
+					WithBalance(1000)).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction(parentCallsChild).
+				WithGasProvided(test.GasProvided).
+				WithArguments([]byte{byte(recursiveCalls)}).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					// test.ParentAddress
+					Balance(host, test.ParentAddress, 1000).
+					GasUsed(test.ParentAddress, 34097+nameCopyGas).
+					// test.ChildAddress
+					GasUsed(test.ChildAddress, 0).
+					// other
+					ReturnData(returnData...).
+					Storage(storeEntries...)
 
-			require.Equal(t, int64(1), host.ManagedTypes().GetBigIntOrCreate(88).Int64())
-		})
+				require.Equal(t, int64(1), host.ManagedTypes().GetBigIntOrCreate(88).Int64())
+			})
+	})
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Mutual_SCs_OutOfGas(t *testing.T) {
@@ -1926,121 +1962,127 @@ func TestExecution_ExecuteOnDestContext_OutOfGas(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnDestContext_Successful(t *testing.T) {
-	// Call parentFunctionChildCall() of the parent SC, which will call the child
-	// SC and pass some arguments using executeOnDestContext().
+	forEachFixAuditChangesV6(t, 13, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		// Call parentFunctionChildCall() of the parent SC, which will call the child
+		// SC and pass some arguments using executeOnDestContext().
 
-	parentGasBeforeExecuteAPI := uint64(168)
-	executeAPICost := uint64(54)
-	childExecutionCost := uint64(272)
-	finalCost := uint64(808596)
-	// childTransferValue := int64(12)
+		parentGasBeforeExecuteAPI := uint64(168)
+		executeAPICost := uint64(54) + nameCopyGas
+		childExecutionCost := uint64(272)
+		finalCost := uint64(808596)
+		// childTransferValue := int64(12)
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-parent", "../../")).
-				WithBalance(10000),
-			test.CreateInstanceContract(test.ChildAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-child", "../../")).
-				WithBalance(10000),
-		).
-		WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
-			stubBlockchainHook.ProcessBuiltInFunctionCalled = BaseDummyProcessBuiltInFunction(200_000)
-			host.SetBuiltInFunctionsContainer(getBaseDummyrBuiltinFunctionsContainer())
-		}).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction(parentFunctionChildCall).
-			WithGasProvided(test.GasProvided).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				// test.ParentAddress
-				Balance(host, test.ParentAddress, 9703).
-				GasUsed(test.ParentAddress, 815458).
-				Balance(host, test.ChildAddress, 8790).
-				GasUsed(test.ChildAddress, test.ChildCompilationCostDestCtx+childExecutionCost).
-				GasRemaining(test.GasProvided-
-					test.ParentCompilationCostDestCtx-
-					parentGasBeforeExecuteAPI-
-					executeAPICost-
-					test.ChildCompilationCostDestCtx-
-					childExecutionCost-
-					finalCost).
-				ReturnData(test.ParentFinishA, test.ParentFinishB, []byte("succ"), test.ChildFinish, []byte("succ"), []byte("succ")).
-				Storage(
-					test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyA).WithValue(test.ParentDataA),
-					test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyB).WithValue(test.ParentDataB),
-					test.CreateStoreEntry(test.ChildAddress).WithKey(test.ChildKey).WithValue(test.ChildData),
-				)
-			// Transfers(
-			// 	*test.CreateTransferEntry(test.ChildAddress, test.ChildTransferReceiver),
-			// 	// WithData([]byte("Second sentence.")).
-			// 	// WithValue(big.NewInt(childTransferValue)),
-			// 	*test.CreateTransferEntry(test.ParentAddress, test.ParentTransferReceiver),
-			// 	// WithData(test.ParentTransferData).
-			// 	// WithValue(big.NewInt(test.ParentTransferValue)),
-			// )
-		})
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-parent", "../../")).
+					WithBalance(10000),
+				test.CreateInstanceContract(test.ChildAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-child", "../../")).
+					WithBalance(10000),
+			).
+			WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
+				stubBlockchainHook.ProcessBuiltInFunctionCalled = BaseDummyProcessBuiltInFunction(200_000)
+				host.SetBuiltInFunctionsContainer(getBaseDummyrBuiltinFunctionsContainer())
+			}).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction(parentFunctionChildCall).
+				WithGasProvided(test.GasProvided).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					// test.ParentAddress
+					Balance(host, test.ParentAddress, 9703).
+					GasUsed(test.ParentAddress, 815458+nameCopyGas).
+					Balance(host, test.ChildAddress, 8790).
+					GasUsed(test.ChildAddress, test.ChildCompilationCostDestCtx+childExecutionCost).
+					GasRemaining(test.GasProvided-
+						test.ParentCompilationCostDestCtx-
+						parentGasBeforeExecuteAPI-
+						executeAPICost-
+						test.ChildCompilationCostDestCtx-
+						childExecutionCost-
+						finalCost).
+					ReturnData(test.ParentFinishA, test.ParentFinishB, []byte("succ"), test.ChildFinish, []byte("succ"), []byte("succ")).
+					Storage(
+						test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyA).WithValue(test.ParentDataA),
+						test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyB).WithValue(test.ParentDataB),
+						test.CreateStoreEntry(test.ChildAddress).WithKey(test.ChildKey).WithValue(test.ChildData),
+					)
+				// Transfers(
+				// 	*test.CreateTransferEntry(test.ChildAddress, test.ChildTransferReceiver),
+				// 	// WithData([]byte("Second sentence.")).
+				// 	// WithValue(big.NewInt(childTransferValue)),
+				// 	*test.CreateTransferEntry(test.ParentAddress, test.ParentTransferReceiver),
+				// 	// WithData(test.ParentTransferData).
+				// 	// WithValue(big.NewInt(test.ParentTransferValue)),
+				// )
+			})
+	})
 }
 
 func TestExecution_ExecuteOnDestContext_Successful_ChildReturns(t *testing.T) {
-	// Call parentFunctionChildCall() of the parent SC, which will call the child
-	// SC and pass some arguments using executeOnDestContext().
+	forEachFixAuditChangesV6(t, 13, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		// Call parentFunctionChildCall() of the parent SC, which will call the child
+		// SC and pass some arguments using executeOnDestContext().
 
-	parentGasBeforeExecuteAPI := uint64(168)
-	executeAPICost := uint64(54)
-	childExecutionCost := uint64(272)
-	parentGasAfterExecuteAPI := uint64(793519)
-	// childTransferValue := int64(12)
+		parentGasBeforeExecuteAPI := uint64(168)
+		executeAPICost := uint64(54) + nameCopyGas
+		childExecutionCost := uint64(272)
+		parentGasAfterExecuteAPI := uint64(793519)
+		// childTransferValue := int64(12)
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-parent", "../../")).
-				WithBalance(10000),
-			test.CreateInstanceContract(test.ChildAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-child", "../../")).
-				WithBalance(10000),
-		).
-		WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
-			stubBlockchainHook.ProcessBuiltInFunctionCalled = BaseDummyProcessBuiltInFunction(200_000)
-			host.SetBuiltInFunctionsContainer(getBaseDummyrBuiltinFunctionsContainer())
-		}).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction("parentFunctionChildCall_ReturnedData").
-			WithGasProvided(test.GasProvided).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				// test.ParentAddress
-				Balance(host, test.ParentAddress, 9703).
-				GasUsed(test.ParentAddress, 800381).
-				Balance(host, test.ChildAddress, 8790).
-				GasUsed(test.ChildAddress, test.ChildCompilationCostDestCtx+childExecutionCost).
-				GasRemaining(test.GasProvided-
-					test.ParentCompilationCostDestCtx-
-					parentGasBeforeExecuteAPI-
-					executeAPICost-
-					test.ChildCompilationCostDestCtx-
-					childExecutionCost-
-					parentGasAfterExecuteAPI).
-				ReturnData(test.ParentFinishA, test.ParentFinishB, []byte("succ"), test.ChildFinish, []byte("succ")).
-				Storage(
-					test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyA).WithValue(test.ParentDataA),
-					test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyB).WithValue(test.ParentDataB),
-					test.CreateStoreEntry(test.ChildAddress).WithKey(test.ChildKey).WithValue(test.ChildData),
-				)
-			// Transfers(
-			// 	*test.CreateTransferEntry(test.ChildAddress, test.ChildTransferReceiver),
-			// 	// WithData([]byte("Second sentence.")).
-			// 	// WithValue(big.NewInt(childTransferValue)),
-			// 	*test.CreateTransferEntry(test.ParentAddress, test.ParentTransferReceiver),
-			// 	// WithData(test.ParentTransferData).
-			// 	// WithValue(big.NewInt(test.ParentTransferValue)),
-			// )
-		})
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-parent", "../../")).
+					WithBalance(10000),
+				test.CreateInstanceContract(test.ChildAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-child", "../../")).
+					WithBalance(10000),
+			).
+			WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
+				stubBlockchainHook.ProcessBuiltInFunctionCalled = BaseDummyProcessBuiltInFunction(200_000)
+				host.SetBuiltInFunctionsContainer(getBaseDummyrBuiltinFunctionsContainer())
+			}).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction("parentFunctionChildCall_ReturnedData").
+				WithGasProvided(test.GasProvided).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					// test.ParentAddress
+					Balance(host, test.ParentAddress, 9703).
+					GasUsed(test.ParentAddress, 800381+nameCopyGas).
+					Balance(host, test.ChildAddress, 8790).
+					GasUsed(test.ChildAddress, test.ChildCompilationCostDestCtx+childExecutionCost).
+					GasRemaining(test.GasProvided-
+						test.ParentCompilationCostDestCtx-
+						parentGasBeforeExecuteAPI-
+						executeAPICost-
+						test.ChildCompilationCostDestCtx-
+						childExecutionCost-
+						parentGasAfterExecuteAPI).
+					ReturnData(test.ParentFinishA, test.ParentFinishB, []byte("succ"), test.ChildFinish, []byte("succ")).
+					Storage(
+						test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyA).WithValue(test.ParentDataA),
+						test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyB).WithValue(test.ParentDataB),
+						test.CreateStoreEntry(test.ChildAddress).WithKey(test.ChildKey).WithValue(test.ChildData),
+					)
+				// Transfers(
+				// 	*test.CreateTransferEntry(test.ChildAddress, test.ChildTransferReceiver),
+				// 	// WithData([]byte("Second sentence.")).
+				// 	// WithValue(big.NewInt(childTransferValue)),
+				// 	*test.CreateTransferEntry(test.ParentAddress, test.ParentTransferReceiver),
+				// 	// WithData(test.ParentTransferData).
+				// 	// WithValue(big.NewInt(test.ParentTransferValue)),
+				// )
+			})
+	})
 }
 
 // func TestExecution_ExecuteOnDestContext_GasRemaining(t *testing.T) {
@@ -2113,232 +2155,244 @@ func TestExecution_ExecuteOnDestContext_Successful_ChildReturns(t *testing.T) {
 // }
 
 func TestExecution_ExecuteOnDestContext_Successful_BigInts(t *testing.T) {
-	// Call parentFunctionChildCall_BigInts() of the parent SC, which will call a
-	// method of the child SC that takes some big Int references as arguments and
-	// produce a new big Int out of the arguments.
+	forEachFixAuditChangesV6(t, 21, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		// Call parentFunctionChildCall_BigInts() of the parent SC, which will call a
+		// method of the child SC that takes some big Int references as arguments and
+		// produce a new big Int out of the arguments.
 
-	parentGasBeforeExecuteAPI := uint64(115)
-	executeAPICost := uint64(25)
-	childExecutionCost := uint64(101)
-	finalCost := uint64(64)
+		parentGasBeforeExecuteAPI := uint64(115)
+		executeAPICost := uint64(25) + nameCopyGas
+		childExecutionCost := uint64(101)
+		finalCost := uint64(64)
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-parent", "../../")).
-				WithBalance(10000),
-			test.CreateInstanceContract(test.ChildAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-child", "../../")).
-				WithBalance(10000),
-		).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction("parentFunctionChildCall_BigInts").
-			WithGasProvided(test.GasProvided).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				Balance(host, test.ParentAddress, 9802).
-				GasUsed(test.ParentAddress, 6842).
-				GasUsed(test.ChildAddress, 4693).
-				GasRemaining(test.GasProvided-
-					test.ParentCompilationCostDestCtx-
-					parentGasBeforeExecuteAPI-
-					executeAPICost-
-					test.ChildCompilationCostDestCtx-
-					childExecutionCost-
-					finalCost).
-				ReturnData([]byte("child ok"), []byte("succ"), []byte("succ"))
-		})
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-parent", "../../")).
+					WithBalance(10000),
+				test.CreateInstanceContract(test.ChildAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-child", "../../")).
+					WithBalance(10000),
+			).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction("parentFunctionChildCall_BigInts").
+				WithGasProvided(test.GasProvided).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					Balance(host, test.ParentAddress, 9802).
+					GasUsed(test.ParentAddress, 6842+nameCopyGas).
+					GasUsed(test.ChildAddress, 4693).
+					GasRemaining(test.GasProvided-
+						test.ParentCompilationCostDestCtx-
+						parentGasBeforeExecuteAPI-
+						executeAPICost-
+						test.ChildCompilationCostDestCtx-
+						childExecutionCost-
+						finalCost).
+					ReturnData([]byte("child ok"), []byte("succ"), []byte("succ"))
+			})
+	})
 }
 
 func TestExecution_ExecuteOnDestContext_Recursive_Direct(t *testing.T) {
-	recursiveCalls := 6
+	forEachFixAuditChangesV6(t, 78, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		recursiveCalls := 6
 
-	var returnData [][]byte
-	var storeEntries []test.StoreEntry
+		var returnData [][]byte
+		var storeEntries []test.StoreEntry
 
-	for i := recursiveCalls; i >= 0; i-- {
-		finishString := fmt.Sprintf("Rfinish%03d", i)
-		returnData = append(returnData, []byte(finishString))
-	}
+		for i := recursiveCalls; i >= 0; i-- {
+			finishString := fmt.Sprintf("Rfinish%03d", i)
+			returnData = append(returnData, []byte(finishString))
+		}
 
-	for i := recursiveCalls - 1; i >= 0; i-- {
-		returnData = append(returnData, []byte("succ"))
-	}
+		for i := recursiveCalls - 1; i >= 0; i-- {
+			returnData = append(returnData, []byte("succ"))
+		}
 
-	for i := 0; i <= recursiveCalls; i++ {
-		key := fmt.Sprintf("Rkey%03d.........................", i)
-		value := fmt.Sprintf("Rvalue%03d", i)
-		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
-	}
+		for i := 0; i <= recursiveCalls; i++ {
+			key := fmt.Sprintf("Rkey%03d.........................", i)
+			value := fmt.Sprintf("Rvalue%03d", i)
+			storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
+		}
 
-	storeEntries = append(storeEntries,
-		test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(recursiveCalls + 1)}),
-		test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
+		storeEntries = append(storeEntries,
+			test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(recursiveCalls + 1)}),
+			test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-recursive", "../../")).
-				WithBalance(1000),
-		).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction(callRecursive).
-			WithGasProvided(test.GasProvided).
-			WithArguments([]byte{byte(recursiveCalls)}).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				Balance(host, test.ParentAddress, 1000).
-				GasUsed(test.ParentAddress, 58726).
-				ReturnData(returnData...).
-				Storage(storeEntries...)
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-recursive", "../../")).
+					WithBalance(1000),
+			).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction(callRecursive).
+				WithGasProvided(test.GasProvided).
+				WithArguments([]byte{byte(recursiveCalls)}).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					Balance(host, test.ParentAddress, 1000).
+					GasUsed(test.ParentAddress, 58726+nameCopyGas).
+					ReturnData(returnData...).
+					Storage(storeEntries...)
 
-			require.Equal(t, int64(1), host.ManagedTypes().GetBigIntOrCreate(16).Int64())
-		})
+				require.Equal(t, int64(1), host.ManagedTypes().GetBigIntOrCreate(16).Int64())
+			})
+	})
 }
 
 func TestExecution_ExecuteOnDestContext_Recursive_Mutual_Methods(t *testing.T) {
-	recursiveCalls := 7
+	forEachFixAuditChangesV6(t, 128, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		recursiveCalls := 7
 
-	var returnData [][]byte
-	var storeEntries []test.StoreEntry
+		var returnData [][]byte
+		var storeEntries []test.StoreEntry
 
-	storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(recursiveCalls + 1)}))
-	storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
+		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(recursiveCalls + 1)}))
+		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
 
-	returnData = append(returnData, []byte("start recursive mutual calls"))
+		returnData = append(returnData, []byte("start recursive mutual calls"))
 
-	for i := 0; i <= recursiveCalls; i++ {
-		var finishData string
-		var key string
-		var value string
-		iteration := recursiveCalls - i
-		if i%2 == 0 {
-			finishData = fmt.Sprintf("Afinish%03d", iteration)
-			key = fmt.Sprintf("Akey%03d.........................", iteration)
-			value = fmt.Sprintf("Avalue%03d", iteration)
-		} else {
-			finishData = fmt.Sprintf("Bfinish%03d", iteration)
-			key = fmt.Sprintf("Bkey%03d.........................", iteration)
-			value = fmt.Sprintf("Bvalue%03d", iteration)
+		for i := 0; i <= recursiveCalls; i++ {
+			var finishData string
+			var key string
+			var value string
+			iteration := recursiveCalls - i
+			if i%2 == 0 {
+				finishData = fmt.Sprintf("Afinish%03d", iteration)
+				key = fmt.Sprintf("Akey%03d.........................", iteration)
+				value = fmt.Sprintf("Avalue%03d", iteration)
+			} else {
+				finishData = fmt.Sprintf("Bfinish%03d", iteration)
+				key = fmt.Sprintf("Bkey%03d.........................", iteration)
+				value = fmt.Sprintf("Bvalue%03d", iteration)
+			}
+			storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
+			returnData = append(returnData, []byte(finishData))
 		}
-		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
-		returnData = append(returnData, []byte(finishData))
-	}
 
-	for i := recursiveCalls; i >= 0; i-- {
-		returnData = append(returnData, []byte("succ"))
-	}
+		for i := recursiveCalls; i >= 0; i-- {
+			returnData = append(returnData, []byte("succ"))
+		}
 
-	returnData = append(returnData, []byte("end recursive mutual calls"))
+		returnData = append(returnData, []byte("end recursive mutual calls"))
 
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-recursive", "../../")).
-				WithBalance(1000),
-		).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction("callRecursiveMutualMethods").
-			WithGasProvided(test.GasProvided).
-			WithArguments([]byte{byte(recursiveCalls)}).
-			Build()).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				Balance(host, test.ParentAddress, 1000).
-				GasUsed(test.ParentAddress, 71066).
-				ReturnData(returnData...).
-				Storage(storeEntries...)
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-recursive", "../../")).
+					WithBalance(1000),
+			).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction("callRecursiveMutualMethods").
+				WithGasProvided(test.GasProvided).
+				WithArguments([]byte{byte(recursiveCalls)}).
+				Build()).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					Balance(host, test.ParentAddress, 1000).
+					GasUsed(test.ParentAddress, 71066+nameCopyGas).
+					ReturnData(returnData...).
+					Storage(storeEntries...)
 
-			require.Equal(t, int64(0), host.ManagedTypes().GetBigIntOrCreate(16).Int64())
-		})
+				require.Equal(t, int64(0), host.ManagedTypes().GetBigIntOrCreate(16).Int64())
+			})
+	})
 }
 
 func TestExecution_ExecuteOnDestContext_Recursive_Mutual_SCs(t *testing.T) {
-	// Call parentFunctionChildCall() of the parent SC, which will call the child
-	// SC and pass some arguments using executeOnDestContext().
+	forEachFixAuditChangesV6(t, 48, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+		// Call parentFunctionChildCall() of the parent SC, which will call the child
+		// SC and pass some arguments using executeOnDestContext().
 
-	recursiveCalls := 6
+		recursiveCalls := 6
 
-	// parentIterations := (recursiveCalls / 2) + (recursiveCalls % 2)
-	// childIterations := recursiveCalls - parentIterations
-	// balanceDelta := int64(5*parentIterations - 3*childIterations)
+		// parentIterations := (recursiveCalls / 2) + (recursiveCalls % 2)
+		// childIterations := recursiveCalls - parentIterations
+		// balanceDelta := int64(5*parentIterations - 3*childIterations)
 
-	var returnData [][]byte
-	var storeEntries []test.StoreEntry
+		var returnData [][]byte
+		var storeEntries []test.StoreEntry
 
-	for i := 0; i <= recursiveCalls; i++ {
-		var finishData string
-		var key string
-		var value string
-		iteration := recursiveCalls - i
-		if i%2 == 0 {
-			finishData = fmt.Sprintf("Pfinish%03d", iteration)
-			key = fmt.Sprintf("Pkey%03d.........................", iteration)
-			value = fmt.Sprintf("Pvalue%03d", iteration)
-			storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
-		} else {
-			finishData = fmt.Sprintf("Cfinish%03d", iteration)
-			key = fmt.Sprintf("Ckey%03d.........................", iteration)
-			value = fmt.Sprintf("Cvalue%03d", iteration)
-			storeEntries = append(storeEntries, test.CreateStoreEntry(test.ChildAddress).WithKey([]byte(key)).WithValue([]byte(value)))
+		for i := 0; i <= recursiveCalls; i++ {
+			var finishData string
+			var key string
+			var value string
+			iteration := recursiveCalls - i
+			if i%2 == 0 {
+				finishData = fmt.Sprintf("Pfinish%03d", iteration)
+				key = fmt.Sprintf("Pkey%03d.........................", iteration)
+				value = fmt.Sprintf("Pvalue%03d", iteration)
+				storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey([]byte(key)).WithValue([]byte(value)))
+			} else {
+				finishData = fmt.Sprintf("Cfinish%03d", iteration)
+				key = fmt.Sprintf("Ckey%03d.........................", iteration)
+				value = fmt.Sprintf("Cvalue%03d", iteration)
+				storeEntries = append(storeEntries, test.CreateStoreEntry(test.ChildAddress).WithKey([]byte(key)).WithValue([]byte(value)))
+			}
+			returnData = append(returnData, []byte(finishData))
 		}
-		returnData = append(returnData, []byte(finishData))
-	}
 
-	for i := recursiveCalls - 1; i >= 0; i-- {
-		returnData = append(returnData, []byte("succ"))
-	}
+		for i := recursiveCalls - 1; i >= 0; i-- {
+			returnData = append(returnData, []byte("succ"))
+		}
 
-	counterValue := (recursiveCalls + recursiveCalls%2) / 2
+		counterValue := (recursiveCalls + recursiveCalls%2) / 2
 
-	storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(counterValue + 1)}))
-	storeEntries = append(storeEntries, test.CreateStoreEntry(test.ChildAddress).WithKey(test.RecursiveIterationCounterKey).WithValue(big.NewInt(int64(counterValue)).Bytes()))
+		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationCounterKey).WithValue([]byte{byte(counterValue + 1)}))
+		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ChildAddress).WithKey(test.RecursiveIterationCounterKey).WithValue(big.NewInt(int64(counterValue)).Bytes()))
 
-	if recursiveCalls%2 == 0 {
-		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
-	} else {
-		storeEntries = append(storeEntries, test.CreateStoreEntry(test.ChildAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
-	}
+		if recursiveCalls%2 == 0 {
+			storeEntries = append(storeEntries, test.CreateStoreEntry(test.ParentAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
+		} else {
+			storeEntries = append(storeEntries, test.CreateStoreEntry(test.ChildAddress).WithKey(test.RecursiveIterationBigCounterKey).WithValue(big.NewInt(int64(1)).Bytes()))
+		}
 
-	testCase := test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-recursive-parent", "../../")).
-				WithBalance(1000),
-			test.CreateInstanceContract(test.ChildAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-recursive-child", "../../")).
-				WithBalance(1000),
-		).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithFunction(parentCallsChild).
-			WithGasProvided(test.GasProvided).
-			WithArguments([]byte{byte(recursiveCalls)}).
-			Build())
+		testCase := test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-recursive-parent", "../../")).
+					WithBalance(1000),
+				test.CreateInstanceContract(test.ChildAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-recursive-child", "../../")).
+					WithBalance(1000),
+			).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithFunction(parentCallsChild).
+				WithGasProvided(test.GasProvided).
+				WithArguments([]byte{byte(recursiveCalls)}).
+				Build())
 
-	for i := 0; i < 1; i++ {
-		testCase.AndAssertResultsWithoutReset(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				// test.ParentAddress
-				Balance(host, test.ParentAddress, 988).
-				GasUsed(test.ParentAddress, 30323).
-				// test.ChildAddress
-				Balance(host, test.ChildAddress, 1012).
-				GasUsed(test.ChildAddress, 26591).
-				// others
-				ReturnData(returnData...).
-				Storage(storeEntries...)
+		for i := 0; i < 1; i++ {
+			testCase.AndAssertResultsWithoutReset(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					// test.ParentAddress
+					Balance(host, test.ParentAddress, 988).
+					GasUsed(test.ParentAddress, 30323+nameCopyGas).
+					// test.ChildAddress
+					Balance(host, test.ChildAddress, 1012).
+					GasUsed(test.ChildAddress, 26591+nameCopyGas).
+					// others
+					ReturnData(returnData...).
+					Storage(storeEntries...)
 
-			require.Equal(t, int64(1), host.ManagedTypes().GetBigIntOrCreate(88).Int64())
-		})
-	}
+				require.Equal(t, int64(1), host.ManagedTypes().GetBigIntOrCreate(88).Int64())
+			})
+		}
 
-	_ = testCase.GetVMHost().Close()
+		_ = testCase.GetVMHost().Close()
+	})
 }
 
 func TestExecution_ExecuteOnDestContext_Recursive_Mutual_SCs_OutOfGas(t *testing.T) {

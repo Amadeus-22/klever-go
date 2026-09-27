@@ -122,6 +122,9 @@ const (
 	// CodeMetadataLen specifies the length of the code metadata
 	CodeMetadataLen = 2
 
+	// MaxFunctionNameLength is the protocol limit on function names: a valid name is strictly shorter
+	MaxFunctionNameLength = 256
+
 	// InitFunctionName specifies the name for the init function
 	InitFunctionName = "init"
 

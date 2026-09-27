@@ -450,6 +450,143 @@ func TestVMHooksImpl_WriteLog_TracesGasOnce(t *testing.T) {
 	assert.Equal(t, expectedTrace, metering.GetGasTrace())
 }
 
+// From FixAuditChangesV6 WriteEventLog charges in four places: the lengths array and the topics inside
+// getArgumentsFromMemory, the data in memLoadCharged, then the Log base cost. The copy charges go into
+// the trace the hook already opened, so the whole call must still show up as a single writeEventLog
+// entry: a helper that started its own trace would split it, one that did not trace would lose gas.
+func TestVMHooksImpl_WriteEventLog_TracesGasOnce(t *testing.T) {
+	t.Parallel()
+
+	const gasProvided = uint64(1000)
+	scAddress := []byte("scAddress1")
+
+	host := newMockVMHost()
+	host.ForkControllerContext = &commonMock.ForkControllerStub{FixAuditChangesV4Value: true, FixAuditChangesV6Value: true}
+	host.OutputContext = &contextmock.OutputContextStub{}
+	host.RuntimeContext.(*contextmock.RuntimeContextMock).SCAddress = scAddress
+
+	metering, err := contexts.NewMeteringContext(host, config.MakeGasMapForTests())
+	require.NoError(t, err)
+	metering.InitStateFromContractCallInput(&vmcommon.VMInput{GasProvided: gasProvided})
+	metering.SetGasTracing(true)
+	host.MeteringContext = metering
+	managedTypes, err := contexts.NewManagedTypesContext(host)
+	require.NoError(t, err)
+	host.ManagedTypesContext = managedTypes
+
+	metering.StartGasTracing("previousHook")
+
+	topics := [][]byte{[]byte("topic1"), []byte("longerTopic2")}
+	data := []byte("event data")
+	topicLengths := make([]byte, 4*len(topics))
+	for i, topic := range topics {
+		topicLengths[i*4] = byte(len(topic))
+	}
+	require.NoError(t, host.MemStoreToMock(executor.MemPtr(0), topicLengths))
+	require.NoError(t, host.MemStoreToMock(executor.MemPtr(100), bytes.Join(topics, nil)))
+	require.NoError(t, host.MemStoreToMock(executor.MemPtr(200), data))
+
+	schedule := metering.GasSchedule()
+	copiedBytes := uint64(len(topicLengths) + len(topics[0]) + len(topics[1]) + len(data))
+	expectedGas := schedule.BaseOpsAPICost.Log + schedule.BaseOperationCost.DataCopyPerByte*copiedBytes
+
+	vmhooks.NewVMHooksImpl(host).WriteEventLog(
+		int32(len(topics)), executor.MemPtr(0), executor.MemPtr(100), executor.MemPtr(200), executor.MemLength(len(data)))
+
+	require.Nil(t, host.RuntimeContext.(*contextmock.RuntimeContextMock).FailExecutionErr)
+	assert.Equal(t, gasProvided-expectedGas, metering.GasLeft())
+	expectedTrace := map[string]map[string][]uint64{string(scAddress): {
+		"previousHook":  {0},
+		"writeEventLog": {expectedGas},
+	}}
+	assert.Equal(t, expectedTrace, metering.GetGasTrace())
+}
+
+// Before FixAuditChangesV6 these hooks load the argument data (and the upgrade code, the event log data)
+// and charge it afterwards; from it they charge it before the load. The total must not move, or blocks
+// from before the fork would stop replaying: a caller that dropped its pre-fork charge, or a helper that
+// charged it a second time, fails here. gasLimit 0 stops each hook right after its charges.
+func TestVMHooksImpl_CopyGas_SameBeforeAndFromV6(t *testing.T) {
+	t.Parallel()
+
+	const (
+		lengthsPtr = executor.MemPtr(0)
+		argsPtr    = executor.MemPtr(100)
+		codePtr    = executor.MemPtr(200)
+		valuePtr   = executor.MemPtr(300)
+		metaPtr    = executor.MemPtr(400)
+		addressPtr = executor.MemPtr(500)
+		resultPtr  = executor.MemPtr(600)
+	)
+	args := [][]byte{[]byte("arg1"), []byte("longerArgument2")}
+	argLengths := make([]byte, 4*len(args))
+	for i, arg := range args {
+		argLengths[i*4] = byte(len(arg))
+	}
+	code := []byte("contract code")
+	codeLen := executor.MemLength(len(code))
+	gasMap := config.MakeGasMapForTests()
+	createCost := gasMap["BaseOpsAPICost"]["CreateContract"]
+	argBytes := uint64(len(argLengths) + len(args[0]) + len(args[1]))
+
+	tests := []struct {
+		name        string
+		baseCost    uint64
+		copiedBytes uint64
+		call        func(hooks *vmhooks.VMHooksImpl)
+	}{
+		{"DeleteContract", 0, argBytes, func(hooks *vmhooks.VMHooksImpl) {
+			hooks.DeleteContract(addressPtr, 0, int32(len(args)), lengthsPtr, argsPtr)
+		}},
+		{"UpgradeContract", createCost, argBytes + uint64(len(code)), func(hooks *vmhooks.VMHooksImpl) {
+			hooks.UpgradeContract(addressPtr, 0, valuePtr, codePtr, metaPtr, codeLen, int32(len(args)), lengthsPtr, argsPtr)
+		}},
+		{"UpgradeFromSourceContract", createCost, argBytes, func(hooks *vmhooks.VMHooksImpl) {
+			hooks.UpgradeFromSourceContract(addressPtr, 0, valuePtr, addressPtr, metaPtr, int32(len(args)), lengthsPtr, argsPtr)
+		}},
+		{"CreateContract", createCost, argBytes, func(hooks *vmhooks.VMHooksImpl) {
+			hooks.CreateContract(0, valuePtr, codePtr, metaPtr, codeLen, resultPtr, int32(len(args)), lengthsPtr, argsPtr)
+		}},
+		{"DeployFromSourceContract", createCost, argBytes, func(hooks *vmhooks.VMHooksImpl) {
+			hooks.DeployFromSourceContract(0, valuePtr, addressPtr, metaPtr, resultPtr, int32(len(args)), lengthsPtr, argsPtr)
+		}},
+		{"WriteEventLog", gasMap["BaseOpsAPICost"]["Log"], argBytes + uint64(len(code)), func(hooks *vmhooks.VMHooksImpl) {
+			hooks.WriteEventLog(int32(len(args)), lengthsPtr, argsPtr, codePtr, codeLen)
+		}},
+	}
+
+	for _, tt := range tests {
+		for _, fixAuditChangesV6 := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/FixAuditChangesV6=%v", tt.name, fixAuditChangesV6), func(t *testing.T) {
+				t.Parallel()
+
+				const gasProvided = uint64(1000)
+				host := newMockVMHost()
+				host.ForkControllerContext = &commonMock.ForkControllerStub{FixAuditChangesV4Value: true, FixAuditChangesV6Value: fixAuditChangesV6}
+				host.OutputContext = &contextmock.OutputContextStub{}
+
+				metering, err := contexts.NewMeteringContext(host, gasMap)
+				require.NoError(t, err)
+				metering.InitStateFromContractCallInput(&vmcommon.VMInput{GasProvided: gasProvided})
+				host.MeteringContext = metering
+				managedTypes, err := contexts.NewManagedTypesContext(host)
+				require.NoError(t, err)
+				host.ManagedTypesContext = managedTypes
+
+				require.NoError(t, host.MemStoreToMock(lengthsPtr, argLengths))
+				require.NoError(t, host.MemStoreToMock(argsPtr, bytes.Join(args, nil)))
+				require.NoError(t, host.MemStoreToMock(codePtr, code))
+
+				tt.call(vmhooks.NewVMHooksImpl(host))
+
+				require.Nil(t, host.RuntimeContext.(*contextmock.RuntimeContextMock).FailExecutionErr)
+				dataCopyPerByte := metering.GasSchedule().BaseOperationCost.DataCopyPerByte
+				assert.Equal(t, tt.baseCost+dataCopyPerByte*tt.copiedBytes, gasProvided-metering.GasLeft())
+			})
+		}
+	}
+}
+
 func TestVMHooksImpl_GetArgumentLength(t *testing.T) {
 	t.Parallel()
 

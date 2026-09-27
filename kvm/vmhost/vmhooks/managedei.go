@@ -1054,10 +1054,10 @@ func (context *VMHooksImpl) ManagedIsBuiltinFunction(functionNameHandle int32) i
 	return ManagedIsBuiltinFunctionWithHost(host, functionNameHandle)
 }
 
-// maxBuiltinFunctionNameLength mirrors maxLengthOfFunctionName (contexts/validator.go),
-// the existing protocol limit for contract-exported function names - a built-in function
-// name is the same kind of identifier and can never legitimately exceed it. Uses >=, not >,
-// to actually mirror it: validator.go rejects at exactly 256, so a real maximum is 255.
+// maxBuiltinFunctionNameLength is vmhost.MaxFunctionNameLength, the protocol limit that
+// verifyValidFunctionName (contexts/validator.go) puts on contract-exported function names - a
+// built-in function name is the same kind of identifier and can never legitimately exceed it.
+// Uses >=, not >, to actually mirror it: validator.go rejects at exactly 256, so a real maximum is 255.
 //
 // The >= vs > distinction is cosmetic rather than consensus-observable. Since this hook now
 // returns 0 instead of reverting, both spellings produce the same result and the same gas at
@@ -1065,7 +1065,7 @@ func (context *VMHooksImpl) ManagedIsBuiltinFunction(functionNameHandle int32) i
 // capped gas but would GetBytes (clone), convert to string, and map-lookup; >= skips all three.
 // CapsGas cannot pin the spelling without asserting on that implementation detail - see
 // TestManagedIsBuiltinFunctionWithHost_CapsGasAndReturnsFalseAboveMax.
-const maxBuiltinFunctionNameLength = 256
+const maxBuiltinFunctionNameLength = vmhost.MaxFunctionNameLength
 
 func ManagedIsBuiltinFunctionWithHost(host vmhost.VMHost, functionNameHandle int32) int32 {
 	runtime := host.Runtime()

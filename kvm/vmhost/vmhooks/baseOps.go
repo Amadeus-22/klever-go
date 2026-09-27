@@ -444,11 +444,10 @@ func (context *VMHooksImpl) ValidateTokenIdentifier(
 }
 
 type indirectContractCallArguments struct {
-	dest      []byte
-	value     *big.Int
-	function  []byte
-	args      [][]byte
-	actualLen int32
+	dest     []byte
+	value    *big.Int
+	function []byte
+	args     [][]byte
 }
 
 func (context *VMHooksImpl) extractIndirectContractCallArgumentsWithValue(
@@ -524,12 +523,19 @@ func (context *VMHooksImpl) extractIndirectContractCallArguments(
 		value = big.NewInt(0).SetBytes(valueBytes)
 	}
 
-	function, err := context.MemLoad(functionOffset, functionLength)
+	// verifyValidFunctionName rejects contract function names this long and builtin names are far shorter,
+	// so a name this long could never be called: reject it before the copy
+	if host.ForkController().FixAuditChangesV6() && functionLength >= vmhost.MaxFunctionNameLength {
+		return nil, vmhost.ErrInvalidFunctionName
+	}
+
+	// the function name was never charged before FixAuditChangesV6, so what is left uncharged is dropped
+	function, _, err := context.memLoadCharged(host, functionOffset, functionLength)
 	if err != nil {
 		return nil, err
 	}
 
-	args, actualLen, err := context.getArgumentsFromMemory(
+	args, argsUncharged, err := context.getArgumentsFromMemory(
 		host,
 		numArguments,
 		argumentsLengthOffset,
@@ -541,23 +547,19 @@ func (context *VMHooksImpl) extractIndirectContractCallArguments(
 
 	if host.ForkController().FixAuditChangesV4() {
 		// #nosec G115
-		gasToUse := math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(actualLen))
-		err = metering.UseGasBounded(gasToUse)
+		err = host.ManagedTypes().ConsumeGasForByteLenBounded(uint64(argsUncharged))
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		// #nosec G115
-		gasToUse := math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(actualLen))
-		metering.UseAndTraceGas(gasToUse)
+		useDataCopyGas(metering, argsUncharged)
 	}
 
 	return &indirectContractCallArguments{
-		dest:      dest,
-		value:     value,
-		function:  function,
-		args:      args,
-		actualLen: actualLen,
+		dest:     dest,
+		value:    value,
+		function: function,
+		args:     args,
 	}, nil
 }
 
@@ -659,7 +661,7 @@ func (context *VMHooksImpl) UpgradeContract(
 		return
 	}
 
-	code, err := context.MemLoad(codeOffset, length)
+	code, codeUncharged, err := context.memLoadCharged(host, codeOffset, length)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
 	}
@@ -669,16 +671,14 @@ func (context *VMHooksImpl) UpgradeContract(
 		return
 	}
 
-	data, actualLen, err := context.getArgumentsFromMemory(
+	data, argsUncharged, err := context.getArgumentsFromMemory(
 		host,
 		numArguments,
 		argumentsLengthOffset,
 		dataOffset,
 	)
 
-	// #nosec G115
-	gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(actualLen))
-	metering.UseAndTraceGas(gasToUse)
+	useDataCopyGas(metering, argsUncharged)
 
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
@@ -689,10 +689,7 @@ func (context *VMHooksImpl) UpgradeContract(
 		return
 	}
 
-	gasSchedule := metering.GasSchedule()
-	// #nosec G115
-	gasToUse = math.MulUint64(gasSchedule.BaseOperationCost.DataCopyPerByte, uint64(length))
-	metering.UseAndTraceGas(gasToUse)
+	useDataCopyGas(metering, codeUncharged)
 
 	upgradeContract(host, calledSCAddress, code, codeMetadata, value, data, gasLimit)
 
@@ -733,16 +730,14 @@ func (context *VMHooksImpl) UpgradeFromSourceContract(
 		return
 	}
 
-	data, actualLen, err := context.getArgumentsFromMemory(
+	data, argsUncharged, err := context.getArgumentsFromMemory(
 		host,
 		numArguments,
 		argumentsLengthOffset,
 		dataOffset,
 	)
 
-	// #nosec G115
-	gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(actualLen))
-	metering.UseAndTraceGas(gasToUse)
+	useDataCopyGas(metering, argsUncharged)
 
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
@@ -846,16 +841,14 @@ func (context *VMHooksImpl) DeleteContract(
 	metering := host.Metering()
 	metering.StartGasTracing(deleteContractName)
 
-	data, actualLen, err := context.getArgumentsFromMemory(
+	data, argsUncharged, err := context.getArgumentsFromMemory(
 		host,
 		numArguments,
 		argumentsLengthOffset,
 		dataOffset,
 	)
 
-	// #nosec G115
-	gasToUse := math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(actualLen))
-	metering.UseAndTraceGas(gasToUse)
+	useDataCopyGas(metering, argsUncharged)
 
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
@@ -1645,7 +1638,7 @@ func (context *VMHooksImpl) WriteEventLog(
 	metering := context.GetMeteringContext()
 	metering.StartGasTracing(writeEventLogName)
 
-	topics, topicDataTotalLen, err := context.getArgumentsFromMemory(
+	topics, topicsUncharged, err := context.getArgumentsFromMemory(
 		host,
 		numTopics,
 		topicLengthsOffset,
@@ -1655,7 +1648,7 @@ func (context *VMHooksImpl) WriteEventLog(
 		return
 	}
 
-	data, err := context.MemLoad(dataOffset, dataLength)
+	data, dataUncharged, err := context.memLoadCharged(host, dataOffset, dataLength)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
 	}
@@ -1663,7 +1656,7 @@ func (context *VMHooksImpl) WriteEventLog(
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.Log
 	gasForData := math.MulUint64(
 		metering.GasSchedule().BaseOperationCost.DataCopyPerByte,
-		uint64(topicDataTotalLen+dataLength)) // #nosec G115
+		uint64(topicsUncharged+dataUncharged)) // #nosec G115
 	gasToUse = math.AddUint64(gasToUse, gasForData)
 	metering.UseAndTraceGas(gasToUse)
 	output.WriteLog(runtime.GetContextAddress(), topics, [][]byte{data})
@@ -2206,16 +2199,14 @@ func (context *VMHooksImpl) createContractWithHost(
 		return 1
 	}
 
-	data, actualLen, err := context.getArgumentsFromMemory(
+	data, argsUncharged, err := context.getArgumentsFromMemory(
 		host,
 		numArguments,
 		argumentsLengthOffset,
 		dataOffset,
 	)
 
-	// #nosec G115
-	gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(actualLen))
-	metering.UseAndTraceGas(gasToUse)
+	useDataCopyGas(metering, argsUncharged)
 
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 1
@@ -2271,16 +2262,14 @@ func (context *VMHooksImpl) DeployFromSourceContract(
 		return 1
 	}
 
-	data, actualLen, err := context.getArgumentsFromMemory(
+	data, argsUncharged, err := context.getArgumentsFromMemory(
 		host,
 		numArguments,
 		argumentsLengthOffset,
 		dataOffset,
 	)
 
-	// #nosec G115
-	gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(actualLen))
-	metering.UseAndTraceGas(gasToUse)
+	useDataCopyGas(metering, argsUncharged)
 
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 1
@@ -2538,8 +2527,6 @@ func (context *VMHooksImpl) getArgumentsFromMemory(
 	argumentsLengthOffset executor.MemPtr,
 	dataOffset executor.MemPtr,
 ) ([][]byte, int32, error) {
-	metering := host.Metering()
-
 	if numArguments < 0 || numArguments > maxNumArgumentsFromMemory {
 		return nil, 0, fmt.Errorf("invalid numArguments (%d)", numArguments)
 	}
@@ -2548,11 +2535,9 @@ func (context *VMHooksImpl) getArgumentsFromMemory(
 		return nil, 0, err
 	}
 
-	//assuming the caller charges for the actual data returned by this helper
 	if host.ForkController().FixAuditChangesV4() {
 		// #nosec G115
-		gasToUse := math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(argumentsLengthsByteLength))
-		err = metering.UseGasBounded(gasToUse)
+		err = host.ManagedTypes().ConsumeGasForByteLenBounded(uint64(argumentsLengthsByteLength))
 		if err != nil {
 			return nil, 0, err
 		}
@@ -2581,12 +2566,57 @@ func (context *VMHooksImpl) getArgumentsFromMemory(
 	if totalArgumentBytes > maxTotalArgumentsBytes {
 		return nil, 0, fmt.Errorf("total argument length exceeds maximum")
 	}
+
+	// the second return value is what the caller still has to charge: nothing once the data is paid for here
+	uncharged := totalArgumentBytes
+	if host.ForkController().FixAuditChangesV6() {
+		// #nosec G115
+		err = host.ManagedTypes().ConsumeGasForByteLenBounded(uint64(totalArgumentBytes))
+		if err != nil {
+			return nil, 0, err
+		}
+		uncharged = 0
+	}
+
 	data, err := context.MemLoadMultiple(dataOffset, argumentLengths)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	return data, totalArgumentBytes, nil
+	return data, uncharged, nil
+}
+
+// memLoadCharged loads length bytes and returns how many of them the caller still has to charge:
+// from FixAuditChangesV6 they are paid here, before the load, so that is 0
+func (context *VMHooksImpl) memLoadCharged(
+	host vmhost.VMHost,
+	memPtr executor.MemPtr,
+	length executor.MemLength,
+) ([]byte, int32, error) {
+	uncharged := length
+	// a negative length is left for MemLoad to reject, as before the fork
+	if host.ForkController().FixAuditChangesV6() && length >= 0 {
+		// #nosec G115
+		err := host.ManagedTypes().ConsumeGasForByteLenBounded(uint64(length))
+		if err != nil {
+			return nil, 0, err
+		}
+		uncharged = 0
+	}
+
+	data, err := context.MemLoad(memPtr, length)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return data, uncharged, nil
+}
+
+// useDataCopyGas charges DataCopyPerByte for length bytes
+func useDataCopyGas(metering vmhost.MeteringContext, length int32) {
+	// #nosec G115
+	gasToUse := math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(length))
+	metering.UseAndTraceGas(gasToUse)
 }
 
 func argumentsLengthByteCount(numArguments int32) (int32, error) {
