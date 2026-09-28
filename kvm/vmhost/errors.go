@@ -158,6 +158,9 @@ var ErrAccountNotPayable = errors.New("sending value to non payable contract")
 // ErrInvalidPublicKeySize signals that the public key size is invalid
 var ErrInvalidPublicKeySize = errors.New("invalid public key size")
 
+// ErrInvalidSignatureSize signals that the signature size is invalid
+var ErrInvalidSignatureSize = errors.New("invalid signature size")
+
 // ErrNilCallbackFunction signals that a nil callback function has been provided
 var ErrNilCallbackFunction = errors.New("nil callback function")
 
