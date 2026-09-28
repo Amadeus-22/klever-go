@@ -2250,6 +2250,208 @@ func TestScProcessor_DeleteAccounts(t *testing.T) {
 	}
 }
 
+// sharedCodeProcessor drives deploy and delete VM outputs through processVMOutput on a
+// real trie-backed accounts cacher, one transaction at a time, and reads the reference
+// count of the code entry shared by every contract deployed from the same bytecode.
+type sharedCodeProcessor struct {
+	t           *testing.T
+	sc          *scProcessor
+	adb         *state.AccountsDB
+	trieGet     func([]byte) ([]byte, error)
+	cacher      state.AccountsCacher
+	marshalizer marshal.Marshalizer
+	code        []byte
+	codeHash    []byte
+	metadata    []byte
+}
+
+func newSharedCodeProcessor(t *testing.T, fixV6 bool) *sharedCodeProcessor {
+	hasher := &sha256.Sha256{}
+	marshalizer := marshal.NewProtoMarshalizer()
+	storageManager, err := trie.NewTrieStorageManagerWithoutPruning(createMemUnit())
+	require.Nil(t, err)
+	tr, err := trie.NewTrie(storageManager, marshalizer, hasher, 5)
+	require.Nil(t, err)
+	adb, err := state.NewAccountsDB(tr, hasher, marshalizer, factory.NewAccountCreator(), core.Normal)
+	require.Nil(t, err)
+	cacher, err := state.NewAccountsCacher(state.ArgsAcccountCacher{Accounts: adb, Kapps: adb, Peers: adb})
+	require.Nil(t, err)
+
+	args := createMockSmartContractProcessorArguments()
+	args.AccountsCacher = cacher
+	args.ForkController = commommock.NewForkControllerStub().SetFork("FixAuditChangesV6", fixV6)
+	args.BlockChainHook = &contextmock.BlockchainHookStub{
+		FilterCodeMetadataForUpgradeCalled: func(input []byte) ([]byte, error) {
+			return input, nil
+		},
+	}
+	sc, err := NewSmartContractProcessor(args)
+	require.Nil(t, err)
+
+	code := []byte("shared contract bytecode")
+	return &sharedCodeProcessor{
+		t:           t,
+		sc:          sc,
+		adb:         adb,
+		trieGet:     tr.Get,
+		cacher:      cacher,
+		marshalizer: marshalizer,
+		code:        code,
+		codeHash:    hasher.Compute(string(code)),
+		metadata:    []byte{vmcommon.MetadataUpgradeable, 0},
+	}
+}
+
+func sharedCodeSCAddress(id byte) []byte {
+	address := make([]byte, 32)
+	copy(address[core.NumInitCharactersForScAddress-core.VMTypeLen:], common.WasmVirtualMachine)
+	address[31] = id
+	return address
+}
+
+func (p *sharedCodeProcessor) processTx(vmOutput *vmcommon.VMOutput) {
+	p.cacher.ResetAll(true)
+	ctx := kapp.NewKappContext(kapp.ArgsNewKAppContext{Block: &block.Block{}, IsScSimulation: true})
+	require.Nil(p.t, p.sc.processVMOutput(ctx, vmOutput))
+	require.Nil(p.t, p.cacher.SaveAll())
+}
+
+func (p *sharedCodeProcessor) deploy(address, owner []byte) {
+	p.processTx(&vmcommon.VMOutput{
+		OutputAccounts: map[string]*vmcommon.OutputAccount{
+			string(address): {
+				Address:             address,
+				Code:                p.code,
+				CodeMetadata:        p.metadata,
+				CodeDeployerAddress: owner,
+			},
+		},
+	})
+}
+
+func (p *sharedCodeProcessor) delete(deleted ...[]byte) {
+	p.processTx(&vmcommon.VMOutput{DeletedAccounts: deleted})
+}
+
+// references returns NumReferences of the shared code entry, or 0 once it is removed.
+func (p *sharedCodeProcessor) references() uint32 {
+	raw, err := p.trieGet(p.codeHash)
+	require.Nil(p.t, err)
+	if len(raw) == 0 {
+		return 0
+	}
+
+	entry := &state.CodeEntry{}
+	require.Nil(p.t, p.marshalizer.Unmarshal(entry, raw))
+	return entry.NumReferences
+}
+
+func (p *sharedCodeProcessor) codeLoadable(address []byte) bool {
+	p.cacher.ResetAll(true)
+	acc, err := p.cacher.GetExistingUser(address)
+	require.Nil(p.t, err)
+	return len(p.cacher.GetCode(acc.GetCodeHash())) != 0
+}
+
+func TestScProcessor_DeleteAccountsSharedCode(t *testing.T) {
+	t.Parallel()
+
+	first := sharedCodeSCAddress(1)
+	second := sharedCodeSCAddress(2)
+	firstOwner := []byte("first-owner-address-00000000000")
+	secondOwner := []byte("second-owner-address-0000000000")
+
+	newDeployed := func(t *testing.T, fixV6 bool) *sharedCodeProcessor {
+		p := newSharedCodeProcessor(t, fixV6)
+		p.deploy(first, firstOwner)
+		p.deploy(second, secondOwner)
+		require.Equal(t, uint32(2), p.references())
+		return p
+	}
+
+	t.Run("single delete decrements the shared entry once", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		p.delete(second)
+
+		require.Equal(t, uint32(1), p.references())
+		require.True(t, p.codeLoadable(first))
+		require.False(t, p.codeLoadable(second))
+	})
+
+	t.Run("address listed more than once decrements once", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		p.delete(second, second, second)
+
+		require.Equal(t, uint32(1), p.references())
+		require.True(t, p.codeLoadable(first))
+	})
+
+	t.Run("deleting again in later transactions has no effect", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		for i := 0; i < 3; i++ {
+			p.delete(second)
+		}
+
+		require.Equal(t, uint32(1), p.references())
+		require.True(t, p.codeLoadable(first))
+	})
+
+	t.Run("repeated deploy and delete keeps the count", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		for i := byte(0); i < 5; i++ {
+			other := sharedCodeSCAddress(10 + i)
+			p.deploy(other, secondOwner)
+			p.delete(other)
+			require.Equal(t, uint32(2), p.references())
+		}
+		require.True(t, p.codeLoadable(first))
+	})
+
+	t.Run("revert restores the shared entry", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		snapshot := p.adb.JournalLen()
+		p.delete(second)
+		require.Equal(t, uint32(1), p.references())
+
+		require.Nil(t, p.adb.RevertToSnapshot(snapshot))
+
+		require.Equal(t, uint32(2), p.references())
+		require.True(t, p.codeLoadable(second))
+	})
+
+	t.Run("deleting the last reference removes the entry", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		p.delete(second)
+		p.delete(first)
+
+		require.Equal(t, uint32(0), p.references())
+		require.False(t, p.codeLoadable(first))
+	})
+
+	// Below FixAuditChangesV6 the legacy accounting is reproduced so that pre-fork
+	// blocks replay to the same state.
+	t.Run("before FixAuditChangesV6 the legacy accounting is kept", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, false)
+		p.delete(second)
+
+		require.Equal(t, uint32(0), p.references())
+	})
+}
+
 // TestSetVMExecutionMode tests setting the execution mode
 func TestSetVMExecutionMode(t *testing.T) {
 	t.Parallel()

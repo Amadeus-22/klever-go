@@ -330,6 +330,8 @@ func (acc *accountsCache) GetCode(codeHash []byte) []byte {
 	return acc.accounts.GetCode(codeHash)
 }
 
+// RemoveCode removes the account code the pre-FixAuditChangesV6 way. It is kept only so
+// that pre-fork blocks replay identically and must not be called once the fork is active.
 func (acc *accountsCache) RemoveCode(address []byte) error {
 	accHandler, err := acc.GetExistingUser(address)
 	if err != nil {

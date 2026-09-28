@@ -926,7 +926,7 @@ func (sc *scProcessor) updateSmartContractCode(
 func (sc *scProcessor) deleteAccounts(deletedAccounts [][]byte) error {
 	for _, value := range deletedAccounts {
 		// delete account code
-		err := sc.accountsCacher.RemoveCode(value)
+		err := sc.removeAccountCode(value)
 		if err != nil {
 			log.Error("deleteAccounts remove code", "address", value, "error", err.Error())
 			return err
@@ -934,6 +934,27 @@ func (sc *scProcessor) deleteAccounts(deletedAccounts [][]byte) error {
 	}
 
 	return nil
+}
+
+// removeAccountCode empties the account's code. Since FixAuditChangesV6 the shared code
+// entry is left to the account save, which decrements it once against the code hash
+// stored in the trie, so removal is idempotent and an address listed more than once is
+// harmless. Before it, the legacy RemoveCode is kept so pre-fork blocks replay identically.
+func (sc *scProcessor) removeAccountCode(address []byte) error {
+	if !sc.forkController.FixAuditChangesV6() {
+		return sc.accountsCacher.RemoveCode(address)
+	}
+
+	acc, err := sc.accountsCacher.GetExistingUser(address)
+	if err != nil {
+		return err
+	}
+
+	acc.SetCode(make([]byte, 0))
+	acc.SetCodeHash(make([]byte, 0))
+
+	// persists immediately when the cache is off; with the cache on, SaveAll flushes it
+	return sc.accountsCacher.UpdateUser(acc)
 }
 
 func (sc *scProcessor) getAccountFromAddress(address []byte) (state.UserAccountHandler, error) {
