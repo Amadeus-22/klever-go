@@ -1133,11 +1133,6 @@ func (n *ProcessorNode) initBlockProcessor() error {
 		return err
 	}
 
-	err = n.TxProcessor.SetProposalController(n.ProposalController)
-	if err != nil {
-		return err
-	}
-
 	err = n.FeeHandler.SetProposalController(n.ProposalController)
 	if err != nil {
 		return err

@@ -103,9 +103,6 @@ func NewController(t *testing.T) *Controller {
 	execTx, err := pTX.NewTxProcessor(args)
 	require.NoError(t, err)
 
-	err = execTx.SetProposalController(pc)
-	require.NoError(t, err)
-
 	c := &Controller{userDB, kappDB, peersDB, accCacher, kdaKapp, stakingKapp, validatorsKapp, marketplaceKapp, pc, args.KAppController, execTx, t}
 	c.CreateMainAssets()
 	c.CreateAPRAsset()
@@ -125,8 +122,6 @@ func (c *Controller) RecreateTxProcessor(cfg config.EnableEpochs) {
 	SetupKappController(c.t, &args)
 
 	execTx, _ := pTX.NewTxProcessor(args)
-
-	_ = execTx.SetProposalController(c.proposalController)
 
 	c.execTx = execTx
 
@@ -159,9 +154,6 @@ func (c *Controller) UpdateForkController(cfg config.EnableEpochs) {
 	InitKapps(args.KAppController, c.accCacher, c.proposalController)
 
 	execTx, err := pTX.NewTxProcessor(args)
-	require.NoError(c.t, err)
-
-	err = execTx.SetProposalController(c.proposalController)
 	require.NoError(c.t, err)
 
 	c.kappController = args.KAppController

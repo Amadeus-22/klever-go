@@ -171,7 +171,7 @@ type Node struct {
 	startWithInSync       bool
 	nodeRedundancyHandler consensus.NodeRedundancyHandler
 
-	proposalController kapps.ActiveProposalController
+	proposalController kapps.ProposalControllerHolder
 	forkController     core.ForkController
 	enableEpochsConfig config.EnableEpochsConfig
 
@@ -264,16 +264,7 @@ func (n *Node) StartConsensus() error {
 		return common.ErrGenesisBlockNotInitialized
 	}
 
-	if !n.indexer.IsNilIndexer() {
-		log.Warn("node is running with a valid indexer. Chronology watchdog will be turned off as " +
-			"it is incompatible with the indexing process.")
-		n.watchdog = &watchdog.DisabledWatchdog{}
-	}
-	if n.isInImportMode {
-		log.Warn("node is running in import mode. Chronology watchdog will be turned off as " +
-			"it is incompatible with the import-db process.")
-		n.watchdog = &watchdog.DisabledWatchdog{}
-	}
+	n.disableIncompatibleWatchdog()
 
 	alarmScheduler := alarm.NewAlarmScheduler()
 
@@ -314,66 +305,9 @@ func (n *Node) StartConsensus() error {
 
 	n.bootstrapper.LoadStorage()
 
-	log.Trace("creating proposal kapp")
+	epoch := n.currentEpoch()
 
-	acnt, err := n.kapps.LoadAccount(kapps.ProposalKAppAddress)
-	if err != nil {
-		return err
-	}
-
-	proposalKApp, ok := acnt.(state.KAppAccountHandler)
-	if !ok {
-		return common.ErrWrongTypeAssertion
-	}
-
-	epoch := n.blkc.GetGenesisHeader().GetEpoch()
-	crtBlockHeader := n.blkc.GetCurrentBlockHeader()
-	if !check.IfNil(crtBlockHeader) {
-		epoch = crtBlockHeader.GetEpoch()
-	}
-
-	if !check.IfNil(crtBlockHeader) && !check.IfNil(n.heartbeatHandler) {
-		n.heartbeatHandler.RefreshPeerTypeCache(epoch)
-	}
-
-	forkControllerSubscriber, ok := n.forkController.(core.EpochSubscriberHandler)
-	if !ok {
-		return common.ErrWrongTypeAssertion
-	}
-
-	forkControllerSubscriber.EpochConfirmed(epoch)
-
-	n.proposalController, err = proposalKApp.StartProposalsKApp(n.forkController)
-	if err != nil {
-		return err
-	}
-
-	err = n.kapps.SaveAccount(proposalKApp)
-	if err != nil {
-		return err
-	}
-
-	err = n.feeHandler.SetProposalController(n.proposalController)
-	if err != nil {
-		return err
-	}
-
-	err = n.blockProcessor.SetProposalController(n.proposalController)
-	if err != nil {
-		return err
-	}
-
-	err = n.txProcessor.SetProposalController(n.proposalController)
-	if err != nil {
-		return err
-	}
-
-	err = n.kappController.SetProposalController(n.proposalController)
-	if err != nil {
-		return err
-	}
-
-	err = n.kappControllerSimulator.SetProposalController(n.proposalController)
+	err = n.startProposalController(epoch)
 	if err != nil {
 		return err
 	}
@@ -491,6 +425,95 @@ func (n *Node) StartConsensus() error {
 	}
 
 	chronologyHandler.StartSlots()
+	return nil
+}
+
+// disableIncompatibleWatchdog turns the chronology watchdog off for the running
+// modes it cannot coexist with.
+func (n *Node) disableIncompatibleWatchdog() {
+	if !n.indexer.IsNilIndexer() {
+		log.Warn("node is running with a valid indexer. Chronology watchdog will be turned off as " +
+			"it is incompatible with the indexing process.")
+		n.watchdog = &watchdog.DisabledWatchdog{}
+	}
+	if n.isInImportMode {
+		log.Warn("node is running in import mode. Chronology watchdog will be turned off as " +
+			"it is incompatible with the import-db process.")
+		n.watchdog = &watchdog.DisabledWatchdog{}
+	}
+}
+
+// currentEpoch returns the epoch of the current block header, falling back to
+// the genesis one before the first block is committed. It also refreshes the
+// heartbeat peer type cache once a current header exists.
+func (n *Node) currentEpoch() uint32 {
+	crtBlockHeader := n.blkc.GetCurrentBlockHeader()
+	if check.IfNil(crtBlockHeader) {
+		return n.blkc.GetGenesisHeader().GetEpoch()
+	}
+
+	epoch := crtBlockHeader.GetEpoch()
+	if !check.IfNil(n.heartbeatHandler) {
+		n.heartbeatHandler.RefreshPeerTypeCache(epoch)
+	}
+
+	return epoch
+}
+
+// startProposalController loads the proposal kapp, confirms the epoch on the
+// fork controller and publishes the resulting controller to its consumers.
+func (n *Node) startProposalController(epoch uint32) error {
+	log.Trace("creating proposal kapp")
+
+	acnt, err := n.kapps.LoadAccount(kapps.ProposalKAppAddress)
+	if err != nil {
+		return err
+	}
+
+	proposalKApp, ok := acnt.(state.KAppAccountHandler)
+	if !ok {
+		return common.ErrWrongTypeAssertion
+	}
+
+	forkControllerSubscriber, ok := n.forkController.(core.EpochSubscriberHandler)
+	if !ok {
+		return common.ErrWrongTypeAssertion
+	}
+
+	forkControllerSubscriber.EpochConfirmed(epoch)
+
+	proposalController, err := proposalKApp.StartProposalsKApp(n.forkController)
+	if err != nil {
+		return err
+	}
+
+	err = n.publishProposalController(proposalController)
+	if err != nil {
+		return err
+	}
+
+	return n.kapps.SaveAccount(proposalKApp)
+}
+
+// publishProposalController hands the same controller to every consumer that
+// reads proposal parameters. The node holder goes first so API readers stop
+// getting ErrProposalNotInitialized as early as possible.
+func (n *Node) publishProposalController(controller kapps.ActiveProposalController) error {
+	n.proposalController.Set(controller)
+
+	setters := []func(kapps.ActiveProposalController) error{
+		n.feeHandler.SetProposalController,
+		n.blockProcessor.SetProposalController,
+		n.kappController.SetProposalController,
+		n.kappControllerSimulator.SetProposalController,
+	}
+
+	for _, set := range setters {
+		if err := set(controller); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -955,7 +978,12 @@ func (n *Node) GetPeerInfo(pid string) ([]core.QueryP2PPeerInfo, error) {
 }
 
 func (n *Node) GetProposalParameters() (map[int32]*kapps.Parameter, error) {
-	return n.proposalController.GetActiveParameters(), nil
+	controller := n.proposalController.Get()
+	if check.IfNil(controller) {
+		return nil, process.ErrProposalNotInitialized
+	}
+
+	return controller.GetActiveParameters(), nil
 }
 
 func (n *Node) createPidInfo(p core.PeerID) core.QueryP2PPeerInfo {

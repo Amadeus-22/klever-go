@@ -3,6 +3,7 @@ package kapps
 import (
 	reflect "reflect"
 	"sync"
+	"sync/atomic"
 
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/common"
@@ -30,6 +31,28 @@ type ActiveProposalController interface {
 	ParseParamAndValidate(parameter EnumParameter, value []byte, fc core.ForkController) (reflect.Value, error)
 	UpdateParameters(map[int32]*Parameter)
 	RestoreParameters(map[int32]*Parameter)
+}
+
+// ProposalControllerHolder publishes an ActiveProposalController reference safely.
+// The reference is wired in while the node starts consensus, by which time API
+// goroutines are already reading it. The zero value means "not wired in yet".
+type ProposalControllerHolder struct {
+	ref atomic.Pointer[ActiveProposalController]
+}
+
+// Set publishes the controller for concurrent readers
+func (h *ProposalControllerHolder) Set(controller ActiveProposalController) {
+	h.ref.Store(&controller)
+}
+
+// Get returns the published controller, or nil while none has been wired in
+func (h *ProposalControllerHolder) Get() ActiveProposalController {
+	controller := h.ref.Load()
+	if controller == nil {
+		return nil
+	}
+
+	return *controller
 }
 
 // NewProposalController returns a live controller holding the initial parameters for forks.

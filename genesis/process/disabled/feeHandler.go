@@ -54,6 +54,12 @@ func (fh *FeeHandler) MaxGasLimitPerTX() uint64 {
 	return math.MaxUint64
 }
 
+// IsProposalControllerSet returns true: the disabled handler serves fixed
+// limits, it never reads the proposal controller
+func (fh *FeeHandler) IsProposalControllerSet() bool {
+	return true
+}
+
 // IsInterfaceNil returns true if there is no value under the interface
 func (fh *FeeHandler) IsInterfaceNil() bool {
 	return fh == nil

@@ -24,7 +24,7 @@ var log = logger.GetOrCreate("process/economics")
 type EconomicsData struct {
 	leaderPercentage float64
 
-	proposalController   kapps.ActiveProposalController
+	proposalController   kapps.ProposalControllerHolder
 	txSimulatorProcessor txsimulator.TransactionSimulatorProcessor
 }
 
@@ -79,7 +79,7 @@ func (ed *EconomicsData) SetProposalController(controller kapps.ActiveProposalCo
 		return common.ErrNilProposalController
 	}
 
-	ed.proposalController = controller
+	ed.proposalController.Set(controller)
 
 	return nil
 }
@@ -97,8 +97,10 @@ func (ed *EconomicsData) SetTXSimulatorProcessor(txSimulatorProcessor txsimulato
 
 // EstimateTransactionGas will calculate how many gas units a transaction will consume
 func (ed *EconomicsData) ComputeTransactionCost(tx process.TransactionWithFeeHandler, simulateSC bool) (*transaction.CostResponse, error) {
-	if err := ed.validateProposalController(); err != nil {
-		return nil, err
+	// loaded once so every fee in this response comes from the same controller
+	controller := ed.proposalController.Get()
+	if check.IfNil(controller) {
+		return nil, process.ErrProposalNotInitialized
 	}
 
 	cost := &transaction.CostResponse{
@@ -106,9 +108,9 @@ func (ed *EconomicsData) ComputeTransactionCost(tx process.TransactionWithFeeHan
 		BandwidthFee: tx.GetDataSize(),
 	}
 
-	gasMultiplier := ed.proposalController.GetParameterUint(kapps.EnumParameter_GasMultiplier)
+	gasMultiplier := controller.GetParameterUint(kapps.EnumParameter_GasMultiplier)
 
-	hasSC, err := ed.processContracts(tx, cost)
+	hasSC, err := ed.processContracts(controller, tx, cost)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +123,7 @@ func (ed *EconomicsData) ComputeTransactionCost(tx process.TransactionWithFeeHan
 		cost.GasEstimated = estimatedGas
 	}
 
-	ed.applyFeePerDataByte(cost)
+	ed.applyFeePerDataByte(controller, cost)
 
 	cost.GasMultiplier = gasMultiplier
 
@@ -131,14 +133,7 @@ func (ed *EconomicsData) ComputeTransactionCost(tx process.TransactionWithFeeHan
 	return cost, nil
 }
 
-func (ed *EconomicsData) validateProposalController() error {
-	if check.IfNil(ed.proposalController) {
-		return process.ErrProposalNotInitialized
-	}
-	return nil
-}
-
-func (ed *EconomicsData) processContracts(tx process.TransactionWithFeeHandler, cost *transaction.CostResponse) (bool, error) {
+func (ed *EconomicsData) processContracts(controller kapps.ActiveProposalController, tx process.TransactionWithFeeHandler, cost *transaction.CostResponse) (bool, error) {
 	hasSC := false
 	for _, c := range tx.GetContracts() {
 		feeType, ok := ContractEnum[c.Type]
@@ -146,7 +141,7 @@ func (ed *EconomicsData) processContracts(tx process.TransactionWithFeeHandler, 
 			return hasSC, process.ErrInvalidTransactionType
 		}
 
-		value := ed.proposalController.GetParameterInt(feeType)
+		value := controller.GetParameterInt(feeType)
 
 		cost.KAppFee += value
 		cost.BandwidthFee += BaseTxSize
@@ -191,8 +186,8 @@ func (ed *EconomicsData) handleSimulationFailure(res *data.SimulationResults) er
 	return fmt.Errorf("%w: %s", process.ErrInvalidArgument, res.FailReason)
 }
 
-func (ed *EconomicsData) applyFeePerDataByte(cost *transaction.CostResponse) {
-	feePerDataByte := ed.proposalController.GetParameterInt(kapps.EnumParameter_FeePerDataByte)
+func (ed *EconomicsData) applyFeePerDataByte(controller kapps.ActiveProposalController, cost *transaction.CostResponse) {
+	feePerDataByte := controller.GetParameterInt(kapps.EnumParameter_FeePerDataByte)
 	cost.BandwidthFee *= feePerDataByte
 }
 
@@ -250,16 +245,31 @@ func (ed *EconomicsData) LeaderPercentage() float64 {
 	return ed.leaderPercentage
 }
 
+// MaxGasLimitPerBlock is only read from block creation, which runs after
+// StartConsensus wired the controller in. It stays unguarded on purpose: a
+// wiring bug must surface here rather than have the leader propose empty blocks.
 func (ed *EconomicsData) MaxGasLimitPerBlock() uint64 {
-	maxGasPerBlock := ed.proposalController.GetParameterUint(kapps.EnumParameter_MaxGasPerBlock)
-
-	return maxGasPerBlock
+	return ed.proposalController.Get().GetParameterUint(kapps.EnumParameter_MaxGasPerBlock)
 }
 
+// MaxGasLimitPerTX returns 0 while the proposal controller is not wired in yet.
+// A wired controller can return 0 too - MaxGasPerTX only exists once
+// EnableSmartContracts is active - so callers that must tell the two apart ask
+// IsProposalControllerSet instead of reading the 0.
 func (ed *EconomicsData) MaxGasLimitPerTX() uint64 {
-	maxGasPerTx := ed.proposalController.GetParameterUint(kapps.EnumParameter_MaxGasPerTX)
+	controller := ed.proposalController.Get()
+	if check.IfNil(controller) {
+		return 0
+	}
 
-	return maxGasPerTx
+	return controller.GetParameterUint(kapps.EnumParameter_MaxGasPerTX)
+}
+
+// IsProposalControllerSet reports whether the proposal controller has been
+// wired in. Readers reachable before StartConsensus use it to distinguish a
+// node still starting from a parameter that is legitimately 0.
+func (ed *EconomicsData) IsProposalControllerSet() bool {
+	return !check.IfNil(ed.proposalController.Get())
 }
 
 // IsInterfaceNil returns true if there is no value under the interface

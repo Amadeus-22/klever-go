@@ -6,7 +6,6 @@ import (
 	"github.com/klever-io/klever-go/data/block"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
-	"github.com/klever-io/klever-go/kapps"
 )
 
 // TxProcessorMock -
@@ -30,11 +29,6 @@ func (tp *TxProcessorMock) PreProcessTransaction(transaction *transaction.Transa
 		return tp.PreProcessTransactionCalled(transaction)
 	}
 	return nil, nil, nil
-}
-
-func (tp *TxProcessorMock) SetProposalController(controller kapps.ActiveProposalController) error {
-
-	return nil
 }
 
 // ProcessTransaction -

@@ -383,7 +383,6 @@ type EpochBootstrapper interface {
 
 // TransactionProcessor is the main interface for transaction execution engine
 type TransactionProcessor interface {
-	SetProposalController(controller kapps.ActiveProposalController) error
 	PreProcessTransaction(tx *transaction.Transaction) (state.UserAccountHandler, []byte, error)
 	ProcessTransaction(block *block.Block, txHash []byte, tx *transaction.Transaction) error
 	ProcessBandwidthFee(txHash []byte, tx *transaction.Transaction, ownerAcc state.UserAccountHandler) (int64, error)
@@ -494,6 +493,7 @@ type EconomicsDataHandler interface {
 	LeaderPercentage() float64
 	MaxGasLimitPerBlock() uint64
 	MaxGasLimitPerTX() uint64
+	IsProposalControllerSet() bool
 	IsInterfaceNil() bool
 }
 

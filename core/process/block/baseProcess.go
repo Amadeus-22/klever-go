@@ -70,7 +70,7 @@ type baseProcessor struct {
 
 	epochNotifier      process.EpochNotifier
 	forkController     core.ForkController
-	proposalController kapps.ActiveProposalController
+	proposalController kapps.ProposalControllerHolder
 }
 
 type bootStorerDataArgs struct {
@@ -97,7 +97,7 @@ func (bp *baseProcessor) SetProposalController(controller kapps.ActiveProposalCo
 		return common.ErrNilProposalController
 	}
 
-	bp.proposalController = controller
+	bp.proposalController.Set(controller)
 
 	return nil
 }
@@ -498,9 +498,9 @@ func (bp *baseProcessor) verifyFees(header data.HeaderHandler) error {
 
 	// check if block/staking rewards are valid
 	if header.GetBlockRewards() !=
-		bp.proposalController.GetParameterInt(kapps.EnumParameter_BlockRewards) ||
+		bp.proposalController.Get().GetParameterInt(kapps.EnumParameter_BlockRewards) ||
 		header.GetStakingRewards() !=
-			bp.proposalController.GetParameterInt(kapps.EnumParameter_StakingRewards) {
+			bp.proposalController.Get().GetParameterInt(kapps.EnumParameter_StakingRewards) {
 
 		log.Error("checkBlockValidity verifyFees rewards does not match",
 			"block rewards", header.GetBlockRewards(),
@@ -884,7 +884,7 @@ func (mp *metaProcessor) getProposalController() (state.KAppAccountHandler, *kap
 			return nil, nil, err
 		}
 
-		mp.proposalController.UpdateParameters(currentProposal.ActiveParameters)
+		mp.proposalController.Get().UpdateParameters(currentProposal.ActiveParameters)
 	}
 
 	return proposalKApp, currentProposal, nil

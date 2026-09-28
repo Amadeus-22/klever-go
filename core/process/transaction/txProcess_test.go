@@ -1574,7 +1574,6 @@ func NewTXProcessor(t *testing.T, argsp ...pTX.ArgsNewTxProcessor) process.Trans
 
 	execTx, err := pTX.NewTxProcessor(args)
 	require.Nil(t, err)
-	_ = execTx.SetProposalController(pc)
 
 	InitKapps(args.KAppController, args.AccountsCacher, pc)
 
@@ -1603,7 +1602,6 @@ func NexTXProcessorV2(t *testing.T) (process.TransactionProcessor, pTX.ArgsNewTx
 
 	execTx, err := pTX.NewTxProcessor(argsp)
 	require.Nil(t, err)
-	_ = execTx.SetProposalController(pc)
 
 	InitKapps(argsp.KAppController, argsp.AccountsCacher, pc)
 
@@ -2815,8 +2813,6 @@ func TestTxProcessor_ProcessAssetTriggerWrongValsShouldErr(t *testing.T) {
 
 	execTx, err := pTX.NewTxProcessor(args)
 	require.Nil(t, err)
-
-	_ = execTx.SetProposalController(pc)
 
 	//Asset Creation to trigger
 	kdaContract := transaction.CreateAssetContract{

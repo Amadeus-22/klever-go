@@ -49,7 +49,7 @@ func (m *MetaProcessorForTests) SetProposalKApp(kdaKapp state.KAppAccountHandler
 }
 
 func (m *MetaProcessorForTests) GetActiveParameters() map[int32]*kapps.Parameter {
-	return m.proposalController.GetActiveParameters()
+	return m.proposalController.Get().GetActiveParameters()
 }
 
 // UpdateState exposes the updateState method for testing

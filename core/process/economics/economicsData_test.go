@@ -22,11 +22,13 @@ const MinFreezeAmount = int64(1_000)
 
 // Helper function to create a new EconomicsData with mocks
 func newMockEconomicsData() *EconomicsData {
-	return &EconomicsData{
+	ed := &EconomicsData{
 		leaderPercentage:     0.5,
-		proposalController:   createProposalController(make(map[int32]*kapps.Parameter)),
 		txSimulatorProcessor: &mock.TransactionSimulatorProcessorStub{},
 	}
+	ed.proposalController.Set(createProposalController(make(map[int32]*kapps.Parameter)))
+
+	return ed
 }
 
 func createProposalController(params map[int32]*kapps.Parameter) kapps.ActiveProposalController {
@@ -67,7 +69,7 @@ func TestSetProposalController(t *testing.T) {
 		})
 		err := ed.SetProposalController(controller)
 		assert.NoError(t, err)
-		assert.Equal(t, controller, ed.proposalController)
+		assert.Equal(t, controller, ed.proposalController.Get())
 	})
 
 	t.Run("Nil controller", func(t *testing.T) {
@@ -97,7 +99,7 @@ func TestSetTXSimulatorProcessor(t *testing.T) {
 
 // Test ComputeTransactionCost
 func TestComputeTransactionCost(t *testing.T) {
-	// ed.proposalController.UpdateParameters(map[int32]*kapps.Parameter{
+	// ed.proposalController.Get().UpdateParameters(map[int32]*kapps.Parameter{
 	// 	int32(kapps.EnumParameter_GasMultiplier):  {Type: kapps.EnumType_Int64, Value: []byte("1")},
 	// 	int32(kapps.EnumParameter_FeePerDataByte): {Type: kapps.EnumType_Int64, Value: []byte("2")},
 	// })
@@ -125,7 +127,7 @@ func TestComputeTransactionCost(t *testing.T) {
 				},
 			},
 		}
-		ed.proposalController.UpdateParameters(map[int32]*kapps.Parameter{
+		ed.proposalController.Get().UpdateParameters(map[int32]*kapps.Parameter{
 			int32(kapps.EnumParameter_GasMultiplier):   {Type: kapps.EnumType_Int64, Value: []byte("1")},
 			int32(kapps.EnumParameter_FeePerDataByte):  {Type: kapps.EnumType_Int64, Value: []byte("2")},
 			int32(kapps.EnumParameter_KAppFeeTransfer): {Type: kapps.EnumType_Int64, Value: []byte("10")},
@@ -140,7 +142,7 @@ func TestComputeTransactionCost(t *testing.T) {
 
 	t.Run("Smart contract transaction", func(t *testing.T) {
 		ed := newMockEconomicsData()
-		ed.proposalController.UpdateParameters(map[int32]*kapps.Parameter{
+		ed.proposalController.Get().UpdateParameters(map[int32]*kapps.Parameter{
 			int32(kapps.EnumParameter_KAppFeeSmartContract): {Type: kapps.EnumType_Int64, Value: []byte("20")},
 			int32(kapps.EnumParameter_GasMultiplier):        {Type: kapps.EnumType_Int64, Value: []byte("2")},
 			int32(kapps.EnumParameter_FeePerDataByte):       {Type: kapps.EnumType_Int64, Value: []byte("2")},
@@ -201,7 +203,7 @@ func TestComputeTransactionCost(t *testing.T) {
 
 	t.Run("Invalid proposal controller", func(t *testing.T) {
 		ed := newMockEconomicsData()
-		ed.proposalController = nil
+		ed.proposalController.Set(nil)
 
 		_, err := ed.ComputeTransactionCost(baseSCTransaction, false)
 		assert.Error(t, err)
@@ -262,7 +264,7 @@ func TestComputeTransactionCost(t *testing.T) {
 func TestCheckValidityTxValues(t *testing.T) {
 	ed := newMockEconomicsData()
 
-	ed.proposalController.UpdateParameters(map[int32]*kapps.Parameter{
+	ed.proposalController.Get().UpdateParameters(map[int32]*kapps.Parameter{
 		int32(kapps.EnumParameter_GasMultiplier):   {Type: kapps.EnumType_Int64, Value: []byte("1")},
 		int32(kapps.EnumParameter_FeePerDataByte):  {Type: kapps.EnumType_Int64, Value: []byte("1")},
 		int32(kapps.EnumParameter_KAppFeeTransfer): {Type: kapps.EnumType_Int64, Value: []byte("10")},
@@ -326,7 +328,7 @@ func TestCheckValidityTxValues(t *testing.T) {
 	})
 
 	t.Run("Fail compute transaction cost", func(t *testing.T) {
-		ed.proposalController = nil
+		ed.proposalController.Set(nil)
 
 		tx := &transaction.Transaction{
 			RawData: &transaction.Transaction_Raw{
@@ -349,7 +351,7 @@ func TestCheckValidityTxValues(t *testing.T) {
 func TestComputeGas(t *testing.T) {
 	ed := newMockEconomicsData()
 
-	ed.proposalController.UpdateParameters(map[int32]*kapps.Parameter{
+	ed.proposalController.Get().UpdateParameters(map[int32]*kapps.Parameter{
 		int32(kapps.EnumParameter_MaxGasPerTX): {Type: kapps.EnumType_Int64, Value: []byte("1000")},
 	})
 
@@ -451,7 +453,7 @@ func TestIsInterfaceNil(t *testing.T) {
 
 func TestGasParams(t *testing.T) {
 	ed := newMockEconomicsData()
-	ed.proposalController.UpdateParameters(map[int32]*kapps.Parameter{
+	ed.proposalController.Get().UpdateParameters(map[int32]*kapps.Parameter{
 		int32(kapps.EnumParameter_MaxGasPerBlock): {Type: kapps.EnumType_Int64, Value: []byte("1")},
 		int32(kapps.EnumParameter_MaxGasPerTX):    {Type: kapps.EnumType_Int64, Value: []byte("1")},
 	})
@@ -459,7 +461,7 @@ func TestGasParams(t *testing.T) {
 	assert.Equal(t, uint64(1), ed.MaxGasLimitPerTX())
 	assert.Equal(t, uint64(1), ed.MaxGasLimitPerBlock())
 
-	ed.proposalController.UpdateParameters(map[int32]*kapps.Parameter{
+	ed.proposalController.Get().UpdateParameters(map[int32]*kapps.Parameter{
 		int32(kapps.EnumParameter_MaxGasPerBlock): {Type: kapps.EnumType_Int64, Value: []byte("2")},
 		int32(kapps.EnumParameter_MaxGasPerTX):    {Type: kapps.EnumType_Int64, Value: []byte("2")},
 	})
@@ -472,4 +474,66 @@ func TestGasParams(t *testing.T) {
 func TestEpochConfirmed(t *testing.T) {
 	ed := newMockEconomicsData()
 	ed.EpochConfirmed(10) // This method doesn't do anything in the current implementation
+}
+
+func TestEconomicsData_SetProposalControllerConcurrently(t *testing.T) {
+	t.Parallel()
+
+	ed := &EconomicsData{leaderPercentage: 0.5}
+	tx := &transaction.Transaction{
+		RawData: &transaction.Transaction_Raw{
+			Contract: []*transaction.TXContract{
+				{Type: transaction.TXContract_TransferContractType},
+			},
+		},
+	}
+
+	// the REST API serves fee reads before StartConsensus wires the controller in
+	require.False(t, ed.IsProposalControllerSet())
+	require.Zero(t, ed.MaxGasLimitPerTX())
+
+	_, err := ed.ComputeTransactionCost(tx, false)
+	require.Equal(t, process.ErrProposalNotInitialized, err)
+
+	_, err = ed.CheckValidityTxValues(tx)
+	require.Equal(t, process.ErrProposalNotInitialized, err)
+
+	require.Equal(t, common.ErrNilProposalController, ed.SetProposalController(nil))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			_ = ed.MaxGasLimitPerTX()
+			_, _ = ed.ComputeTransactionCost(tx, false)
+		}
+	}()
+
+	require.Nil(t, ed.SetProposalController(createProposalController(map[int32]*kapps.Parameter{
+		int32(kapps.EnumParameter_MaxGasPerTX): {Type: kapps.EnumType_Uint64, Value: []byte("42")},
+	})))
+	<-done
+
+	require.Equal(t, uint64(42), ed.MaxGasLimitPerTX())
+	require.True(t, ed.IsProposalControllerSet())
+
+	// wired, but MaxGasPerTX is missing until EnableSmartContracts is active: 0
+	// is a real limit here, not a node still starting
+	require.Nil(t, ed.SetProposalController(createProposalController(map[int32]*kapps.Parameter{})))
+	require.Zero(t, ed.MaxGasLimitPerTX())
+	require.True(t, ed.IsProposalControllerSet())
+}
+
+// MaxGasLimitPerBlock only runs on the consensus path, so it stays unguarded: a
+// missing controller must surface rather than yield a zero gas bandwidth.
+func TestEconomicsData_MaxGasLimitPerBlock(t *testing.T) {
+	t.Parallel()
+
+	ed := &EconomicsData{leaderPercentage: 0.5}
+	require.Panics(t, func() { _ = ed.MaxGasLimitPerBlock() })
+
+	require.Nil(t, ed.SetProposalController(createProposalController(map[int32]*kapps.Parameter{
+		int32(kapps.EnumParameter_MaxGasPerBlock): {Type: kapps.EnumType_Uint64, Value: []byte("77")},
+	})))
+	require.Equal(t, uint64(77), ed.MaxGasLimitPerBlock())
 }

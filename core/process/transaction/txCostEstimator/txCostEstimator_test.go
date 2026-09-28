@@ -207,6 +207,52 @@ func TestAddMissingFieldsIfNeeded(t *testing.T) {
 		assert.Equal(t, signature, tx.Signature)
 		assert.Equal(t, uint64(1000), tx.GasLimit)
 	})
+
+}
+
+// the wired state is what tells a node still starting from a max gas limit that
+// is legitimately 0 - MaxGasPerTX only exists once EnableSmartContracts is active
+func TestEstimateTransactionGas_ProposalControllerWiredState(t *testing.T) {
+	simulator := &mock.TransactionSimulatorProcessorStub{
+		ProcessTXCalled: func(tx *transaction.Transaction) (*data.SimulationResults, error) {
+			return &data.SimulationResults{}, nil
+		},
+	}
+
+	newEstimator := func(feeHandler *mock.FeeHandlerStub) *transactionCostEstimator {
+		tce, err := NewTransactionCostEstimator(
+			&mock.AccountsCacherStub{},
+			feeHandler,
+			simulator,
+			&mock.ForkControllerStub{},
+		)
+		require.NoError(t, err)
+
+		return tce
+	}
+
+	unwired := &mock.FeeHandlerStub{IsProposalControllerSetCalled: func() bool { return false }}
+
+	// both gas limits take the same path, so an estimate before wiring never
+	// comes back as a CostResponse with an out-of-gas RetMessage
+	for _, gasLimit := range []uint64{0, 1000} {
+		tx := &transaction.Transaction{Signature: [][]byte{[]byte("sig")}, GasLimit: gasLimit}
+
+		cost, err := newEstimator(unwired).EstimateTransactionGas(tx)
+		require.Nil(t, cost)
+		require.Equal(t, process.ErrProposalNotInitialized, err)
+	}
+
+	// wired, but MaxGasPerTX is missing before the smart contracts fork: 0 is a
+	// real value here and the estimate must run
+	wiredWithoutMaxGas := &mock.FeeHandlerStub{MaxGasLimitPerTxValue: 0}
+	tx := &transaction.Transaction{Signature: [][]byte{[]byte("sig")}}
+
+	cost, err := newEstimator(wiredWithoutMaxGas).EstimateTransactionGas(tx)
+	require.NoError(t, err)
+	require.NotNil(t, cost)
+	require.Equal(t, process.ErrNilVMOutput.Error(), cost.RetMessage)
+	require.Equal(t, uint64(0), tx.GasLimit)
 }
 
 // Test IsInterfaceNil

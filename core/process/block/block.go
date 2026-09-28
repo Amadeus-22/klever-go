@@ -149,7 +149,7 @@ func (mp *metaProcessor) ProcessBlock(
 	// in-memory proposal parameters.
 	var restoreProposalParameters func()
 	if header.GetIsEpochStart() {
-		restoreProposalParameters = snapshotProposalParameters(mp.proposalController)
+		restoreProposalParameters = snapshotProposalParameters(mp.proposalController.Get())
 	}
 
 	defer func() {
@@ -1024,8 +1024,8 @@ func (mp *metaProcessor) applyHeader(blk *block.Block) error {
 	blk.Header.TxFees = mp.feeHandler.GetAccumulatedTxFees()
 	blk.Header.TxBurnedFees = mp.feeHandler.GetAccumulatedTxFees() - mp.validatorStatisticsProcessor.LeaderRewards(blk.GetTxFees())
 	blk.Header.KAppFees = mp.feeHandler.GetAccumulatedKAppFees()
-	blk.Header.BlockRewards = mp.proposalController.GetParameterInt(kapps.EnumParameter_BlockRewards)
-	blk.Header.StakingRewards = mp.proposalController.GetParameterInt(kapps.EnumParameter_StakingRewards)
+	blk.Header.BlockRewards = mp.proposalController.Get().GetParameterInt(kapps.EnumParameter_BlockRewards)
+	blk.Header.StakingRewards = mp.proposalController.Get().GetParameterInt(kapps.EnumParameter_StakingRewards)
 
 	sw.Start("UpdatePeerState")
 	currentBlockHeader := mp.blockChain.GetCurrentBlockHeader()
@@ -1322,7 +1322,7 @@ func (mp *metaProcessor) epochStartNativeStakingKapps(blk data.HeaderHandler) er
 		return err
 	}
 
-	maxEpochUnclaimed := mp.proposalController.GetParameterInt(kapps.EnumParameter_MaxEpochsUnclaimed)
+	maxEpochUnclaimed := mp.proposalController.Get().GetParameterInt(kapps.EnumParameter_MaxEpochsUnclaimed)
 
 	amountKLVToBurn := int64(0)
 	if len(klv.FPR) == int(maxEpochUnclaimed) {
@@ -1491,7 +1491,7 @@ func (mp *metaProcessor) finalizeProposalUpdates(proposalKApp state.KAppAccountH
 	// also the one epoch start mutation that no accounts DB snapshot covers, so
 	// ProcessBlock snapshots the parameter set up front and restores it on
 	// failure (see snapshotProposalParameters).
-	mp.proposalController.UpdateParameters(controller.ActiveParameters)
+	mp.proposalController.Get().UpdateParameters(controller.ActiveParameters)
 
 	return nil
 }
