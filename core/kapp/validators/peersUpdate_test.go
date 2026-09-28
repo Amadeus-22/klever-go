@@ -202,6 +202,7 @@ func TestDecreaseAll(t *testing.T) {
 		v := setupValidatorsKApp(t)
 		addFunctionalCacher(t, v)
 		v.forkController.(*mock.ForkControllerStub).EnableSmartContractsValue = false
+		v.forkController.(*mock.ForkControllerStub).FixAuditChangesV6Value = false
 
 		missedSlots := uint64(100)
 		consensusGroupSize := 21
@@ -300,6 +301,149 @@ func TestDecreaseAll(t *testing.T) {
 			return nil
 		})
 		assert.NoError(t, err)
+	})
+
+	t.Run("Exact multiple of validators count", func(t *testing.T) {
+		tests := []struct {
+			name                         string
+			fixV6                        bool
+			validatorsCount              int
+			missedSlots                  uint64
+			expectedLeaderAppearances    uint32
+			expectedValidatorAppearances uint32
+		}{
+			{"pre-fork keeps the legacy rounding", false, 21, 105, 6, 101},
+			{"post-fork is the exact ceiling", true, 21, 105, 5, 100},
+			{"pre-fork two validators", false, 2, 104, 53, 53},
+			{"post-fork two validators", true, 2, 104, 52, 52},
+		}
+
+		for _, tc := range tests {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				v := setupValidatorsKApp(t)
+				addFunctionalCacher(t, v)
+				v.forkController.(*mock.ForkControllerStub).FixAuditChangesV6Value = tc.fixV6
+				validators := getValidators(tc.validatorsCount)
+
+				err := v.DecreaseAll(validators, tc.missedSlots, tc.validatorsCount)
+				require.NoError(t, err)
+
+				for _, validator := range validators {
+					peerAcc, err := v.accountsCacher.GetExistingPeer(validator)
+					require.NoError(t, err)
+					assert.Equal(t, tc.expectedLeaderAppearances, peerAcc.GetLeaderSuccessRateFailure())
+					assert.Equal(t, tc.expectedValidatorAppearances, peerAcc.GetValidatorSuccessRateFailure())
+				}
+			})
+		}
+	})
+
+	t.Run("No validators post fork", func(t *testing.T) {
+		v := setupValidatorsKApp(t)
+		addFunctionalCacher(t, v)
+
+		err := v.DecreaseAll([][]byte{}, 150, 21)
+		assert.NoError(t, err)
+	})
+}
+
+func TestComputeDecreaseAllAppearances(t *testing.T) {
+	t.Parallel()
+
+	newKApp := func(t *testing.T, fixV6 bool) *validatorsKApp {
+		v := setupValidatorsKApp(t)
+		v.forkController.(*mock.ForkControllerStub).FixAuditChangesV6Value = fixV6
+		return v
+	}
+
+	t.Run("post-fork matches the integer ceiling", func(t *testing.T) {
+		t.Parallel()
+
+		v := newKApp(t, true)
+		for validatorsCount := 1; validatorsCount <= 64; validatorsCount++ {
+			for groupSize := 0; groupSize <= validatorsCount; groupSize++ {
+				for missedSlots := uint64(1); missedSlots <= 600; missedSlots++ {
+					leader, validator := v.computeDecreaseAllAppearances(missedSlots, validatorsCount, groupSize)
+
+					vc := uint64(validatorsCount)
+					expectedLeader := uint32((missedSlots + vc - 1) / vc)
+					expectedValidator := uint32((uint64(groupSize)*missedSlots + vc - 1) / vc)
+					require.Equal(t, expectedLeader, leader, "missedSlots=%d validators=%d groupSize=%d", missedSlots, validatorsCount, groupSize)
+					require.Equal(t, expectedValidator, validator, "missedSlots=%d validators=%d groupSize=%d", missedSlots, validatorsCount, groupSize)
+				}
+			}
+		}
+	})
+
+	t.Run("pre-fork and post-fork differ only when the division is exact", func(t *testing.T) {
+		t.Parallel()
+
+		legacy := newKApp(t, false)
+		fixed := newKApp(t, true)
+		for validatorsCount := 1; validatorsCount <= 64; validatorsCount++ {
+			vc := uint64(validatorsCount)
+			for groupSize := 0; groupSize <= validatorsCount; groupSize++ {
+				for missedSlots := uint64(1); missedSlots <= 600; missedSlots++ {
+					legacyLeader, legacyValidator := legacy.computeDecreaseAllAppearances(missedSlots, validatorsCount, groupSize)
+					fixedLeader, fixedValidator := fixed.computeDecreaseAllAppearances(missedSlots, validatorsCount, groupSize)
+
+					if missedSlots%vc == 0 {
+						require.Equal(t, fixedLeader+1, legacyLeader, "missedSlots=%d validators=%d", missedSlots, validatorsCount)
+					} else {
+						require.Equal(t, fixedLeader, legacyLeader, "missedSlots=%d validators=%d", missedSlots, validatorsCount)
+					}
+
+					if (uint64(groupSize)*missedSlots)%vc != 0 {
+						require.Equal(t, fixedValidator, legacyValidator, "missedSlots=%d validators=%d groupSize=%d", missedSlots, validatorsCount, groupSize)
+						continue
+					}
+
+					require.LessOrEqual(t, fixedValidator, legacyValidator, "missedSlots=%d validators=%d groupSize=%d", missedSlots, validatorsCount, groupSize)
+					require.LessOrEqual(t, legacyValidator-fixedValidator, uint32(1), "missedSlots=%d validators=%d groupSize=%d", missedSlots, validatorsCount, groupSize)
+				}
+			}
+		}
+	})
+
+	t.Run("pre-fork adds one validator appearance without an exact multiple of validators", func(t *testing.T) {
+		t.Parallel()
+
+		legacyLeader, legacyValidator := newKApp(t, false).computeDecreaseAllAppearances(105, 30, 20)
+		fixedLeader, fixedValidator := newKApp(t, true).computeDecreaseAllAppearances(105, 30, 20)
+
+		assert.Equal(t, uint32(4), legacyLeader)
+		assert.Equal(t, uint32(4), fixedLeader)
+		assert.Equal(t, uint32(71), legacyValidator)
+		assert.Equal(t, uint32(70), fixedValidator)
+	})
+
+	t.Run("post-fork handles degenerate sizes", func(t *testing.T) {
+		t.Parallel()
+
+		v := newKApp(t, true)
+
+		leader, validator := v.computeDecreaseAllAppearances(150, 0, 20)
+		assert.Equal(t, uint32(0), leader)
+		assert.Equal(t, uint32(0), validator)
+
+		leader, validator = v.computeDecreaseAllAppearances(150, 1, 0)
+		assert.Equal(t, uint32(150), leader)
+		assert.Equal(t, uint32(0), validator)
+
+		leader, validator = v.computeDecreaseAllAppearances(150, 1, -1)
+		assert.Equal(t, uint32(150), leader)
+		assert.Equal(t, uint32(0), validator)
+	})
+
+	t.Run("post-fork saturates instead of overflowing", func(t *testing.T) {
+		t.Parallel()
+
+		v := newKApp(t, true)
+
+		leader, validator := v.computeDecreaseAllAppearances(math.MaxUint64, 21, 20)
+		assert.Equal(t, uint32(math.MaxUint32), leader)
+		assert.Equal(t, uint32(math.MaxUint32), validator)
 	})
 }
 

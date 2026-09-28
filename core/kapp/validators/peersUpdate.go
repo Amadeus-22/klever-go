@@ -172,20 +172,13 @@ func (v *validatorsKApp) DecreaseAll(
 		return err
 	}
 
-	validatorsCount := len(validators)
-	// Calculate the average number of missed participation per validator
-	percentageSlotMissedFromTotalValidators := float64(missedSlots) / float64(validatorsCount)
-	// Estimate the number of times each validator should have been a leader during missed slots
-	// Adding (1 - math.SmallestNonzeroFloat64) ensures rounding up to at least 1
-	leaderAppearances := uint32(percentageSlotMissedFromTotalValidators + 1 - math.SmallestNonzeroFloat64)
-	// Estimate the total number of times each validator should have participated in consensus as validator
-	// Adding (1 - math.SmallestNonzeroFloat64) ensures rounding up to at least 1
 	consensusGroupSizeValidators := consensusGroupSize
 	if v.forkController.EnableSmartContracts() {
 		consensusGroupSizeValidators -= 1
 	}
-	consensusGroupAppearances := uint32(float64(consensusGroupSizeValidators)*percentageSlotMissedFromTotalValidators +
-		1 - math.SmallestNonzeroFloat64)
+	leaderAppearances, consensusGroupAppearances := v.computeDecreaseAllAppearances(
+		missedSlots, len(validators), consensusGroupSizeValidators,
+	)
 	ratingDifference := uint32(0)
 
 	// Apply penalties to each validator
@@ -234,6 +227,51 @@ func (v *validatorsKApp) DecreaseAll(
 
 	// Persist all changes
 	return v.accountsCacher.SaveAll()
+}
+
+func (v *validatorsKApp) computeDecreaseAllAppearances(
+	missedSlots uint64,
+	validatorsCount int,
+	consensusGroupSizeValidators int,
+) (uint32, uint32) {
+	if !v.forkController.FixAuditChangesV6() {
+		// Calculate the average number of missed participation per validator
+		percentageSlotMissedFromTotalValidators := float64(missedSlots) / float64(validatorsCount)
+		// Estimate the number of times each validator should have been a leader during missed slots
+		// Adding (1 - math.SmallestNonzeroFloat64) ensures rounding up to at least 1
+		leaderAppearances := uint32(percentageSlotMissedFromTotalValidators + 1 - math.SmallestNonzeroFloat64)
+		// Estimate the total number of times each validator should have participated in consensus as validator
+		// Adding (1 - math.SmallestNonzeroFloat64) ensures rounding up to at least 1
+		consensusGroupAppearances := uint32(float64(consensusGroupSizeValidators)*percentageSlotMissedFromTotalValidators +
+			1 - math.SmallestNonzeroFloat64)
+		return leaderAppearances, consensusGroupAppearances
+	}
+
+	if validatorsCount <= 0 {
+		return 0, 0
+	}
+
+	numValidators := uint64(validatorsCount)
+	leaderAppearances := tools.SafeU64ToU32(ceilDivUint64(missedSlots, numValidators))
+	if consensusGroupSizeValidators <= 0 {
+		return leaderAppearances, 0
+	}
+
+	groupSize := uint64(consensusGroupSizeValidators)
+	if missedSlots > math.MaxUint64/groupSize {
+		return leaderAppearances, math.MaxUint32
+	}
+
+	return leaderAppearances, tools.SafeU64ToU32(ceilDivUint64(groupSize*missedSlots, numValidators))
+}
+
+func ceilDivUint64(numerator uint64, denominator uint64) uint64 {
+	quotient := numerator / denominator
+	if numerator%denominator != 0 {
+		quotient++
+	}
+
+	return quotient
 }
 
 func (v *validatorsKApp) DecreaseTempRating(validator []byte, isProposer bool) error {
