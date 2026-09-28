@@ -203,6 +203,7 @@ type ManagedTypesContext interface {
 	BigFloatExpIsNotValid(exponent int) bool
 	BigFloatIsNotCanonical(bigFloat *big.Float) bool
 	EncodedBigFloatIsNotValid(encodedBigFloat []byte) bool
+	EncodedBigFloatLenIsNotValid(length int32) bool
 	GetBigFloatOrCreate(handle int32) (*big.Float, error)
 	GetBigFloat(handle int32) (*big.Float, error)
 	GetTwoBigFloats(handle1 int32, handle2 int32) (*big.Float, *big.Float, error)

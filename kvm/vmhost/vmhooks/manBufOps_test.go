@@ -19,15 +19,19 @@ import (
 )
 
 func TestMBufferToBigFloat(t *testing.T) {
+	// 18 bytes is the accepted maximum, so this also pins the lower side of the V6 length check.
 	t.Run("Canonical encoding succeeds", func(t *testing.T) {
 		mockWorld := worldmock.NewMockWorld()
-		vmHost, err := hostCore.NewVMHost(mockWorld, makeHostParameters())
+		fc := commonMock.NewForkControllerStub()
+		fc.FixAuditChangesV6Value = true
+		vmHost, err := hostCore.NewVMHost(mockWorld, makeHostParametersWithFork(fc))
 		require.NoError(t, err)
 		hooks := vmhooks.NewVMHooksImpl(vmHost)
 		provideGas(hooks, 1_000_000)
 
 		canonical, err := big.NewFloat(1.5).GobEncode()
 		require.NoError(t, err)
+		require.Len(t, canonical, 18, "a canonical prec-53 encoding is exactly the accepted maximum")
 		mBufferHandle := hooks.GetManagedTypesContext().NewManagedBufferFromBytes(canonical)
 		bigFloatHandle := int32(100)
 
@@ -43,10 +47,13 @@ func TestMBufferToBigFloat(t *testing.T) {
 	// 64-bit word, of which only the top 53 bits are significant. Appending
 	// an extra mantissa word still has a valid prefix and still GobDecodes
 	// successfully, but MinPrec() on the decoded value exceeds 53, which is
-	// exactly the non-canonical encoding the check rejects.
+	// exactly the non-canonical encoding the check rejects. Post-V6 the length
+	// check rejects it first, so V6 is off here to keep MinPrec() covered.
 	t.Run("Non-canonical encoding faults", func(t *testing.T) {
 		mockWorld := worldmock.NewMockWorld()
-		vmHost, err := hostCore.NewVMHost(mockWorld, makeHostParameters())
+		fc := commonMock.NewForkControllerStub()
+		fc.FixAuditChangesV6Value = false
+		vmHost, err := hostCore.NewVMHost(mockWorld, makeHostParametersWithFork(fc))
 		require.NoError(t, err)
 		hooks := vmhooks.NewVMHooksImpl(vmHost)
 		provideGas(hooks, 1_000_000)
@@ -131,6 +138,73 @@ func TestMBufferToBigFloat(t *testing.T) {
 		result, err := hooks.GetManagedTypesContext().GetBigFloat(bigFloatHandle)
 		require.NoError(t, err)
 		require.Equal(t, 0, big.NewFloat(0).Cmp(result), "destination must be left untouched (still the zero value GetBigFloatOrCreate seeded)")
+	})
+
+	// Trailing zero mantissa words and a leading zero mantissa byte both decode to exactly 1.5
+	// with MinPrec() 2, so neither the prefix check nor the MinPrec check can see them. Post-V6
+	// they are rejected by length alone, before the destination handle is even created. The
+	// 19-byte cases pin the upper side of the length check.
+	t.Run("Over-long encodings fault before decode", func(t *testing.T) {
+		canonical, err := big.NewFloat(1.5).GobEncode()
+		require.NoError(t, err)
+
+		leadingZeroMantissa := append([]byte{}, canonical[:10]...)
+		leadingZeroMantissa = append(leadingZeroMantissa, 0)
+		leadingZeroMantissa = append(leadingZeroMantissa, canonical[10:]...)
+
+		for _, tc := range []struct {
+			name    string
+			encoded []byte
+		}{
+			{"one trailing zero byte", append(append([]byte{}, canonical...), 0)},
+			{"leading zero mantissa byte", leadingZeroMantissa},
+			{"whole trailing zero mantissa word", append(append([]byte{}, canonical...), make([]byte, 8)...)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				require.Greater(t, len(tc.encoded), 18, "input must be past the accepted maximum")
+
+				mockWorld := worldmock.NewMockWorld()
+				fc := commonMock.NewForkControllerStub()
+				fc.FixAuditChangesV6Value = true
+				vmHost, err := hostCore.NewVMHost(mockWorld, makeHostParametersWithFork(fc))
+				require.NoError(t, err)
+				hooks := vmhooks.NewVMHooksImpl(vmHost)
+				provideGas(hooks, 1_000_000)
+
+				mBufferHandle := hooks.GetManagedTypesContext().NewManagedBufferFromBytes(tc.encoded)
+				bigFloatHandle := int32(105)
+
+				ret := hooks.MBufferToBigFloat(mBufferHandle, bigFloatHandle)
+
+				require.Equal(t, int32(1), ret)
+				require.ErrorIs(t, hooks.GetRuntimeContext().GetAllErrors(), vmhost.ErrBigFloatNonCanonicalEncoding)
+				_, err = hooks.GetManagedTypesContext().GetBigFloat(bigFloatHandle)
+				require.ErrorIs(t, err, vmhost.ErrNoBigFloatUnderThisHandle)
+			})
+		}
+	})
+
+	t.Run("Pre-V6: zero-padded encoding succeeds", func(t *testing.T) {
+		mockWorld := worldmock.NewMockWorld()
+		fc := commonMock.NewForkControllerStub()
+		fc.FixAuditChangesV6Value = false
+		vmHost, err := hostCore.NewVMHost(mockWorld, makeHostParametersWithFork(fc))
+		require.NoError(t, err)
+		hooks := vmhooks.NewVMHooksImpl(vmHost)
+		provideGas(hooks, 1_000_000)
+
+		canonical, err := big.NewFloat(1.5).GobEncode()
+		require.NoError(t, err)
+		padded := append(append([]byte{}, canonical...), make([]byte, 8)...)
+		mBufferHandle := hooks.GetManagedTypesContext().NewManagedBufferFromBytes(padded)
+		bigFloatHandle := int32(106)
+
+		ret := hooks.MBufferToBigFloat(mBufferHandle, bigFloatHandle)
+
+		require.Equal(t, int32(0), ret)
+		result, err := hooks.GetManagedTypesContext().GetBigFloat(bigFloatHandle)
+		require.NoError(t, err)
+		require.Equal(t, 0, big.NewFloat(1.5).Cmp(result))
 	})
 }
 

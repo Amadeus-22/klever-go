@@ -36,6 +36,7 @@ type ManagedTypesContextMock struct {
 	BigFloatExpIsNotValidCalled                    func(exponent int) bool
 	BigFloatIsNotCanonicalCalled                   func(bigFloat *big.Float) bool
 	EncodedBigFloatIsNotValidCalled                func(encodedBigFloat []byte) bool
+	EncodedBigFloatLenIsNotValidCalled             func(length int32) bool
 	GetBigFloatOrCreateCalled                      func(handle int32) (*big.Float, error)
 	GetBigFloatCalled                              func(handle int32) (*big.Float, error)
 	GetTwoBigFloatsCalled                          func(handle1 int32, handle2 int32) (*big.Float, *big.Float, error)
@@ -219,6 +220,13 @@ func (m *ManagedTypesContextMock) BigFloatIsNotCanonical(bigFloat *big.Float) bo
 func (m *ManagedTypesContextMock) EncodedBigFloatIsNotValid(encodedBigFloat []byte) bool {
 	if m.EncodedBigFloatIsNotValidCalled != nil {
 		return m.EncodedBigFloatIsNotValidCalled(encodedBigFloat)
+	}
+	return false
+}
+
+func (m *ManagedTypesContextMock) EncodedBigFloatLenIsNotValid(length int32) bool {
+	if m.EncodedBigFloatLenIsNotValidCalled != nil {
+		return m.EncodedBigFloatLenIsNotValidCalled(length)
 	}
 	return false
 }

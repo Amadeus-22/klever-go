@@ -725,6 +725,14 @@ func (context *VMHooksImpl) MBufferToBigFloat(mBufferHandle, bigFloatHandle int3
 		return 1
 	}
 
+	// reject by length before the bytes are copied or decoded: GobDecode would keep trailing
+	// zero padding as extra mantissa words
+	if context.host.ForkController().FixAuditChangesV6() &&
+		managedType.EncodedBigFloatLenIsNotValid(managedType.GetLength(mBufferHandle)) {
+		_ = context.WithFault(vmhost.ErrBigFloatNonCanonicalEncoding, runtime.BigFloatAPIErrorShouldFailExecution())
+		return 1
+	}
+
 	managedBuffer, err := managedType.GetBytes(mBufferHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
