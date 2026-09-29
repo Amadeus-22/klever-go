@@ -3,6 +3,7 @@ package mock
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	executorwrapper "github.com/klever-io/klever-go/kvm/executor/wrapper"
@@ -12,6 +13,11 @@ import (
 )
 
 var _ executor.Instance = (*InstanceMock)(nil)
+
+// mutBreakpoints guards BreakpointValue in the accessors, which a timed-out
+// execution calls from the timeout goroutine, as the wasmer2 instance does. It
+// is package-level because InstanceMock is copied by value.
+var mutBreakpoints sync.Mutex
 
 type mockMethod func() *InstanceMock
 
@@ -89,11 +95,15 @@ func (instance *InstanceMock) SetGasLimit(gasLimit uint64) {
 
 // SetBreakpointValue mocked method
 func (instance *InstanceMock) SetBreakpointValue(value uint64) {
+	mutBreakpoints.Lock()
+	defer mutBreakpoints.Unlock()
 	instance.BreakpointValue = vmhost.BreakpointValue(value)
 }
 
 // GetBreakpointValue mocked method
 func (instance *InstanceMock) GetBreakpointValue() uint64 {
+	mutBreakpoints.Lock()
+	defer mutBreakpoints.Unlock()
 	return uint64(instance.BreakpointValue)
 }
 

@@ -467,11 +467,40 @@ func (context *VMHooksImpl) BigFloatPow(destinationHandle, opHandle, exponent in
 	setResultIfNotInfinity(context.GetVMHost(), powResult, destinationHandle)
 }
 
+// powCancellationCheckInterval is how many multiplications pow performs between
+// checks of the execution context. Big floats are fixed at 53-bit precision, so a
+// multiplication costs tens of nanoseconds and a check on every iteration adds a
+// measurable share of that; every 64 is within noise and still observes a
+// cancellation within a few microseconds, far below the execution timeout.
+//
+// The loop itself must stay one multiplication per iteration: big.Float rounds
+// at every operation, so square-and-multiply would change the result bits.
+const powCancellationCheckInterval = 64
+
 func (context *VMHooksImpl) pow(base *big.Float, exp int32) (*big.Float, error) {
 	result := big.NewFloat(1)
 	result.SetPrec(base.Prec())
 	managedType := context.GetManagedTypesContext()
+
+	// The loop is charged up front, but a timed-out execution must still stop
+	// promptly rather than finish the remaining multiplications: the timeout
+	// path joins this hook before returning. The hook context is only cancelled
+	// once the execution has already timed out, whose result replaces whatever
+	// this returns, so observing it cannot make an execution diverge.
+	var cancelled <-chan struct{}
+	if ctx := context.host.GetExecutionContext(); ctx != nil {
+		cancelled = ctx.Done()
+	}
+
 	for i := 0; i < int(exp); i++ {
+		if i%powCancellationCheckInterval == 0 {
+			select {
+			case <-cancelled:
+				return nil, vmhost.ErrExecutionFailedWithTimeout
+			default:
+			}
+		}
+
 		resultMul, err := vmMath.MulBigFloat(result, base)
 		if err != nil {
 			return nil, err

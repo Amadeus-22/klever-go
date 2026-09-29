@@ -54,12 +54,11 @@ func FailAfterTimeout[K any](f func() K, category HookCategory, vmHooks *Wrapper
 	// - Must be interruptible to avoid DoS attacks
 	// - We run the hook in a goroutine and wait for either completion or timeout
 	// - If the hook panics, we propagate the panic to the caller
-	// - If the hook times out, we panic with ErrExecutionFailedWithTimeout and
-	//   abandon the goroutine: it is NOT cancelled, it keeps running until f()
-	//   returns and its result is discarded. Slow hooks must therefore bound
-	//   their own work up front (e.g. the pow hooks charge gas before looping)
-	//   so an abandoned goroutine finishes shortly after the timeout instead of
-	//   mutating shared VM state indefinitely.
+	// - If the hook times out, we join the goroutine and then panic with
+	//   ErrExecutionFailedWithTimeout, discarding its result. The join waits for
+	//   f() to return, so slow hooks must bound their own work up front (e.g. the
+	//   pow hooks charge gas before looping) and, where they loop, observe the
+	//   execution context (BigFloatPow) so the timeout completes promptly.
 	type resultOrPanic struct {
 		result K
 		panic  any
@@ -90,9 +89,9 @@ func FailAfterTimeout[K any](f func() K, category HookCategory, vmHooks *Wrapper
 			}
 			return rp.result
 		case <-ctx.Done():
-			// Contract timeout triggered. The timeout path in host.go has already set the
-			// execution breakpoint (FailExecution) before cancelling this hook context, so the
-			// in-flight worker will stop at the next breakpoint check and send on done.
+			// Contract timeout triggered. The timeout path in host.go has already requested the
+			// interruption (RequestTimeoutInterruption) before cancelling this hook context, so
+			// the in-flight worker will stop at the next breakpoint check and send on done.
 			//
 			// We must join the worker here before unwinding: this panic propagates up to the
 			// recover in RunSmartContractCall, which calls CleanInstance and destroys the native

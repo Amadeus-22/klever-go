@@ -10,39 +10,40 @@ var _ vmhost.RuntimeContext = (*RuntimeContextMock)(nil)
 
 // RuntimeContextMock is used in tests to check the RuntimeContextMock interface method calls
 type RuntimeContextMock struct {
-	Err                      error
-	VMInput                  *vmcommon.ContractCallInput
-	OriginalCallerAddr       []byte
-	SCAddress                []byte
-	SCCode                   []byte
-	SCCodeSize               uint64
-	CallFunction             string
-	VMType                   []byte
-	ReadOnlyFlag             bool
-	VerifyCode               bool
-	CurrentBreakpointValue   vmhost.BreakpointValue
-	PointsUsed               uint64
-	InstanceCtxID            int
-	MemLoadResult            []byte
-	MemLoadMultipleResult    [][]byte
-	FailCryptoAPI            bool
-	FailBaseOpsAPI           bool
-	FailSyncExecAPI          bool
-	FailBigIntAPI            bool
-	FailBigFloatAPI          bool
-	FailManagedBuffersAPI    bool
-	FailManagedMapAPI        bool
-	InstanceStackSize        uint64
-	CurrentTxHash            []byte
-	OriginalTxHash           []byte
-	TraceGasEnabled          bool
-	GasTrace                 map[string]map[string][]uint64
-	SameContractOnStackCount uint64
-	HasFunctionResult        bool
-	InstanceMock             executor.Instance
-	SignalErrorMessage       string
-	FailExecutionErr         error
-	FailExecutionCalled      func(err error)
+	Err                              error
+	VMInput                          *vmcommon.ContractCallInput
+	OriginalCallerAddr               []byte
+	SCAddress                        []byte
+	SCCode                           []byte
+	SCCodeSize                       uint64
+	CallFunction                     string
+	VMType                           []byte
+	ReadOnlyFlag                     bool
+	VerifyCode                       bool
+	CurrentBreakpointValue           vmhost.BreakpointValue
+	PointsUsed                       uint64
+	InstanceCtxID                    int
+	MemLoadResult                    []byte
+	MemLoadMultipleResult            [][]byte
+	FailCryptoAPI                    bool
+	FailBaseOpsAPI                   bool
+	FailSyncExecAPI                  bool
+	FailBigIntAPI                    bool
+	FailBigFloatAPI                  bool
+	FailManagedBuffersAPI            bool
+	FailManagedMapAPI                bool
+	InstanceStackSize                uint64
+	CurrentTxHash                    []byte
+	OriginalTxHash                   []byte
+	TraceGasEnabled                  bool
+	GasTrace                         map[string]map[string][]uint64
+	SameContractOnStackCount         uint64
+	HasFunctionResult                bool
+	InstanceMock                     executor.Instance
+	SignalErrorMessage               string
+	FailExecutionErr                 error
+	FailExecutionCalled              func(err error)
+	RequestTimeoutInterruptionCalled func()
 }
 
 // InitState mocked method
@@ -227,6 +228,18 @@ func (r *RuntimeContextMock) SignalUserError(message string) {
 
 // SetRuntimeBreakpointValue mocked method
 func (r *RuntimeContextMock) SetRuntimeBreakpointValue(_ vmhost.BreakpointValue) {
+}
+
+// RequestTimeoutInterruption mocked method
+func (r *RuntimeContextMock) RequestTimeoutInterruption() {
+	if r.RequestTimeoutInterruptionCalled != nil {
+		r.RequestTimeoutInterruptionCalled()
+	}
+}
+
+// ClearTimeoutInterruption mocked method
+func (r *RuntimeContextMock) ClearTimeoutInterruption() {
+	// no-op: the mock keeps no interruption state to clear
 }
 
 // GetRuntimeBreakpointValue mocked method

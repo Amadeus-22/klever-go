@@ -6,6 +6,7 @@ import (
 
 	commonMock "github.com/klever-io/klever-go/common/mock"
 	mock "github.com/klever-io/klever-go/kvm/mock/context"
+	"github.com/klever-io/klever-go/kvm/vmhost"
 	"github.com/stretchr/testify/require"
 )
 
@@ -486,4 +487,252 @@ func TestInstanceTracker_SetNewInstanceCapacityBeforeFixAuditChangesV4(t *testin
 	iTracker.codeHash = []byte("alpha")
 	iTracker.ForceCleanInstance(true)
 	require.ErrorIs(t, iTracker.SetNewInstance(mock.NewInstanceMock(nil), Bytecode), errTooManyInstances)
+}
+
+func TestInstanceTracker_RequestInterruption(t *testing.T) {
+	t.Run("stops the active instance", func(t *testing.T) {
+		iTracker, err := NewInstanceTracker(commonMock.NewForkControllerStub())
+		require.Nil(t, err)
+		active := mock.NewInstanceMock(nil)
+		require.Nil(t, iTracker.SetNewInstance(active, Bytecode))
+
+		iTracker.RequestInterruption(vmhost.BreakpointExecutionFailed)
+
+		require.Equal(t, vmhost.BreakpointExecutionFailed, active.BreakpointValue)
+	})
+
+	t.Run("with no active instance does not panic", func(t *testing.T) {
+		iTracker, err := NewInstanceTracker(commonMock.NewForkControllerStub())
+		require.Nil(t, err)
+
+		require.NotPanics(t, func() {
+			iTracker.RequestInterruption(vmhost.BreakpointExecutionFailed)
+		})
+	})
+
+	// A nested call started after the timeout replaces the active instance; the
+	// request must reach it, and the parent restored when the nested call returns.
+	t.Run("applies to instances made active afterwards", func(t *testing.T) {
+		iTracker, err := NewInstanceTracker(commonMock.NewForkControllerStub())
+		require.Nil(t, err)
+		parent := mock.NewInstanceMock(nil)
+		require.Nil(t, iTracker.SetNewInstance(parent, Bytecode))
+		iTracker.PushState()
+
+		nested := mock.NewInstanceMock(nil)
+		require.Nil(t, iTracker.SetNewInstance(nested, Bytecode))
+		iTracker.RequestInterruption(vmhost.BreakpointExecutionFailed)
+		parent.BreakpointValue = vmhost.BreakpointNone
+
+		iTracker.PopSetActiveState()
+
+		require.Equal(t, vmhost.BreakpointExecutionFailed, nested.BreakpointValue)
+		require.Equal(t, vmhost.BreakpointExecutionFailed, parent.BreakpointValue)
+
+		late := mock.NewInstanceMock(nil)
+		require.Nil(t, iTracker.SetNewInstance(late, Bytecode))
+		require.Equal(t, vmhost.BreakpointExecutionFailed, late.BreakpointValue)
+	})
+
+	// Starting an instance resets its breakpoint to BreakpointNone; that reset
+	// must not undo a pending interruption.
+	t.Run("survives a breakpoint reset", func(t *testing.T) {
+		iTracker, err := NewInstanceTracker(commonMock.NewForkControllerStub())
+		require.Nil(t, err)
+		active := mock.NewInstanceMock(nil)
+		require.Nil(t, iTracker.SetNewInstance(active, Bytecode))
+
+		iTracker.RequestInterruption(vmhost.BreakpointExecutionFailed)
+		iTracker.SetActiveBreakpointValue(vmhost.BreakpointNone)
+		require.Equal(t, vmhost.BreakpointExecutionFailed, active.BreakpointValue)
+
+		iTracker.SetActiveBreakpointValue(vmhost.BreakpointOutOfGas)
+		require.Equal(t, vmhost.BreakpointOutOfGas, active.BreakpointValue)
+	})
+
+	t.Run("ClearInterruption stops applying the request", func(t *testing.T) {
+		iTracker, err := NewInstanceTracker(commonMock.NewForkControllerStub())
+		require.Nil(t, err)
+		iTracker.RequestInterruption(vmhost.BreakpointExecutionFailed)
+		iTracker.ClearInterruption()
+
+		active := mock.NewInstanceMock(nil)
+		require.Nil(t, iTracker.SetNewInstance(active, Bytecode))
+		require.Equal(t, vmhost.BreakpointNone, active.BreakpointValue)
+
+		active.BreakpointValue = vmhost.BreakpointSignalError
+		iTracker.SetActiveBreakpointValue(vmhost.BreakpointNone)
+		require.Equal(t, vmhost.BreakpointNone, active.BreakpointValue)
+	})
+}
+
+// cleanObserver records whether an instance was still the active one when it
+// was destroyed.
+type cleanObserver struct {
+	*mock.InstanceMock
+	tracker           *instanceTracker
+	cleaned           bool
+	activeWhenCleaned bool
+}
+
+func (observer *cleanObserver) Clean() bool {
+	observer.cleaned = true
+	observer.activeWhenCleaned = observer.tracker.Instance() == observer
+	return observer.InstanceMock.Clean()
+}
+
+// RequestInterruption runs outside the execution goroutine, so an instance must
+// stop being the active one before it is destroyed; otherwise the request can
+// land on an already-cleaned instance.
+func TestInstanceTracker_InstanceIsNotActiveWhenCleaned(t *testing.T) {
+	// Each case reaches a different ForceCleanInstance branch. A timed-out top-level
+	// call takes the warm eviction one: its code hash is not on the stack.
+	forceCleanCases := []struct {
+		name   string
+		bypass bool
+		setup  func(iTracker *instanceTracker)
+	}{
+		{name: "bypassing warm and stack checks", bypass: true},
+		{name: "code hash on the stack", setup: func(iTracker *instanceTracker) {
+			iTracker.codeHashStack = append(iTracker.codeHashStack, []byte("alpha"))
+		}},
+		{name: "evicting the warm instance", setup: func(iTracker *instanceTracker) {
+			iTracker.SaveAsWarmInstance()
+		}},
+	}
+	for _, testCase := range forceCleanCases {
+		t.Run("ForceCleanInstance "+testCase.name, func(t *testing.T) {
+			iTracker, err := NewInstanceTracker(commonMock.NewForkControllerStub())
+			require.Nil(t, err)
+			active := &cleanObserver{InstanceMock: mock.NewInstanceMock(nil), tracker: iTracker}
+			require.Nil(t, iTracker.SetNewInstance(active, Bytecode))
+			iTracker.codeHash = []byte("alpha")
+			if testCase.setup != nil {
+				testCase.setup(iTracker)
+			}
+
+			iTracker.ForceCleanInstance(testCase.bypass)
+
+			require.True(t, active.cleaned)
+			require.False(t, active.activeWhenCleaned)
+			require.Nil(t, iTracker.Instance())
+			require.Nil(t, iTracker.CodeHash())
+		})
+	}
+
+	t.Run("PopSetActiveState", func(t *testing.T) {
+		iTracker, err := NewInstanceTracker(commonMock.NewForkControllerStub())
+		require.Nil(t, err)
+		parent := mock.NewInstanceMock(nil)
+		require.Nil(t, iTracker.SetNewInstance(parent, Bytecode))
+		iTracker.codeHash = []byte("alpha")
+		iTracker.PushState()
+
+		// Same code hash as the stacked parent, so popping cleans the nested instance.
+		nested := &cleanObserver{InstanceMock: mock.NewInstanceMock(nil), tracker: iTracker}
+		require.Nil(t, iTracker.SetNewInstance(nested, Bytecode))
+		iTracker.codeHash = []byte("alpha")
+
+		iTracker.PopSetActiveState()
+
+		require.True(t, nested.cleaned)
+		require.False(t, nested.activeWhenCleaned)
+		require.Equal(t, parent, iTracker.Instance())
+	})
+}
+
+// blockingCleanObserver holds Clean until released, so a test can act while the
+// instance is being destroyed.
+type blockingCleanObserver struct {
+	*mock.InstanceMock
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newBlockingCleanObserver() *blockingCleanObserver {
+	return &blockingCleanObserver{
+		InstanceMock: mock.NewInstanceMock(nil),
+		entered:      make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+}
+
+func (observer *blockingCleanObserver) Clean() bool {
+	close(observer.entered)
+	<-observer.release
+	return observer.InstanceMock.Clean()
+}
+
+// An interruption requested from the timeout goroutine while an instance is being
+// destroyed must not reach that instance, and must still stop the next active one.
+func TestInstanceTracker_InterruptionDuringCleanupSkipsCleanedInstance(t *testing.T) {
+	testCases := []struct {
+		name    string
+		setup   func(iTracker *instanceTracker)
+		cleanup func(iTracker *instanceTracker)
+	}{
+		{name: "ForceCleanInstance bypassing warm and stack checks", cleanup: func(iTracker *instanceTracker) {
+			iTracker.ForceCleanInstance(true)
+		}},
+		{name: "ForceCleanInstance with the code hash on the stack", setup: func(iTracker *instanceTracker) {
+			iTracker.codeHashStack = append(iTracker.codeHashStack, []byte("alpha"))
+		}, cleanup: func(iTracker *instanceTracker) {
+			iTracker.ForceCleanInstance(false)
+		}},
+		{name: "ForceCleanInstance evicting the warm instance", setup: func(iTracker *instanceTracker) {
+			iTracker.SaveAsWarmInstance()
+		}, cleanup: func(iTracker *instanceTracker) {
+			iTracker.ForceCleanInstance(false)
+		}},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			iTracker, err := NewInstanceTracker(commonMock.NewForkControllerStub())
+			require.Nil(t, err)
+			cleaned := newBlockingCleanObserver()
+			require.Nil(t, iTracker.SetNewInstance(cleaned, Bytecode))
+			iTracker.codeHash = []byte("alpha")
+			if testCase.setup != nil {
+				testCase.setup(iTracker)
+			}
+
+			requestDuringClean(iTracker, cleaned)
+			testCase.cleanup(iTracker)
+
+			require.Equal(t, uint64(vmhost.BreakpointNone), cleaned.GetBreakpointValue())
+			next := mock.NewInstanceMock(nil)
+			require.Nil(t, iTracker.SetNewInstance(next, Bytecode))
+			require.Equal(t, uint64(vmhost.BreakpointExecutionFailed), next.GetBreakpointValue())
+		})
+	}
+
+	t.Run("PopSetActiveState", func(t *testing.T) {
+		iTracker, err := NewInstanceTracker(commonMock.NewForkControllerStub())
+		require.Nil(t, err)
+		parent := mock.NewInstanceMock(nil)
+		require.Nil(t, iTracker.SetNewInstance(parent, Bytecode))
+		iTracker.codeHash = []byte("alpha")
+		iTracker.PushState()
+
+		// Same code hash as the stacked parent, so popping cleans the nested instance.
+		cleaned := newBlockingCleanObserver()
+		require.Nil(t, iTracker.SetNewInstance(cleaned, Bytecode))
+		iTracker.codeHash = []byte("alpha")
+
+		requestDuringClean(iTracker, cleaned)
+		iTracker.PopSetActiveState()
+
+		require.Equal(t, uint64(vmhost.BreakpointNone), cleaned.GetBreakpointValue())
+		require.Equal(t, uint64(vmhost.BreakpointExecutionFailed), parent.GetBreakpointValue())
+	})
+}
+
+// requestDuringClean requests an interruption from another goroutine once the
+// observed instance's Clean has started, then lets Clean finish.
+func requestDuringClean(iTracker *instanceTracker, observer *blockingCleanObserver) {
+	go func() {
+		<-observer.entered
+		iTracker.RequestInterruption(vmhost.BreakpointExecutionFailed)
+		close(observer.release)
+	}()
 }

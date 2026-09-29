@@ -18,4 +18,5 @@
   drop)
  (func (export "child")
   (loop $again
-   br $again)))
+   br $again))
+ (func (export "noop")))

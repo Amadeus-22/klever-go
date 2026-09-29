@@ -142,6 +142,8 @@ type RuntimeContext interface {
 	DisarmPendingCodeVerification()
 	SetRuntimeBreakpointValue(value BreakpointValue)
 	GetRuntimeBreakpointValue() BreakpointValue
+	RequestTimeoutInterruption()
+	ClearTimeoutInterruption()
 	GetInstanceStackSize() uint64
 	CountSameContractInstancesOnStack(address []byte) uint64
 	IsFunctionImported(name string) bool

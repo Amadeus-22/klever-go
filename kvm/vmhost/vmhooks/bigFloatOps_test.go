@@ -1,7 +1,9 @@
 package vmhooks_test
 
 import (
+	"context"
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"testing"
@@ -297,4 +299,57 @@ func TestBigFloatPow(t *testing.T) {
 			})
 		}
 	})
+}
+
+// cancelledContextHost is a VMHost whose execution context reports that the
+// execution has already timed out.
+type cancelledContextHost struct {
+	vmhost.VMHost
+	ctx context.Context
+}
+
+func (host *cancelledContextHost) GetExecutionContext() context.Context {
+	return host.ctx
+}
+
+// A timed-out execution joins the BigFloatPow hook before returning, so the
+// multiply loop must observe the cancelled execution context instead of running
+// the remaining iterations it was charged for up front.
+func TestBigFloatPow_StopsWhenExecutionContextIsCancelled(t *testing.T) {
+	vmHost, err := hostCore.NewVMHost(worldmock.NewMockWorld(), makeHostParameters())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	hooks := vmhooks.NewVMHooksImpl(&cancelledContextHost{VMHost: vmHost, ctx: ctx})
+	provideGas(hooks, math.MaxUint64/2)
+
+	baseHandle, err := hooks.GetManagedTypesContext().PutBigFloat(big.NewFloat(1.5))
+	require.NoError(t, err)
+	destHandle := int32(200)
+
+	hooks.BigFloatPow(destHandle, baseHandle, math.MaxInt32)
+
+	_, err = hooks.GetManagedTypesContext().GetBigFloat(destHandle)
+	require.Error(t, err, "a cancelled pow must not publish a result")
+	require.ErrorIs(t, vmHost.Runtime().GetAllErrors(), vmhost.ErrExecutionFailedWithTimeout)
+}
+
+func TestBigFloatPow_RunsToCompletionWithLiveExecutionContext(t *testing.T) {
+	vmHost, err := hostCore.NewVMHost(worldmock.NewMockWorld(), makeHostParameters())
+	require.NoError(t, err)
+
+	hooks := vmhooks.NewVMHooksImpl(&cancelledContextHost{VMHost: vmHost, ctx: context.Background()})
+	provideGas(hooks, 1_000_000)
+
+	baseHandle, err := hooks.GetManagedTypesContext().PutBigFloat(big.NewFloat(2.0))
+	require.NoError(t, err)
+	destHandle := int32(201)
+
+	hooks.BigFloatPow(destHandle, baseHandle, 200)
+
+	result, err := hooks.GetManagedTypesContext().GetBigFloat(destHandle)
+	require.NoError(t, err)
+	expected := new(big.Float).SetMantExp(big.NewFloat(1), 200)
+	require.Equal(t, 0, expected.Cmp(result))
 }

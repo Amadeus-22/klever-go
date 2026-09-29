@@ -423,8 +423,12 @@ func (host *vmHost) getEffectiveTimeout() time.Duration {
 }
 
 // setupExecutionContext initializes the timeout context and sets up cleanup.
-// Returns the context and a cleanup function that should be deferred.
-func (host *vmHost) setupExecutionContext() (context.Context, func()) {
+// Returns the timeout context, the function that cancels the hook context, and a
+// cleanup function that must be deferred. Cancelling the hooks and cleaning up are
+// separate on purpose: the timeout path cancels the hooks while the execution
+// goroutine still reads the hook context, so the context itself may only be
+// released by the cleanup, after that goroutine has been joined.
+func (host *vmHost) setupExecutionContext() (context.Context, context.CancelFunc, func()) {
 	host.setGasTracerEnabledIfLogIsTrace()
 	effectiveTimeout := host.getEffectiveTimeout()
 
@@ -436,9 +440,12 @@ func (host *vmHost) setupExecutionContext() (context.Context, func()) {
 	// Create main execution context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), effectiveTimeout)
 
-	// Hook context has no timeout - manually cancelled after FailExecution()
+	// Hook context has no timeout - manually cancelled after the interruption request.
 	// This ensures SetBreakpointValue() completes before hooks can panic and call CleanInstance()
 	ctxHook, cancelHook := context.WithCancel(context.Background())
+
+	// A request left over from a previous timed-out execution must not stop this one.
+	host.Runtime().ClearTimeoutInterruption()
 
 	// Set execution context on vmHost instance (not global) for timeout protection
 	// This ensures each RunSmartContractCreate invocation has its own isolated context
@@ -449,26 +456,44 @@ func (host *vmHost) setupExecutionContext() (context.Context, func()) {
 		cancelHook()
 		cancel()
 		host.executionContext = nil
+		host.Runtime().ClearTimeoutInterruption()
 	}
 
-	return ctx, cleanup
+	return ctx, cancelHook, cleanup
 }
 
 // handleTimeout processes timeout during contract execution.
-// It ensures SetBreakpointValue() completes before hooks can panic and call CleanInstance().
-// This sequential execution prevents race conditions.
+// It runs on the calling goroutine while the execution goroutine is still active,
+// so it only requests the interruption and cancels the hooks: it must not touch
+// the VM output or runtime errors, which the execution goroutine owns until done
+// is closed. The timeout result is published by finalizeTimeout after the join.
 func (host *vmHost) handleTimeout(cancelHook context.CancelFunc, done <-chan struct{}) error {
-	// Timeout detected. Set breakpoint first, then cancel hooks.
-	// Sequential execution ensures SetBreakpointValue() completes before
-	// any hook can panic and call CleanInstance(), preventing race condition.
-	host.Runtime().FailExecution(vmhost.ErrExecutionFailedWithTimeout)
+	// Set the breakpoint first, then cancel hooks. Sequential execution ensures
+	// SetBreakpointValue() completes before any hook can panic and call
+	// CleanInstance(), preventing a race with instance destruction.
+	host.Runtime().RequestTimeoutInterruption()
 
-	// Now safe to cancel hook context - FailExecution() has completed
+	// Now safe to cancel hook context - the interruption request has completed
 	cancelHook()
 
 	// Wait for execution to complete cleanup
 	<-done
 	return vmhost.ErrExecutionFailedWithTimeout
+}
+
+// finalizeTimeout publishes the result of a timed-out execution. It must only be
+// called after the execution goroutine has been joined. Whatever that goroutine
+// left behind is replaced: without this, the result depended on where the timeout
+// landed (no output, hence VMUserError, when a slow hook unwound through a panic;
+// VMExecutionFailed otherwise). Validators only accept a leader's timeout as
+// VMExecutionFailed (txResultValidation CASE 1a), so every timeout reports it.
+func (host *vmHost) finalizeTimeout() *vmcommon.VMOutput {
+	host.Runtime().AddError(vmhost.ErrExecutionFailedWithTimeout)
+
+	return &vmcommon.VMOutput{
+		ReturnCode:    vmcommon.VMExecutionFailed,
+		ReturnMessage: vmhost.ErrExecutionFailedWithTimeout.Error(),
+	}
 }
 
 // waitExecutionWithDeterministicCompletion waits for execution completion or timeout.
@@ -508,8 +533,8 @@ func (host *vmHost) RunSmartContractCreate(input *vmcommon.ContractCreateInput) 
 		return nil, vmhost.ErrVMIsClosing
 	}
 
-	ctx, cancel := host.setupExecutionContext()
-	defer cancel()
+	ctx, cancelHook, cleanup := host.setupExecutionContext()
+	defer cleanup()
 
 	log.Trace("RunSmartContractCreate begin",
 		"len(code)", len(input.ContractCode),
@@ -556,11 +581,24 @@ func (host *vmHost) RunSmartContractCreate(input *vmcommon.ContractCreateInput) 
 		host.logFromGasTracer("init")
 	}()
 
-	if timeoutErr := host.waitExecutionWithDeterministicCompletion(ctx, cancel, done); timeoutErr != nil {
+	if timeoutErr := host.waitExecutionWithDeterministicCompletion(ctx, cancelHook, done); timeoutErr != nil {
+		vmOutput = host.finalizeTimeout()
 		err = timeoutErr
 	}
 
 	return
+}
+
+// dispatchSmartContractCall routes a call to the upgrade, delete or plain call path.
+func (host *vmHost) dispatchSmartContractCall(input *vmcommon.ContractCallInput) *vmcommon.VMOutput {
+	switch input.Function {
+	case vmhost.UpgradeFunctionName:
+		return host.doRunSmartContractUpgrade(input)
+	case vmhost.DeleteFunctionName:
+		return host.doRunSmartContractDelete(input)
+	default:
+		return host.doRunSmartContractCall(input)
+	}
 }
 
 // RunSmartContractCall executes the call of an existing contract
@@ -577,8 +615,8 @@ func (host *vmHost) RunSmartContractCall(input *vmcommon.ContractCallInput) (vmO
 		return nil, vmhost.ErrVMIsClosing
 	}
 
-	ctx, cancel := host.setupExecutionContext()
-	defer cancel()
+	ctx, cancelHook, cleanup := host.setupExecutionContext()
+	defer cleanup()
 
 	log.Trace("RunSmartContractCall begin",
 		"function", input.Function,
@@ -614,14 +652,7 @@ func (host *vmHost) RunSmartContractCall(input *vmcommon.ContractCallInput) (vmO
 			close(done)
 		}()
 
-		switch input.Function {
-		case vmhost.UpgradeFunctionName:
-			vmOutput = host.doRunSmartContractUpgrade(input)
-		case vmhost.DeleteFunctionName:
-			vmOutput = host.doRunSmartContractDelete(input)
-		default:
-			vmOutput = host.doRunSmartContractCall(input)
-		}
+		vmOutput = host.dispatchSmartContractCall(input)
 
 		logsFromErrors := host.createLogEntryFromErrors(input.CallerAddr, input.RecipientAddr, input.Function)
 		if logsFromErrors != nil {
@@ -636,7 +667,8 @@ func (host *vmHost) RunSmartContractCall(input *vmcommon.ContractCallInput) (vmO
 		host.logFromGasTracer(input.Function)
 	}()
 
-	if timeoutErr := host.waitExecutionWithDeterministicCompletion(ctx, cancel, done); timeoutErr != nil {
+	if timeoutErr := host.waitExecutionWithDeterministicCompletion(ctx, cancelHook, done); timeoutErr != nil {
+		vmOutput = host.finalizeTimeout()
 		err = timeoutErr
 	}
 
