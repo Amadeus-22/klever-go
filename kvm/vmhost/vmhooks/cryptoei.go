@@ -18,6 +18,7 @@ const ed25519SignatureLength = 64
 const secp256k1CompressedPublicKeyLength = 33
 const secp256k1UncompressedPublicKeyLength = 65
 const secp256k1SignatureComponentMaxLength = 32
+const secp256k1PlainMessageLength = 32
 const curveNameLength = 4
 
 const (
@@ -589,6 +590,14 @@ func (context *VMHooksImpl) VerifyCustomSecp256k1(
 		return 1
 	}
 
+	plainMessage := isSecp256k1PlainMessage(hashType)
+	if plainMessage {
+		err = checkMemLength(context.GetVMHost(), messageLength, vmhost.ErrInvalidSecp256k1PlainMessageLength, secp256k1PlainMessageLength)
+		if context.WithFault(err, runtime.CryptoAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	}
+
 	key, err := loadMemBytes(context, keyOffset, keyLength, 0, 0)
 	if context.WithFault(err, runtime.CryptoAPIErrorShouldFailExecution()) {
 		return 1
@@ -596,6 +605,14 @@ func (context *VMHooksImpl) VerifyCustomSecp256k1(
 
 	message, err := memLoadDataCopy(context, messageOffset, messageLength)
 	if context.WithFault(err, runtime.CryptoAPIErrorShouldFailExecution()) {
+		return 1
+	}
+	// MemLoad truncates instead of failing when the range runs past the end of contract memory, so a
+	// plain message declared as 32 bytes can come back shorter, and the curve would zero-extend it: the
+	// short-message acceptance the length check above closes. From FixAuditChangesV6 that is an
+	// out-of-bounds fault, like the truncated signature header below
+	if plainMessage && context.GetVMHost().ForkController().FixAuditChangesV6() && len(message) != secp256k1PlainMessageLength {
+		_ = context.WithFault(vmhost.ErrBadBounds, runtime.CryptoAPIErrorShouldFailExecution())
 		return 1
 	}
 
@@ -667,6 +684,13 @@ func ManagedVerifyCustomSecp256k1WithHost(
 		return 1
 	}
 
+	if isSecp256k1PlainMessage(hashType) {
+		err = checkMBufferLength(host, messageHandle, vmhost.ErrInvalidSecp256k1PlainMessageLength, secp256k1PlainMessageLength)
+		if WithFaultAndHost(host, err, runtime.CryptoAPIErrorShouldFailExecution()) {
+			return 1
+		}
+	}
+
 	keyBytes, err := mBufferLoadDataCopy(host, keyHandle)
 	if WithFaultAndHost(host, err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
@@ -689,6 +713,18 @@ func ManagedVerifyCustomSecp256k1WithHost(
 	}
 
 	return 0
+}
+
+// isSecp256k1PlainMessage reports whether hashType selects plain-message mode, where the message goes to
+// the curve unhashed and the curve reads it as a 32-byte scalar: bytes past 32 are dropped and a shorter
+// message is zero-extended, so a signature over one digest would also pass for that digest with anything
+// appended. The verify hooks then hold the message to exactly 32 bytes from FixAuditChangesV6, before
+// anything is copied, with checkMemLength / checkMBufferLength. hashType is compared after the same uint8
+// narrowing VerifySecp256k1 applies, so a value like 256 narrows to ECDSAPlainMsg and is held to the same
+// 32-byte rule instead of slipping past it
+func isSecp256k1PlainMessage(hashType int32) bool {
+	// #nosec G115
+	return secp256k1.MessageHashType(uint8(hashType)) == secp256k1.ECDSAPlainMsg
 }
 
 // VerifySecp256k1 VMHooks implementation.
