@@ -20,40 +20,41 @@ import (
 
 // Facade is the mock implementation of a node router handler
 type Facade struct {
-	ShouldErrorStart               bool
-	ShouldErrorStop                bool
-	TpsBenchmarkHandler            func() *statistics.TpsBenchmark
-	GetHeartbeatsHandler           func() ([]data.PubKeyHeartbeat, error)
-	GetAccountHandler              func(address string) (state.UserAccountHandler, error)
-	GetAssetHandler                func(address string) (*kapps.KDAData, error)
-	GetNFTHandler                  func(owner string, address string) (*kapps.UserKDA, *kapps.KDAData, error)
-	GetKDAFeePoolHandler           func(address string) (*kdafeespool.KDAFeesPoolData, error)
-	BalanceHandler                 func(string, string) (*models.BalanceResponse, error)
-	GetUserKDAHandler              func(string, string) (*kapps.UserKDA, error)
-	RewardsAvailableToClaimHandler func(address string, assetId string) (*models.AvailableClaimResponse, error)
-	GetEconomicsHandler            func() (*models.EconomicsResponse, error)
-	GetAccountTotalsHandler        func() (*models.AccountTotalsResponse, error)
-	StatusMetricsHandler           func() core.StatusMetricsHandler
-	GetNodeOverviewHandler         func() (models.NodeOverview, error)
-	ValidatorStatisticsHandler     func() (map[string]*state.ValidatorApiResponse, error)
-	GetPeerInfoCalled              func(pid string) ([]core.QueryP2PPeerInfo, error)
-	GetThrottlerForEndpointCalled  func(endpoint string) (core.Throttler, bool)
-	NodeConfigCalled               func() map[string]interface{}
-	GetQueryHandlerCalled          func(name string) (debug.QueryHandler, error)
-	SetRedundancyCalled            func(level int64) error
-	GetRedundancyCalled            func() int64
-	GetValueForKeyCalled           func(address string, key string) (string, error)
-	GetBlockByHashCalled           func(hash string, withTxs bool) (*api.Block, error)
-	GetBlockByNonceCalled          func(nonce uint64, withTxs bool) (*api.Block, error)
-	GetTotalStakedValueHandler     func() (int64, error)
-	GetTransactionHandler          func(hash string, withResults bool) (*api.Transaction, error)
-	CreateTransactionHandler       func(txType uint32, base *transaction.TXBaseInfo, contracts []json.RawMessage, skipValidate bool) (*transaction.Transaction, []byte, error)
-	SendTransactionHandler         func(tx *transaction.Transaction) (string, error)
-	DecodeTransactionHandler       func(tx *transaction.Transaction) (*indexerData.Transaction, error)
-	SendBulkTransactionsHandler    func(txs []*transaction.Transaction) ([]string, error)
-	GetNextNonceHandler            func(address string) (*models.AccountNonceResponse, error)
-	EstimateTransactionGasHandler  func(tx *transaction.Transaction) (*transaction.CostResponse, error)
-	EstimateTransactionFeesHandler func(tx *transaction.Transaction) (*transaction.FeesResponse, error)
+	ShouldErrorStart                   bool
+	ShouldErrorStop                    bool
+	TpsBenchmarkHandler                func() *statistics.TpsBenchmark
+	GetHeartbeatsHandler               func() ([]data.PubKeyHeartbeat, error)
+	GetAccountHandler                  func(address string) (state.UserAccountHandler, error)
+	GetAssetHandler                    func(address string) (*kapps.KDAData, error)
+	GetNFTHandler                      func(owner string, address string) (*kapps.UserKDA, *kapps.KDAData, error)
+	GetKDAFeePoolHandler               func(address string) (*kdafeespool.KDAFeesPoolData, error)
+	BalanceHandler                     func(string, string) (*models.BalanceResponse, error)
+	GetUserKDAHandler                  func(string, string) (*kapps.UserKDA, error)
+	RewardsAvailableToClaimHandler     func(address string, assetId string) (*models.AvailableClaimResponse, error)
+	RewardsAvailableToClaimListHandler func(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error)
+	GetEconomicsHandler                func() (*models.EconomicsResponse, error)
+	GetAccountTotalsHandler            func() (*models.AccountTotalsResponse, error)
+	StatusMetricsHandler               func() core.StatusMetricsHandler
+	GetNodeOverviewHandler             func() (models.NodeOverview, error)
+	ValidatorStatisticsHandler         func() (map[string]*state.ValidatorApiResponse, error)
+	GetPeerInfoCalled                  func(pid string) ([]core.QueryP2PPeerInfo, error)
+	GetThrottlerForEndpointCalled      func(endpoint string) (core.Throttler, bool)
+	NodeConfigCalled                   func() map[string]interface{}
+	GetQueryHandlerCalled              func(name string) (debug.QueryHandler, error)
+	SetRedundancyCalled                func(level int64) error
+	GetRedundancyCalled                func() int64
+	GetValueForKeyCalled               func(address string, key string) (string, error)
+	GetBlockByHashCalled               func(hash string, withTxs bool) (*api.Block, error)
+	GetBlockByNonceCalled              func(nonce uint64, withTxs bool) (*api.Block, error)
+	GetTotalStakedValueHandler         func() (int64, error)
+	GetTransactionHandler              func(hash string, withResults bool) (*api.Transaction, error)
+	CreateTransactionHandler           func(txType uint32, base *transaction.TXBaseInfo, contracts []json.RawMessage, skipValidate bool) (*transaction.Transaction, []byte, error)
+	SendTransactionHandler             func(tx *transaction.Transaction) (string, error)
+	DecodeTransactionHandler           func(tx *transaction.Transaction) (*indexerData.Transaction, error)
+	SendBulkTransactionsHandler        func(txs []*transaction.Transaction) ([]string, error)
+	GetNextNonceHandler                func(address string) (*models.AccountNonceResponse, error)
+	EstimateTransactionGasHandler      func(tx *transaction.Transaction) (*transaction.CostResponse, error)
+	EstimateTransactionFeesHandler     func(tx *transaction.Transaction) (*transaction.FeesResponse, error)
 }
 
 // GetThrottlerForEndpoint -
@@ -175,6 +176,11 @@ func (f *Facade) GetAccount(address string) (state.UserAccountHandler, error) {
 // GetAvailableClaim is the mock implementation of a handler's GetAvailableClaim method
 func (f *Facade) GetAvailableClaim(address string, assetId string) (*models.AvailableClaimResponse, error) {
 	return f.RewardsAvailableToClaimHandler(address, assetId)
+}
+
+// GetAvailableClaimList is the mock implementation of a handler's GetAvailableClaimList method
+func (f *Facade) GetAvailableClaimList(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+	return f.RewardsAvailableToClaimListHandler(address, assetIds)
 }
 
 // GetBalance is the mock implementation of a handler's GetBalance method

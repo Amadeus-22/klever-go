@@ -50,9 +50,6 @@ var ErrEmptyAssetId = errors.New("assetId is empty")
 // ErrTooManyAssets signals that more assets were requested than the endpoint allows
 var ErrTooManyAssets = errors.New("too many assets requested")
 
-// ErrClaimLookupFailed signals that an asset reward lookup terminated unexpectedly
-var ErrClaimLookupFailed = errors.New("asset reward lookup failed")
-
 // ErrValidation signals an error in validation
 var ErrValidation = errors.New("validation error")
 

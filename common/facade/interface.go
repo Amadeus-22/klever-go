@@ -73,6 +73,9 @@ type NodeHandler interface {
 	// GetAvailableClaim returns the rewards available for a specific asset in an account
 	GetAvailableClaim(address string, assetId string) (int64, map[string]int64, int64, error)
 
+	// GetAvailableClaimList returns the rewards available for each of the given assets in an account
+	GetAvailableClaimList(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error)
+
 	// GetAsset returns an assetResponse containing information
 	//  about the asset correlated with provided assetID
 	GetAsset(assetID string) (*kapps.KDAData, error)

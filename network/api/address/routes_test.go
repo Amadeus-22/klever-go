@@ -9,7 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -18,14 +17,12 @@ import (
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/kapps"
 	"github.com/klever-io/klever-go/network/api/address"
-	apiErrors "github.com/klever-io/klever-go/network/api/errors"
 	"github.com/klever-io/klever-go/network/api/middleware"
 	"github.com/klever-io/klever-go/network/api/mock"
 	"github.com/klever-io/klever-go/network/api/models"
 	"github.com/klever-io/klever-go/network/api/shared"
 	"github.com/klever-io/klever-go/network/api/wrapper"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 const validAddress = "klv17e8zzgn73h6ehe3c6q9vlt77kuxk5euddmhymy5uhv2rhv0dc0nqlfp0ap"
@@ -525,7 +522,7 @@ func TestGetAvailableClaimList(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			facade := mock.Facade{}
 			if tc.mockHandler != nil {
-				facade.RewardsAvailableToClaimHandler = tc.mockHandler
+				facade.RewardsAvailableToClaimListHandler = perAssetClaimList(tc.mockHandler)
 			}
 
 			ws := startNodeServer(&facade)
@@ -560,7 +557,7 @@ func TestGetAvailableClaimListDeduplicatesRequestedAssets(t *testing.T) {
 	callsPerAsset := make(map[string]int)
 
 	facade := mock.Facade{
-		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+		RewardsAvailableToClaimListHandler: perAssetClaimList(func(address, assetId string) (*models.AvailableClaimResponse, error) {
 			lock.Lock()
 			callsPerAsset[assetId]++
 			lock.Unlock()
@@ -570,7 +567,7 @@ func TestGetAvailableClaimListDeduplicatesRequestedAssets(t *testing.T) {
 				AllStakingRewards: map[string]int64{assetId: 200},
 				Allowance:         300,
 			}, nil
-		},
+		}),
 	}
 
 	ws := startNodeServer(&facade)
@@ -631,7 +628,7 @@ func TestGetAvailableClaimListRejectsExcessiveAssetCount(t *testing.T) {
 			var calls atomic.Int64
 
 			facade := mock.Facade{
-				RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+				RewardsAvailableToClaimListHandler: perAssetClaimList(func(address, assetId string) (*models.AvailableClaimResponse, error) {
 					calls.Add(1)
 
 					return &models.AvailableClaimResponse{
@@ -639,7 +636,7 @@ func TestGetAvailableClaimListRejectsExcessiveAssetCount(t *testing.T) {
 						AllStakingRewards: map[string]int64{assetId: 200},
 						Allowance:         300,
 					}, nil
-				},
+				}),
 			}
 
 			ws := startNodeServer(&facade)
@@ -683,13 +680,13 @@ func TestGetAvailableClaimListReturnsAllRequestedAssets(t *testing.T) {
 	}
 
 	facade := mock.Facade{
-		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+		RewardsAvailableToClaimListHandler: perAssetClaimList(func(address, assetId string) (*models.AvailableClaimResponse, error) {
 			return &models.AvailableClaimResponse{
 				StakingRewards:    rewardsPerAsset[assetId],
 				AllStakingRewards: map[string]int64{assetId: 200},
 				Allowance:         300,
 			}, nil
-		},
+		}),
 	}
 
 	ws := startNodeServer(&facade)
@@ -726,32 +723,22 @@ func TestGetAvailableClaimListReturnsAllRequestedAssets(t *testing.T) {
 	}
 }
 
-func TestGetAvailableClaimListBoundsConcurrentLookups(t *testing.T) {
+func TestGetAvailableClaimListMakesSingleFacadeCall(t *testing.T) {
 	t.Parallel()
 
-	const expectedMaxConcurrentLookups = int64(address.MaxConcurrentClaimLookups)
-
-	var inFlight atomic.Int64
-	var peakInFlight atomic.Int64
+	var calls atomic.Int64
+	var receivedAssets []string
 
 	facade := mock.Facade{
-		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
-			current := inFlight.Add(1)
-			for {
-				peak := peakInFlight.Load()
-				if current <= peak || peakInFlight.CompareAndSwap(peak, current) {
-					break
-				}
+		RewardsAvailableToClaimListHandler: func(addr string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+			calls.Add(1)
+			receivedAssets = assetIds
+
+			claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+			for _, assetId := range assetIds {
+				claims[assetId] = &models.AvailableClaimResponse{StakingRewards: 100}
 			}
-
-			time.Sleep(2 * time.Millisecond)
-			inFlight.Add(-1)
-
-			return &models.AvailableClaimResponse{
-				StakingRewards:    100,
-				AllStakingRewards: map[string]int64{assetId: 200},
-				Allowance:         300,
-			}, nil
+			return claims, nil, nil
 		},
 	}
 
@@ -769,62 +756,21 @@ func TestGetAvailableClaimListBoundsConcurrentLookups(t *testing.T) {
 	ws.ServeHTTP(resp, req)
 
 	assert.Equal(t, http.StatusOK, resp.Code)
-
-	var response shared.GenericAPIResponse
-	err := json.Unmarshal(resp.Body.Bytes(), &response)
-	assert.NoError(t, err)
-	assert.Empty(t, response.Error)
-	assert.Len(t, extractClaimListAssets(t, response), len(requestedAssets))
-
-	assert.Zero(t, inFlight.Load())
-	assert.LessOrEqual(t, peakInFlight.Load(), expectedMaxConcurrentLookups)
-	assert.Greater(t, peakInFlight.Load(), int64(1))
+	assert.Equal(t, int64(1), calls.Load())
+	assert.Equal(t, requestedAssets, receivedAssets)
 }
 
-func TestGetAvailableClaimListReleasesSlotsOnLookupError(t *testing.T) {
+func TestGetAvailableClaimListReportsRequestErrorPerAsset(t *testing.T) {
 	t.Parallel()
 
-	const expectedMaxConcurrentLookups = int64(address.MaxConcurrentClaimLookups)
-
-	var calls atomic.Int64
-	var inFlight atomic.Int64
-	var peakInFlight atomic.Int64
-
 	facade := mock.Facade{
-		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
-			current := inFlight.Add(1)
-			for {
-				peak := peakInFlight.Load()
-				if current <= peak || peakInFlight.CompareAndSwap(peak, current) {
-					break
-				}
-			}
-
-			time.Sleep(time.Millisecond)
-			inFlight.Add(-1)
-
-			// Fail most lookups: if a failing lookup did not release its semaphore slot,
-			// the dispatch loop would block once the bound is exhausted and never return.
-			if calls.Add(1)%3 != 0 {
-				return nil, fmt.Errorf("lookup failed for %s", assetId)
-			}
-
-			return &models.AvailableClaimResponse{
-				StakingRewards:    100,
-				AllStakingRewards: map[string]int64{assetId: 200},
-				Allowance:         300,
-			}, nil
+		RewardsAvailableToClaimListHandler: func(string, []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+			return nil, nil, fmt.Errorf("account not found")
 		},
 	}
 
-	requestedAssets := buildRequestedAssets(address.MaxAssetsPerClaimList)
-
 	ws := startNodeServer(&facade)
-	url := fmt.Sprintf(
-		"/address/%s/allowance/list?asset=%s",
-		validAddress,
-		strings.Join(requestedAssets, ","),
-	)
+	url := fmt.Sprintf("/address/%s/allowance/list?asset=KLV,BTC", validAddress)
 
 	req, _ := http.NewRequest("GET", url, nil)
 	resp := httptest.NewRecorder()
@@ -835,56 +781,33 @@ func TestGetAvailableClaimListReleasesSlotsOnLookupError(t *testing.T) {
 	var response shared.GenericAPIResponse
 	err := json.Unmarshal(resp.Body.Bytes(), &response)
 	assert.NoError(t, err)
-	assert.NotEmpty(t, response.Error)
-
-	// Every asset was dispatched, so no slot was leaked by a failing lookup.
-	assert.Equal(t, int64(len(requestedAssets)), calls.Load())
-	assert.Zero(t, inFlight.Load())
-	assert.LessOrEqual(t, peakInFlight.Load(), expectedMaxConcurrentLookups)
+	assert.Equal(
+		t,
+		"could not get rewards for requested account asset list: map[BTC:account not found KLV:account not found]",
+		response.Error,
+	)
+	assert.Nil(t, response.Data)
 }
 
-func TestGetAvailableClaimListRecoversFromLookupPanic(t *testing.T) {
-	t.Parallel()
-
-	var calls atomic.Int64
-
-	facade := mock.Facade{
-		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
-			// Panic on a subset; gin.Recovery cannot reach these goroutines, so an
-			// unrecovered panic here would take the whole process down.
-			if calls.Add(1)%2 == 0 {
-				panic("simulated lookup panic for " + assetId)
+// perAssetClaimList adapts a per-asset claim mock into the list facade call, collecting
+// per-asset errors the way the node does.
+func perAssetClaimList(
+	handler func(address, assetId string) (*models.AvailableClaimResponse, error),
+) func(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+	return func(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+		claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+		claimErrors := make(map[string]error)
+		for _, assetId := range assetIds {
+			claim, err := handler(address, assetId)
+			if err != nil {
+				claimErrors[assetId] = err
+				continue
 			}
+			claims[assetId] = claim
+		}
 
-			return &models.AvailableClaimResponse{
-				StakingRewards:    100,
-				AllStakingRewards: map[string]int64{assetId: 200},
-				Allowance:         300,
-			}, nil
-		},
+		return claims, claimErrors, nil
 	}
-
-	requestedAssets := buildRequestedAssets(20)
-
-	ws := startNodeServer(&facade)
-	url := fmt.Sprintf(
-		"/address/%s/allowance/list?asset=%s",
-		validAddress,
-		strings.Join(requestedAssets, ","),
-	)
-
-	req, _ := http.NewRequest("GET", url, nil)
-	resp := httptest.NewRecorder()
-
-	require.NotPanics(t, func() { ws.ServeHTTP(resp, req) })
-
-	assert.Equal(t, http.StatusBadRequest, resp.Code)
-	assert.Equal(t, int64(len(requestedAssets)), calls.Load())
-
-	var response shared.GenericAPIResponse
-	err := json.Unmarshal(resp.Body.Bytes(), &response)
-	assert.NoError(t, err)
-	assert.Contains(t, fmt.Sprint(response.Error), apiErrors.ErrClaimLookupFailed.Error())
 }
 
 func buildRequestedAssets(count int) []string {

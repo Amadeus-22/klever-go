@@ -75,6 +75,9 @@ func (n *NodeHandlerStub) GetUserKDA(string, string) (*kapps.UserKDA, error) {
 func (n *NodeHandlerStub) GetAvailableClaim(string, string) (int64, map[string]int64, int64, error) {
 	return 0, nil, 0, nil
 }
+func (n *NodeHandlerStub) GetAvailableClaimList(string, []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+	return nil, nil, nil
+}
 func (n *NodeHandlerStub) GetAsset(string) (*kapps.KDAData, error) { return nil, nil }
 func (n *NodeHandlerStub) GetEconomics() (*models.EconomicsResponse, error) {
 	if n.GetEconomicsCalled != nil {

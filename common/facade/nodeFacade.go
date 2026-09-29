@@ -566,6 +566,11 @@ func (nf *nodeFacade) GetAvailableClaim(address string, assetId string) (*models
 	}, nil
 }
 
+// GetAvailableClaimList returns the rewards available for each of the given assets in an account
+func (nf *nodeFacade) GetAvailableClaimList(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+	return nf.node.GetAvailableClaimList(address, assetIds)
+}
+
 // GetAsset returns an assetResponse containing information
 // about the asset correlated with provided address
 func (nf *nodeFacade) GetAsset(assetID string) (*kapps.KDAData, error) {

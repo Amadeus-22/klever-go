@@ -7,8 +7,10 @@ import (
 	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/process/kda/kdautils"
+	"github.com/klever-io/klever-go/data"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/kapps"
+	"github.com/klever-io/klever-go/network/api/models"
 	"github.com/klever-io/klever-go/tools/check"
 )
 
@@ -120,16 +122,16 @@ func (n *Node) GetUserKDA(address string, assetId string) (*kapps.UserKDA, error
 
 // loadStakingData loads and unmarshals staking data for a given asset.
 func (n *Node) loadStakingData(assetId string) (*kapps.StakingData, error) {
-	stakingAcnt, err := n.kapps.LoadAccount(kapps.StakingKAppAddress)
+	stakingKapp, err := n.loadKAppAccount(kapps.StakingKAppAddress)
 	if err != nil {
 		return nil, err
 	}
 
-	stakingKapp, ok := stakingAcnt.(state.KAppAccountHandler)
-	if !ok {
-		return nil, common.ErrWrongTypeAssertion
-	}
+	return n.readStakingData(stakingKapp, assetId)
+}
 
+// readStakingData unmarshals staking data for a given asset from an already loaded staking kapp.
+func (n *Node) readStakingData(stakingKapp state.KAppAccountHandler, assetId string) (*kapps.StakingData, error) {
 	key := kdautils.ToKDAKey([]byte(assetId), nil)
 	stakedBytes, err := stakingKapp.DataTrieTracker().RetrieveValue(key)
 	if err != nil {
@@ -147,18 +149,8 @@ func (n *Node) loadStakingData(assetId string) (*kapps.StakingData, error) {
 	return kdaStaking, nil
 }
 
-// loadKDAData loads and unmarshals KDA data for a given asset.
-func (n *Node) loadKDAData(assetId string) (*kapps.KDAData, error) {
-	kdaAcnt, err := n.kapps.LoadAccount(kapps.KDAKAppAddress)
-	if err != nil {
-		return nil, err
-	}
-
-	kdaKapp, ok := kdaAcnt.(state.KAppAccountHandler)
-	if !ok {
-		return nil, common.ErrWrongTypeAssertion
-	}
-
+// readKDAData unmarshals KDA data for a given asset from an already loaded KDA kapp.
+func (n *Node) readKDAData(kdaKapp state.KAppAccountHandler, assetId string) (*kapps.KDAData, error) {
 	key := kdautils.ToKDAKey([]byte(assetId), nil)
 	kdaBytes, err := kdaKapp.DataTrieTracker().RetrieveValue(key)
 	if err != nil {
@@ -206,47 +198,82 @@ func computeRewardsForAsset(rewards map[string]int64, assetId string) int64 {
 	return rewards[assetId]
 }
 
-func (n *Node) GetAvailableClaim(address string, assetId string) (int64, map[string]int64, int64, error) {
+// availableClaimState holds the request-invariant state an available-claim lookup reads.
+// Loading it once per request keeps a multi-asset lookup at a constant number of
+// accounts-adapter lock acquisitions instead of three per asset.
+type availableClaimState struct {
+	userAccount state.UserAccountHandler
+	stakingKapp state.KAppAccountHandler
+	kdaKapp     state.KAppAccountHandler
+}
+
+// loadAvailableClaimState loads the user account and the staking and KDA kapps. A nil state
+// with a nil error means the address does not hold a user account.
+func (n *Node) loadAvailableClaimState(address string) (*availableClaimState, error) {
 	account, err := n.getAccountHandler(address)
 	if err != nil {
-		return 0, nil, 0, err
+		return nil, err
 	}
 
 	userAccount, ok := n.castAccountToUserAccount(account)
 	if !ok {
-		return 0, nil, 0, nil
+		return nil, nil
 	}
 
-	kdaStaking, err := n.loadStakingData(assetId)
+	stakingKapp, err := n.loadKAppAccount(kapps.StakingKAppAddress)
 	if err != nil {
-		return 0, nil, 0, err
+		return nil, err
 	}
 
-	_, err = n.loadKDAData(assetId)
+	kdaKapp, err := n.loadKAppAccount(kapps.KDAKAppAddress)
 	if err != nil {
-		return 0, nil, 0, err
+		return nil, err
 	}
 
+	return &availableClaimState{
+		userAccount: userAccount,
+		stakingKapp: stakingKapp,
+		kdaKapp:     kdaKapp,
+	}, nil
+}
+
+// computeAvailableClaim computes the available claim for one asset from the preloaded state.
+func (n *Node) computeAvailableClaim(claimState *availableClaimState, assetId string) (*models.AvailableClaimResponse, error) {
+	kdaStaking, err := n.readStakingData(claimState.stakingKapp, assetId)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = n.readKDAData(claimState.kdaKapp, assetId)
+	if err != nil {
+		return nil, err
+	}
+
+	userAccount := claimState.userAccount
 	userKDA, err := userAccount.GetUserKDA([]byte(assetId), nil, n.forkController.EnableSmartContracts())
 	if err != nil {
-		return 0, nil, 0, err
+		return nil, err
 	}
 
-	currentBlockHeader := n.blkc.GetCurrentBlockHeader()
-	if check.IfNil(currentBlockHeader) {
-		return 0, nil, 0, common.ErrNilHeader
+	// Read the header per asset, after the asset's data, so it is as recent as possible.
+	header := n.blkc.GetCurrentBlockHeader()
+	if check.IfNil(header) {
+		return nil, common.ErrNilHeader
 	}
 
-	rewards, err := userAccount.ComputeAvailableClaim(
-		[]byte(assetId),
-		currentBlockHeader.GetEpoch(),
-		currentBlockHeader.GetTimestamp(),
-		userKDA,
-		kdaStaking,
-		n.forkController,
-	)
-	if err != nil && !errors.Is(err, state.ErrClaimNotAvailable) {
-		return 0, nil, 0, err
+	var rewards map[string]int64
+	if !isClaimInFlight(userKDA, header) {
+		rewards, err = userAccount.ComputeAvailableClaim(
+			[]byte(assetId),
+			header.GetEpoch(),
+			header.GetTimestamp(),
+			userKDA,
+			kdaStaking,
+			n.forkController,
+		)
+		if err != nil && !errors.Is(err, state.ErrClaimNotAvailable) {
+			return nil, err
+		}
 	}
 
 	allowance := int64(0)
@@ -254,9 +281,74 @@ func (n *Node) GetAvailableClaim(address string, assetId string) (int64, map[str
 		allowance = n.getKLVAllowanceWithPending(userAccount)
 	}
 
-	computedRewards := computeRewardsForAsset(rewards, assetId)
+	return &models.AvailableClaimResponse{
+		StakingRewards:    computeRewardsForAsset(rewards, assetId),
+		AllStakingRewards: rewards,
+		Allowance:         allowance,
+	}, nil
+}
 
-	return computedRewards, rewards, allowance, nil
+// isClaimInFlight reports whether the user's last claim is newer than the current header. The
+// data tries are shared with block processing, which writes a block's state before it publishes
+// that block's header (at the end of CommitBlock), so a claim in the block being executed can be
+// visible while the header is still the previous block's. Nothing is claimable then, and the claim
+// maths would run backwards (negative APR rewards), so the preview reports zero instead.
+func isClaimInFlight(userKDA *kapps.UserKDA, header data.HeaderHandler) bool {
+	lastClaim := userKDA.GetLastClaim()
+	if lastClaim == nil {
+		return false
+	}
+
+	return lastClaim.GetTimestamp() > header.GetTimestamp() || lastClaim.GetEpoch() > header.GetEpoch()
+}
+
+// GetAvailableClaim returns the rewards available for a specific asset in an account
+func (n *Node) GetAvailableClaim(address string, assetId string) (int64, map[string]int64, int64, error) {
+	claimState, err := n.loadAvailableClaimState(address)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	if claimState == nil {
+		return 0, nil, 0, nil
+	}
+
+	claim, err := n.computeAvailableClaim(claimState, assetId)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+
+	return claim.StakingRewards, claim.AllStakingRewards, claim.Allowance, nil
+}
+
+// GetAvailableClaimList returns the rewards available for each of the given assets in an account.
+// The account and kapp state is loaded once and shared by every asset, and the assets are
+// computed sequentially so the shared account handlers are never read from more than one goroutine.
+// A request-level failure is returned as err; per-asset failures are returned keyed by asset.
+func (n *Node) GetAvailableClaimList(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+	claimState, err := n.loadAvailableClaimState(address)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+	claimErrors := make(map[string]error)
+	if claimState == nil {
+		for _, assetId := range assetIds {
+			claims[assetId] = &models.AvailableClaimResponse{}
+		}
+		return claims, claimErrors, nil
+	}
+
+	for _, assetId := range assetIds {
+		claim, errClaim := n.computeAvailableClaim(claimState, assetId)
+		if errClaim != nil {
+			claimErrors[assetId] = errClaim
+			continue
+		}
+		claims[assetId] = claim
+	}
+
+	return claims, claimErrors, nil
 }
 
 func (n *Node) castAccountToUserAccount(ah state.AccountHandler) (state.UserAccountHandler, bool) {
