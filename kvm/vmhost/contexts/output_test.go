@@ -4,6 +4,8 @@ import (
 	"math/big"
 	"testing"
 
+	commonMock "github.com/klever-io/klever-go/common/mock"
+	"github.com/klever-io/klever-go/core"
 	contextmock "github.com/klever-io/klever-go/kvm/mock/context"
 	worldmock "github.com/klever-io/klever-go/kvm/mock/world"
 	"github.com/klever-io/klever-go/kvm/vmhost"
@@ -691,4 +693,96 @@ func TestOutputContext_PendingCodeUpdateFromNestedCallKeptOnDiscard(t *testing.T
 	require.True(t, outputContext.HasPendingCodeUpdate(address))
 	require.Equal(t, []byte("code"), outputContext.GetOutputAccounts()[string(address)].Code)
 	require.Equal(t, 0, len(outputContext.codeUpdatesStack))
+}
+
+func newOutputContextWithFixAuditChangesV6(fixAuditChangesV6 bool) *outputContext {
+	forkController := commonMock.NewForkControllerStub()
+	forkController.FixAuditChangesV6Value = fixAuditChangesV6
+
+	host := &contextmock.VMHostStub{}
+	host.RuntimeCalled = func() vmhost.RuntimeContext {
+		return &contextmock.RuntimeContextMock{VMInput: &vmcommon.ContractCallInput{}}
+	}
+	host.ForkControllerCalled = func() core.ForkController {
+		return forkController
+	}
+	outputContext, _ := NewOutputContext(host)
+
+	return outputContext
+}
+
+func runSuccessfulNestedCalls(outputContext *outputContext, numCalls int) {
+	for i := 0; i < numCalls; i++ {
+		outputContext.PushState()
+		outputContext.CensorVMOutput()
+		outputContext.PopMergeActiveState()
+	}
+}
+
+func TestOutputContext_DeletedAccountsStayLinearAcrossNestedCalls(t *testing.T) {
+	t.Parallel()
+
+	outputContext := newOutputContextWithFixAuditChangesV6(true)
+	deletedAddress := []byte("deleted-address")
+
+	outputContext.PushState()
+	outputContext.CensorVMOutput()
+	outputContext.outputState.DeletedAccounts = append(outputContext.outputState.DeletedAccounts, deletedAddress)
+	outputContext.PopMergeActiveState()
+
+	runSuccessfulNestedCalls(outputContext, 20)
+
+	require.Equal(t, [][]byte{deletedAddress}, outputContext.outputState.DeletedAccounts)
+}
+
+func TestOutputContext_CensorVMOutputHidesParentDeletedAccounts(t *testing.T) {
+	t.Parallel()
+
+	outputContext := newOutputContextWithFixAuditChangesV6(true)
+	parentDeleted := []byte("parent-deleted")
+	childDeleted := []byte("child-deleted")
+	outputContext.outputState.DeletedAccounts = [][]byte{parentDeleted}
+
+	outputContext.PushState()
+	outputContext.CensorVMOutput()
+	require.Empty(t, outputContext.outputState.DeletedAccounts)
+
+	outputContext.outputState.DeletedAccounts = append(outputContext.outputState.DeletedAccounts, childDeleted)
+	outputContext.PopMergeActiveState()
+
+	require.Equal(t, [][]byte{parentDeleted, childDeleted}, outputContext.outputState.DeletedAccounts)
+}
+
+func TestOutputContext_FailedNestedCallKeepsParentDeletedAccounts(t *testing.T) {
+	t.Parallel()
+
+	outputContext := newOutputContextWithFixAuditChangesV6(true)
+	parentDeleted := []byte("parent-deleted")
+	outputContext.outputState.DeletedAccounts = [][]byte{parentDeleted}
+
+	outputContext.PushState()
+	outputContext.CensorVMOutput()
+	outputContext.outputState.DeletedAccounts = append(outputContext.outputState.DeletedAccounts, []byte("child-deleted"))
+	outputContext.PopSetActiveState()
+
+	require.Equal(t, [][]byte{parentDeleted}, outputContext.outputState.DeletedAccounts)
+}
+
+func TestOutputContext_DeletedAccountsInheritedBeforeFixAuditChangesV6(t *testing.T) {
+	t.Parallel()
+
+	outputContext := newOutputContextWithFixAuditChangesV6(false)
+	deletedAddress := []byte("deleted-address")
+
+	outputContext.PushState()
+	outputContext.CensorVMOutput()
+	outputContext.outputState.DeletedAccounts = append(outputContext.outputState.DeletedAccounts, deletedAddress)
+	outputContext.PopMergeActiveState()
+
+	runSuccessfulNestedCalls(outputContext, 3)
+
+	require.Len(t, outputContext.outputState.DeletedAccounts, 8)
+	for _, address := range outputContext.outputState.DeletedAccounts {
+		require.Equal(t, deletedAddress, address)
+	}
 }

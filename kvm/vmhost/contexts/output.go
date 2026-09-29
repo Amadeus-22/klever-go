@@ -165,12 +165,20 @@ func (context *outputContext) popCodeUpdatesState() map[string]struct{} {
 // nothing was executed before. Required for ExecuteOnDestContext().
 // StorageUpdates are not deleted from context.outputState.OutputAccounts,
 // preserving the storage cache.
+// From FixAuditChangesV6, DeletedAccounts is cleared too, so the nested call
+// carries only its own deletions. The parent's list survives on the state
+// stack: PopMergeActiveState merges it back and PopSetActiveState restores it.
+// Before the fork the child inherits the list, so pre-activation blocks replay
+// unchanged.
 func (context *outputContext) CensorVMOutput() {
 	context.outputState.ReturnData = make([][]byte, 0)
 	context.outputState.ReturnCode = vmcommon.Ok
 	context.outputState.ReturnMessage = ""
 	context.outputState.GasRemaining = 0
 	context.outputState.Logs = make([]*vmcommon.LogEntry, 0)
+	if context.host.ForkController().FixAuditChangesV6() {
+		context.outputState.DeletedAccounts = make([][]byte, 0)
+	}
 
 	for _, account := range context.outputState.OutputAccounts {
 		account.OutputTransfers = append(

@@ -1153,6 +1153,161 @@ func Test_ManagedDeleteContract(t *testing.T) {
 	assert.Nil(t, err)
 }
 
+var (
+	parentDeleteTarget       = test.MakeTestSCAddressWithDefaultVM("parentTarget")
+	childDeleteTarget        = test.MakeTestSCAddressWithDefaultVM("childTarget")
+	failingChildDeleteTarget = test.MakeTestSCAddressWithDefaultVM("failingTarget")
+)
+
+func deleteContractWithHost(host vmhost.VMHost, target []byte) {
+	managedTypes := host.ManagedTypes()
+	argumentsHandle := managedTypes.NewManagedBuffer()
+	managedTypes.WriteManagedVecOfManagedBuffers(nil, argumentsHandle)
+	destHandle := managedTypes.NewManagedBufferFromBytes(target)
+
+	vmhooks.ManagedDeleteContractWithHost(host, destHandle, 100000, argumentsHandle)
+}
+
+func callChildOnDestContext(host vmhost.VMHost, function string) int32 {
+	return vmhooks.ExecuteOnDestContextWithTypedArgs(host, 100000, big.NewInt(0), []byte(function), test.ChildAddress, [][]byte{})
+}
+
+func callChildOnDestContextTimes(t *testing.T, host vmhost.VMHost, function string, numCalls int) {
+	for i := 0; i < numCalls; i++ {
+		require.Equal(t, int32(0), callChildOnDestContext(host, function))
+	}
+}
+
+func runManagedDeleteContractScenario(t *testing.T, fixAuditChangesV6 uint32, parentFunction func(host vmhost.VMHost)) *vmcommon.VMOutput {
+	testConfig := baseTestConfig
+
+	deleteTarget := func(address []byte, owner []byte) test.MockTestSmartContract {
+		return test.CreateMockContract(address).
+			WithCodeMetadata([]byte{vmcommon.MetadataUpgradeable, 0}).
+			WithOwnerAddress(owner).
+			WithMethods()
+	}
+
+	vmOutput, err := test.BuildMockInstanceCallTest(t).
+		WithEnableEpochs(blockchainConfig.EnableEpochs{FixAuditChangesV6: fixAuditChangesV6}).
+		WithContracts(
+			test.CreateMockContract(test.ParentAddress).
+				WithBalance(testConfig.ParentBalance).
+				WithConfig(testConfig).
+				WithMethods(func(parentInstance *mock.InstanceMock, config interface{}) {
+					parentInstance.AddMockMethod("testFunction", func() *mock.InstanceMock {
+						parentFunction(parentInstance.Host)
+						return parentInstance
+					})
+				}),
+			test.CreateMockContract(test.ChildAddress).
+				WithMethods(func(childInstance *mock.InstanceMock, config interface{}) {
+					childInstance.AddMockMethod("doNothing", func() *mock.InstanceMock {
+						return childInstance
+					})
+					childInstance.AddMockMethod("deleteChildTarget", func() *mock.InstanceMock {
+						deleteContractWithHost(childInstance.Host, childDeleteTarget)
+						return childInstance
+					})
+					childInstance.AddMockMethod("deleteChildTargetAndFail", func() *mock.InstanceMock {
+						deleteContractWithHost(childInstance.Host, failingChildDeleteTarget)
+						childInstance.Host.Runtime().SignalUserError("child failed after delete")
+						return childInstance
+					})
+					childInstance.AddMockMethod("deleteParentTargetOnSameContext", func() *mock.InstanceMock {
+						deleteContractWithHost(childInstance.Host, parentDeleteTarget)
+						return childInstance
+					})
+				}),
+			deleteTarget(parentDeleteTarget, test.ParentAddress),
+			deleteTarget(childDeleteTarget, test.ChildAddress),
+			deleteTarget(failingChildDeleteTarget, test.ChildAddress),
+		).
+		WithInput(test.CreateTestContractCallInputBuilder().
+			WithRecipientAddr(test.ParentAddress).
+			WithGasProvided(testConfig.GasProvided).
+			WithFunction("testFunction").
+			Build()).
+		WithSetup(func(host vmhost.VMHost, world *worldmock.MockWorld) {
+			setZeroCodeCosts(host)
+		}).
+		AndAssertResults(func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+			verify.Ok()
+		})
+	require.NoError(t, err)
+
+	return vmOutput
+}
+
+func Test_ManagedDeleteContract_ListedOnceAfterNestedCalls(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
+		deleteContractWithHost(host, parentDeleteTarget)
+		callChildOnDestContextTimes(t, host, "doNothing", 10)
+	})
+
+	require.Equal(t, [][]byte{parentDeleteTarget}, vmOutput.DeletedAccounts)
+}
+
+func Test_ManagedDeleteContract_RepeatedAfterNestedCallsBeforeFixAuditChangesV6(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 1_000_000, func(host vmhost.VMHost) {
+		deleteContractWithHost(host, parentDeleteTarget)
+		callChildOnDestContextTimes(t, host, "doNothing", 3)
+	})
+
+	require.Len(t, vmOutput.DeletedAccounts, 8)
+	for _, address := range vmOutput.DeletedAccounts {
+		require.Equal(t, parentDeleteTarget, address)
+	}
+}
+
+func Test_ManagedDeleteContract_ParentAndChildDeletionsListedOnce(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
+		deleteContractWithHost(host, parentDeleteTarget)
+		callChildOnDestContextTimes(t, host, "deleteChildTarget", 1)
+		callChildOnDestContextTimes(t, host, "doNothing", 5)
+	})
+
+	require.Equal(t, [][]byte{parentDeleteTarget, childDeleteTarget}, vmOutput.DeletedAccounts)
+}
+
+func Test_ManagedDeleteContract_RepeatedDeleteListedOncePerCall(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
+		deleteContractWithHost(host, parentDeleteTarget)
+		deleteContractWithHost(host, parentDeleteTarget)
+		callChildOnDestContextTimes(t, host, "doNothing", 5)
+	})
+
+	require.Equal(t, [][]byte{parentDeleteTarget, parentDeleteTarget}, vmOutput.DeletedAccounts)
+}
+
+func Test_ManagedDeleteContract_OnSameContextListedOnceAfterNestedCalls(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
+		result := vmhooks.ExecuteOnSameContextWithTypedArgs(host, 100000, big.NewInt(0), []byte("deleteParentTargetOnSameContext"), test.ChildAddress, [][]byte{})
+		require.Equal(t, int32(0), result)
+		callChildOnDestContextTimes(t, host, "doNothing", 5)
+	})
+
+	require.Equal(t, [][]byte{parentDeleteTarget}, vmOutput.DeletedAccounts)
+}
+
+func Test_ManagedDeleteContract_FailedNestedCallDropsItsDeletion(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
+		callChildOnDestContextTimes(t, host, "deleteChildTarget", 1)
+
+		failingInput := test.DefaultTestContractCallInput()
+		failingInput.CallerAddr = test.ParentAddress
+		failingInput.RecipientAddr = test.ChildAddress
+		failingInput.Function = "deleteChildTargetAndFail"
+		failingInput.GasProvided = host.Metering().GasLeft() / 2
+		_, err := host.ExecuteOnDestContext(failingInput)
+		require.Error(t, err)
+
+		callChildOnDestContextTimes(t, host, "doNothing", 3)
+	})
+
+	require.Equal(t, [][]byte{childDeleteTarget}, vmOutput.DeletedAccounts)
+}
+
 func TestBaseOpsAPI_NFTNonceOverflow(t *testing.T) {
 	testConfig := makeTestConfig()
 
