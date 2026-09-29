@@ -39,8 +39,6 @@ type BlockchainHookStub struct {
 	SaveCompiledCodeCalled                  func(codeHash []byte, code []byte)
 	GetCodeCalled                           func(account state.UserAccountHandler) []byte
 	GetKDATokenCalled                       func(address []byte, tokenID []byte, nonce uint64) (*kapps.KDAData, *kapps.UserKDA, error)
-	GetSnapshotCalled                       func() int
-	RevertToSnapshotCalled                  func(snapshot int) error
 	ExecuteSmartContractCallOnOtherVMCalled func(input *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error)
 	TransferValueOnlyCalled                 func(destination []byte, sender []byte, value *big.Int) error
 	KDATransferCalled                       func(sender []byte, tc *transaction.TransferContract) error
@@ -280,22 +278,6 @@ func (b *BlockchainHookStub) KDATransfer(sender []byte, tc *transaction.Transfer
 
 // ClearCompiledCodes mocked method
 func (b *BlockchainHookStub) ClearCompiledCodes() {
-}
-
-// GetSnapshot mocked method
-func (b *BlockchainHookStub) GetSnapshot() int {
-	if b.GetSnapshotCalled != nil {
-		return b.GetSnapshotCalled()
-	}
-	return 1
-}
-
-// RevertToSnapshot mocked method
-func (b *BlockchainHookStub) RevertToSnapshot(snapshot int) error {
-	if b.RevertToSnapshotCalled != nil {
-		return b.RevertToSnapshotCalled(snapshot)
-	}
-	return nil
 }
 
 // ExecuteSmartContractCallOnOtherVM -

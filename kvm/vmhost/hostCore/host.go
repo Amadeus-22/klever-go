@@ -353,7 +353,6 @@ func (host *vmHost) initContexts() {
 	host.meteringContext.InitState()
 	host.runtimeContext.InitState()
 	host.storageContext.InitState()
-	host.blockchainContext.InitState()
 }
 
 // ClearContextStateStack cleans the state stacks of all the contexts of the host
@@ -363,7 +362,6 @@ func (host *vmHost) ClearContextStateStack() {
 	host.meteringContext.ClearStateStack()
 	host.runtimeContext.ClearStateStack()
 	host.storageContext.ClearStateStack()
-	host.blockchainContext.ClearStateStack()
 }
 
 // GasScheduleChange applies a new gas schedule to the host

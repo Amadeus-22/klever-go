@@ -11,11 +11,6 @@ import (
 )
 
 type BlockchainContextStub struct {
-	InitStateCalled                         func()
-	PushStateCalled                         func()
-	PopSetActiveStateCalled                 func()
-	PopDiscardCalled                        func()
-	ClearStateStackCalled                   func()
 	NewAddressCalled                        func(creatorAddress []byte) ([]byte, error)
 	AccountExistsCalled                     func([]byte) bool
 	GetBalanceCalled                        func([]byte) []byte
@@ -46,8 +41,6 @@ type BlockchainContextStub struct {
 	GetSFTMetaCalled                        func([]byte, uint64) (*kapps.MetaV2, error)
 	GetUserAccountCalled                    func([]byte) (state.UserAccountHandler, error)
 	ProcessBuiltInFunctionCalled            func(*vmcommon.ContractCallInput) (*vmcommon.VMOutput, error)
-	GetSnapshotCalled                       func() int
-	RevertToSnapshotCalled                  func(int)
 	IsLimitedTransferCalled                 func([]byte) bool
 	IsPausedCalled                          func([]byte) bool
 	ClearCompiledCodesCalled                func()
@@ -55,36 +48,6 @@ type BlockchainContextStub struct {
 	TransferValueOnlyCalled                 func(destination []byte, sender []byte, value *big.Int) error
 	KDATransferCalled                       func(sender []byte, tc *transaction.TransferContract) error
 	GetKAppControllerCalled                 func() kapp.KAppController
-}
-
-func (stub *BlockchainContextStub) InitState() {
-	if stub.InitStateCalled != nil {
-		stub.InitStateCalled()
-	}
-}
-
-func (stub *BlockchainContextStub) PushState() {
-	if stub.PushStateCalled != nil {
-		stub.PushStateCalled()
-	}
-}
-
-func (stub *BlockchainContextStub) PopSetActiveState() {
-	if stub.PopSetActiveStateCalled != nil {
-		stub.PopSetActiveStateCalled()
-	}
-}
-
-func (stub *BlockchainContextStub) PopDiscard() {
-	if stub.PopDiscardCalled != nil {
-		stub.PopDiscardCalled()
-	}
-}
-
-func (stub *BlockchainContextStub) ClearStateStack() {
-	if stub.ClearStateStackCalled != nil {
-		stub.ClearStateStackCalled()
-	}
 }
 
 func (stub *BlockchainContextStub) NewAddress(creatorAddress []byte) ([]byte, error) {
@@ -293,19 +256,6 @@ func (stub *BlockchainContextStub) ProcessBuiltInFunction(input *vmcommon.Contra
 		return stub.ProcessBuiltInFunctionCalled(input)
 	}
 	return nil, nil
-}
-
-func (stub *BlockchainContextStub) GetSnapshot() int {
-	if stub.GetSnapshotCalled != nil {
-		return stub.GetSnapshotCalled()
-	}
-	return 0
-}
-
-func (stub *BlockchainContextStub) RevertToSnapshot(snapshot int) {
-	if stub.RevertToSnapshotCalled != nil {
-		stub.RevertToSnapshotCalled(snapshot)
-	}
 }
 
 func (stub *BlockchainContextStub) IsLimitedTransfer(tokenID []byte) bool {

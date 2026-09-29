@@ -72,10 +72,10 @@ type VMHost interface {
 	IsInterfaceNil() bool
 }
 
-// BlockchainContext defines the functionality needed for interacting with the blockchain context
+// BlockchainContext defines the functionality needed for interacting with the blockchain context.
+// Unlike the other contexts it has no state stack: transfers settle into the accounts cacher
+// immediately and cannot be reverted below the transaction, so every VM error path must abort it.
 type BlockchainContext interface {
-	StateStack
-
 	NewAddress(creatorAddress []byte) ([]byte, error)
 	AccountExists(addr []byte) bool
 	GetBalance(addr []byte) []byte
@@ -105,8 +105,6 @@ type BlockchainContext interface {
 	GetSFTMeta(tokenID []byte, nonce uint64) (*kapps.MetaV2, error)
 	GetUserAccount(address []byte) (state.UserAccountHandler, error)
 	ProcessBuiltInFunction(input *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error)
-	GetSnapshot() int
-	RevertToSnapshot(snapshot int)
 	TransferValueOnly(destination []byte, sender []byte, value *big.Int) error
 	IncreaseNonce(address []byte)
 	KDATransfer(sender []byte, tc *transaction.TransferContract) error

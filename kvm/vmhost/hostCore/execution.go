@@ -374,17 +374,12 @@ func (host *vmHost) ExecuteOnDestContext(input *vmcommon.ContractCallInput) (vmO
 
 	scExecutionInput := input
 
-	blockchain := host.Blockchain()
-
-	blockchain.PushState()
-
 	// if ExecuteOnDestContext is called with an embedded builtin function call
 	// then parser the builtin function call and execute it i.e. (with_kda_transfer , with_klv_transfer)
 	if host.IsBuiltinFunctionName(input.Function) {
 		// scExecutionInput will have the function call embedded as the new input function call
 		scExecutionInput, vmOutput, err = host.handleBuiltinFunctionCall(input)
 		if err != nil {
-			blockchain.PopSetActiveState()
 			host.Runtime().AddError(err, input.Function)
 			vmOutput = host.Output().CreateVMOutputInCaseOfError(err)
 			return
@@ -397,12 +392,6 @@ func (host *vmHost) ExecuteOnDestContext(input *vmcommon.ContractCallInput) (vmO
 	if scExecutionInput != nil {
 		vmOutput, err = host.executeOnDestContextNoBuiltinFunction(scExecutionInput)
 		host.addNewBackTransfersFromVMOutput(vmOutput, scExecutionInput.CallerAddr, scExecutionInput.RecipientAddr)
-	}
-
-	if err != nil {
-		blockchain.PopSetActiveState()
-	} else {
-		blockchain.PopDiscard()
 	}
 
 	return
@@ -508,8 +497,8 @@ func (host *vmHost) executeOnDestContextNoBuiltinFunction(input *vmcommon.Contra
 		runtime.AddError(err, input.Function)
 	}()
 
-	// Perform a value transfer to the called SC. If the execution fails, this
-	// transfer will not persist.
+	// Perform a value transfer to the called SC. It is settled immediately; if the
+	// execution fails, the transaction aborts and is reset as a whole (KLC-2686).
 	for _, transfer := range input.KDATransfers {
 		if transfer.IsExecuted() {
 			log.Trace("executeOnDestContextNoBuiltinFunction skip executed transfers", "assetID", string(transfer.KDATokenName), "amount", transfer.KDAValue.Int64())
@@ -596,10 +585,11 @@ func (host *vmHost) ExecuteOnSameContext(input *vmcommon.ContractCallInput) erro
 		return vmhost.ErrBuiltinCallOnSameContextDisallowed
 	}
 
-	managedTypes, blockchain, metering, output, runtime, _ := host.GetContexts()
+	managedTypes, _, metering, output, runtime, _ := host.GetContexts()
 
-	// Back up the states of the contexts (except Storage, which aren't affected
-	// by ExecuteOnSameContext())
+	// Back up the states of the contexts, except Storage, which ExecuteOnSameContext()
+	// doesn't affect, and Blockchain, which has no state stack: its transfers are only
+	// undone by the transaction-level reset
 	managedTypes.PushState()
 	managedTypes.InitState()
 	output.PushState()
@@ -617,8 +607,6 @@ func (host *vmHost) ExecuteOnSameContext(input *vmcommon.ContractCallInput) erro
 	metering.PushState()
 	metering.InitStateFromContractCallInput(&input.VMInput)
 
-	blockchain.PushState()
-
 	var err error
 
 	defer func() {
@@ -629,8 +617,8 @@ func (host *vmHost) ExecuteOnSameContext(input *vmcommon.ContractCallInput) erro
 		host.finishExecuteOnSameContext(deferredErr)
 	}()
 
-	// Perform a value transfer to the called SC. If the execution fails, this
-	// transfer will not persist.
+	// Perform a value transfer to the called SC. It is settled immediately; if the
+	// execution fails, the transaction aborts and is reset as a whole (KLC-2686).
 	for _, transfer := range input.KDATransfers {
 		if transfer.IsExecuted() {
 			log.Trace("ExecuteOnSameContext skip executed transfers", "assetID", string(transfer.KDATokenName), "amount", transfer.KDAValue.Int64())
@@ -666,14 +654,13 @@ func (host *vmHost) ExecuteOnSameContext(input *vmcommon.ContractCallInput) erro
 }
 
 func (host *vmHost) finishExecuteOnSameContext(executeErr error) {
-	managedTypes, blockchain, metering, output, runtime, _ := host.GetContexts()
+	managedTypes, _, metering, output, runtime, _ := host.GetContexts()
 
 	if output.ReturnCode() != vmcommon.Ok || executeErr != nil {
 		// Execution failed: restore contexts as if the execution didn't happen.
 		managedTypes.PopSetActiveState()
 		metering.PopSetActiveState()
 		output.PopSetActiveState()
-		blockchain.PopSetActiveState()
 		runtime.PopSetActiveState()
 		return
 	}
@@ -685,7 +672,6 @@ func (host *vmHost) finishExecuteOnSameContext(executeErr error) {
 
 	metering.PopMergeActiveState()
 	output.PopDiscard()
-	blockchain.PopDiscard()
 	managedTypes.PopSetActiveState()
 	runtime.PopSetActiveState()
 	// Restore remaining gas to the caller (parent) Wasmer instance

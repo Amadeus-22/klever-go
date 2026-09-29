@@ -657,8 +657,6 @@ type BlockChainHookHandler interface {
 	IsPayable(sndAddress []byte, recvAddress []byte) (bool, error)
 	DeleteCompiledCode(codeHash []byte)
 	ClearCompiledCodes()
-	GetSnapshot() int
-	RevertToSnapshot(snapshot int) error
 	ExecuteSmartContractCallOnOtherVM(input *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error)
 	TransferValueOnly(destination []byte, sender []byte, value *big.Int) error
 	KDATransfer(sender []byte, tc *transaction.TransferContract) error

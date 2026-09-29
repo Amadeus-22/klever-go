@@ -563,7 +563,11 @@ func (context *VMHooksImpl) extractIndirectContractCallArguments(
 	}, nil
 }
 
-// TransferKDANFTExecuteWithTypedArgs defines the actual transfer KDA execute logic
+// TransferKDANFTExecuteWithTypedArgs defines the actual transfer KDA execute logic.
+//
+// The transfers are settled before the follow-up execution runs, and nothing below the
+// transaction undoes them: when that execution fails, failing the whole execution is what rolls
+// them back (KLC-2686).
 func TransferKDANFTExecuteWithTypedArgs(
 	host vmhost.VMHost,
 	dest []byte,
@@ -604,8 +608,6 @@ func TransferKDANFTExecuteWithTypedArgs(
 
 	}
 
-	snapshotBeforeTransfer := host.Blockchain().GetSnapshot()
-
 	originalCaller := host.Runtime().GetOriginalCallerAddress()
 	transfersArgs := &vmhost.KDATransfersArgs{
 		Destination:    dest,
@@ -624,7 +626,6 @@ func TransferKDANFTExecuteWithTypedArgs(
 		_, executeErr := executeOnDestContextFromAPI(host, contractCallInput)
 		if executeErr != nil {
 			logEEI.Trace("KDA post-transfer execution failed", "error", executeErr)
-			host.Blockchain().RevertToSnapshot(snapshotBeforeTransfer)
 			WithFaultAndHost(host, executeErr, runtime.BaseOpsErrorShouldFailExecution())
 			return 1
 		}
