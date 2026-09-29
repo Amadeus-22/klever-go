@@ -26,19 +26,22 @@ const LastClaimLen = 8
 
 // Deserializes a *transaction.TXContract object.
 func readKDATransfer(
-	managedType vmhost.ManagedTypesContext,
+	host vmhost.VMHost,
 	data []byte,
 ) (*vmcommon.KDATransfer, error) {
 	if len(data) != kdaTransferLen {
 		return nil, errors.New("invalid KDA transfer object encoding")
 	}
+	managedType := host.ManagedTypes()
+	dataCopyPerByte := host.Metering().GasSchedule().BaseOperationCost.DataCopyPerByte
 
 	tokenIdentifierHandle := int32(binary.BigEndian.Uint32(data[0:4])) // #nosec G115
-	tokenIdentifier, err := managedType.GetBytes(tokenIdentifierHandle)
+	// post-fork the token identifier is paid, bounded, before it is cloned, so a vector that
+	// repeats one large handle stops at the gas limit instead of cloning it once per record
+	tokenIdentifier, err := loadMBufferBytes(host, tokenIdentifierHandle, dataCopyPerByte, dataCopyPerByte)
 	if err != nil {
 		return nil, err
 	}
-	managedType.ConsumeGasForBytes(tokenIdentifier)
 
 	nonce := binary.BigEndian.Uint64(data[4:12])
 
@@ -70,23 +73,42 @@ func readKDATransfer(
 // - value handle - 4 bytes
 // Total: 16 bytes.
 func readKDATransfers(
-	managedType vmhost.ManagedTypesContext,
+	host vmhost.VMHost,
 	managedVecHandle int32,
 ) ([]*vmcommon.KDATransfer, error) {
-	managedVecBytes, err := managedType.GetBytes(managedVecHandle)
+	metering := host.Metering()
+	fixAuditV6 := host.ForkController().FixAuditChangesV6()
+
+	// the same cap the managed vector of buffers is held to
+	err := checkMBufferMaxLength(host, managedVecHandle, vmhost.ErrManagedBufferLengthExceedsMaximum, vmhost.MaxTotalArgumentsBytes)
 	if err != nil {
 		return nil, err
 	}
-	managedType.ConsumeGasForBytes(managedVecBytes)
+	dataCopyPerByte := metering.GasSchedule().BaseOperationCost.DataCopyPerByte
+	managedVecBytes, err := loadMBufferBytes(host, managedVecHandle, dataCopyPerByte, dataCopyPerByte)
+	if err != nil {
+		return nil, err
+	}
 
 	if len(managedVecBytes)%kdaTransferLen != 0 {
 		return nil, errors.New("invalid managed vector of KDA transfers")
 	}
 
 	numTransfers := len(managedVecBytes) / kdaTransferLen
+	// post-fork a vector with more records than the gas left can pay TransferValue for fails
+	// before any record is built. It only checks: the charge stays in TransferKDANFTExecuteWithTypedArgs,
+	// so an honest call costs the same gas
+	if fixAuditV6 {
+		// #nosec G115
+		transfersGas := math.MulUint64(metering.GasSchedule().BaseOpsAPICost.TransferValue, uint64(numTransfers))
+		if metering.GasLeft() < transfersGas {
+			return nil, vmhost.ErrNotEnoughGas
+		}
+	}
+
 	result := make([]*vmcommon.KDATransfer, 0, numTransfers)
 	for i := 0; i < len(managedVecBytes); i += kdaTransferLen {
-		kdaTransfer, err := readKDATransfer(managedType, managedVecBytes[i:i+kdaTransferLen])
+		kdaTransfer, err := readKDATransfer(host, managedVecBytes[i:i+kdaTransferLen])
 		if err != nil {
 			return nil, err
 		}
@@ -488,6 +510,19 @@ type vmInputData struct {
 	arguments   [][]byte
 }
 
+// checkFunctionNameLength is the managed twin of the memory-path check in getArgumentsFromMemory:
+// verifyValidFunctionName rejects contract function names this long and builtin names are far shorter,
+// so post-fork a name this long could never be called and is rejected before anything is cloned
+func checkFunctionNameLength(host vmhost.VMHost, functionHandle int32) error {
+	if !host.ForkController().FixAuditChangesV6() {
+		return nil
+	}
+	if host.ManagedTypes().GetLength(functionHandle) >= vmhost.MaxFunctionNameLength {
+		return vmhost.ErrInvalidFunctionName
+	}
+	return nil
+}
+
 func readDestinationValueFunctionArguments(
 	host vmhost.VMHost,
 	destHandle int32,
@@ -496,6 +531,11 @@ func readDestinationValueFunctionArguments(
 	argumentsHandle int32,
 ) (*vmInputData, error) {
 	managedType := host.ManagedTypes()
+
+	err := checkFunctionNameLength(host, functionHandle)
+	if err != nil {
+		return nil, err
+	}
 
 	vmInput, err := readDestinationValueArguments(host, destHandle, valueHandle, argumentsHandle)
 	if err != nil {
@@ -540,6 +580,11 @@ func readDestinationFunctionArguments(
 ) (*vmInputData, error) {
 	managedType := host.ManagedTypes()
 
+	err := checkFunctionNameLength(host, functionHandle)
+	if err != nil {
+		return nil, err
+	}
+
 	vmInput, err := readDestinationArguments(host, destHandle, argumentsHandle)
 	if err != nil {
 		return nil, err
@@ -562,9 +607,14 @@ func readDestinationArguments(
 	managedType := host.ManagedTypes()
 	metering := host.Metering()
 
-	var err error
-	vmInput := &vmInputData{}
+	// every destination these hooks read is an address, which the memory path always loads as
+	// exactly AddressLen bytes, so post-fork a longer one is rejected before it is cloned
+	err := checkMBufferMaxLength(host, destHandle, vmhost.ErrInvalidArgument, vmhost.AddressLen)
+	if err != nil {
+		return nil, err
+	}
 
+	vmInput := &vmInputData{}
 	vmInput.destination, err = managedType.GetBytes(destHandle)
 	if err != nil {
 		return nil, err
@@ -577,8 +627,12 @@ func readDestinationArguments(
 	}
 	vmInput.arguments = data
 
-	gasToUse := math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, actualLen)
-	metering.UseAndTraceGas(gasToUse)
+	// pre-fork the arguments were charged per byte a second time here, on top of the decode;
+	// post-fork the decode's charge is the only one
+	if !host.ForkController().FixAuditChangesV6() {
+		gasToUse := math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, actualLen)
+		metering.UseAndTraceGas(gasToUse)
+	}
 
 	return vmInput, err
 }

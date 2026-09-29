@@ -14,6 +14,11 @@ const VMVersion = "v1.5"
 // WASMPageSize is the size in bytes of a WASM linear memory page
 const WASMPageSize = uint32(65536)
 
+// MaxTotalArgumentsBytes caps the bytes a set of call arguments may total, whether they are read
+// from wasm memory or decoded from a managed vector; it is also the managed buffer length cap. It
+// is a consensus rule, so both decoders take it from here rather than keeping their own copy.
+const MaxTotalArgumentsBytes = 16_000_000
+
 // BreakpointValue encodes Wasmer runtime breakpoint types
 type BreakpointValue uint64
 

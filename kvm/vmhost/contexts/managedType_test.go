@@ -3,11 +3,13 @@ package contexts
 import (
 	"bytes"
 	"crypto/elliptic"
+	"encoding/binary"
 	"math/big"
 	"testing"
 
 	commonMock "github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/core"
+	"github.com/klever-io/klever-go/kvm/config"
 	contextmock "github.com/klever-io/klever-go/kvm/mock/context"
 	"github.com/klever-io/klever-go/kvm/vmhost"
 	"github.com/klever-io/klever-go/tools/check"
@@ -1051,4 +1053,207 @@ func TestDeleteSliceKeepsThePolicyCapacity(t *testing.T) {
 	buffer := managedTypesCtx.managedTypesValues.mBufferValues[handle]
 	require.Equal(t, 1050, len(buffer))
 	require.Equal(t, capacityBefore, cap(buffer))
+}
+
+// newManagedVecDecodeFixture builds a real managed types context behind a host whose fork
+// controller reports FixAuditChangesV6 as fixAuditV6 and whose metering has gasLeft gas, charged
+// at dataCopyPerByte per byte.
+func newManagedVecDecodeFixture(fixAuditV6 bool, gasLeft uint64) (*managedTypesContext, *contextmock.MeteringContextMock) {
+	const dataCopyPerByte = 50
+	metering := &contextmock.MeteringContextMock{
+		GasCost:     &config.GasCost{BaseOperationCost: config.BaseOperationCost{DataCopyPerByte: dataCopyPerByte}},
+		GasLeftMock: gasLeft,
+	}
+	forkController := &commonMock.ForkControllerStub{FixAuditChangesV6Value: fixAuditV6}
+	host := &contextmock.VMHostStub{
+		ForkControllerCalled: func() core.ForkController {
+			return forkController
+		},
+		MeteringCalled: func() vmhost.MeteringContext {
+			return metering
+		},
+	}
+	managedTypesCtx, _ := NewManagedTypesContext(host)
+	return managedTypesCtx, metering
+}
+
+// managedVecOfHandles encodes a managed vector naming the given handles, in order.
+func managedVecOfHandles(handles ...int32) []byte {
+	vec := make([]byte, len(handles)*handleLen)
+	for i, handle := range handles {
+		binary.BigEndian.PutUint32(vec[i*handleLen:], uint32(handle)) // #nosec G115
+	}
+	return vec
+}
+
+func TestManagedTypesContext_ReadManagedVecOfManagedBuffers_FixAuditV6(t *testing.T) {
+	t.Parallel()
+
+	const dataCopyPerByte = 50
+	const plenty = uint64(1_000_000_000)
+
+	t.Run("decodes distinct items and charges the vector and the items once", func(t *testing.T) {
+		t.Parallel()
+
+		for _, fixAuditV6 := range []bool{false, true} {
+			ctx, metering := newManagedVecDecodeFixture(fixAuditV6, plenty)
+			var legacyCharges []uint64
+			metering.UseAndTraceGasCalled = func(gas uint64) {
+				legacyCharges = append(legacyCharges, gas)
+			}
+			first := ctx.NewManagedBufferFromBytes([]byte("transfer"))
+			second := ctx.NewManagedBufferFromBytes([]byte("abc"))
+			vec := ctx.NewManagedBufferFromBytes(managedVecOfHandles(first, second))
+
+			items, sumOfItemByteLengths, err := ctx.ReadManagedVecOfManagedBuffers(vec)
+
+			require.NoError(t, err)
+			require.Equal(t, [][]byte{[]byte("transfer"), []byte("abc")}, items)
+			require.Equal(t, uint64(11), sumOfItemByteLengths)
+			if fixAuditV6 {
+				require.Nil(t, legacyCharges)
+				require.Equal(t, plenty-(8+11)*dataCopyPerByte, metering.GasLeft())
+			} else {
+				// the legacy path charges through UseAndTraceGas, which the mock records but does not meter
+				require.Equal(t, []uint64{8 * dataCopyPerByte, 8 * dataCopyPerByte, 3 * dataCopyPerByte}, legacyCharges)
+			}
+		}
+	})
+
+	t.Run("an underfunded vector is not cloned", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, metering := newManagedVecDecodeFixture(true, 8*dataCopyPerByte-1)
+		item := ctx.NewManagedBufferFromBytes([]byte("item"))
+		vec := ctx.NewManagedBufferFromBytes(managedVecOfHandles(item, item))
+
+		items, _, err := ctx.ReadManagedVecOfManagedBuffers(vec)
+
+		require.Equal(t, vmhost.ErrNotEnoughGas, err)
+		require.Nil(t, items)
+		require.Equal(t, uint64(8*dataCopyPerByte-1), metering.GasLeft())
+	})
+
+	t.Run("a repeated handle stops at the gas limit before any item is cloned", func(t *testing.T) {
+		t.Parallel()
+
+		const numItems, itemLen = 1000, 1024
+		ctx, metering := newManagedVecDecodeFixture(true, (numItems*handleLen+3*itemLen)*dataCopyPerByte)
+		item := ctx.NewManagedBufferFromBytes(make([]byte, itemLen))
+		handles := make([]int32, numItems)
+		for i := range handles {
+			handles[i] = item
+		}
+		vec := ctx.NewManagedBufferFromBytes(managedVecOfHandles(handles...))
+
+		items, _, err := ctx.ReadManagedVecOfManagedBuffers(vec)
+
+		require.Equal(t, vmhost.ErrNotEnoughGas, err)
+		require.Nil(t, items)
+		// only the vector was paid for: the items' total is charged as one amount, and it did not fit
+		require.Equal(t, uint64(3*itemLen*dataCopyPerByte), metering.GasLeft())
+	})
+
+	t.Run("a total above the cap is rejected before the items are charged", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, metering := newManagedVecDecodeFixture(true, plenty)
+		half := ctx.NewManagedBufferFromBytes(make([]byte, vmhost.MaxTotalArgumentsBytes/2+1))
+		vec := ctx.NewManagedBufferFromBytes(managedVecOfHandles(half, half))
+
+		items, _, err := ctx.ReadManagedVecOfManagedBuffers(vec)
+
+		require.Equal(t, vmhost.ErrManagedBufferLengthExceedsMaximum, err)
+		require.Nil(t, items)
+		require.Equal(t, plenty-2*handleLen*dataCopyPerByte, metering.GasLeft())
+	})
+
+	t.Run("a vector above the cap is rejected before it is charged", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, metering := newManagedVecDecodeFixture(true, plenty)
+		vec := ctx.NewManagedBufferFromBytes(make([]byte, vmhost.MaxTotalArgumentsBytes+handleLen))
+
+		items, _, err := ctx.ReadManagedVecOfManagedBuffers(vec)
+
+		require.Equal(t, vmhost.ErrManagedBufferLengthExceedsMaximum, err)
+		require.Nil(t, items)
+		require.Equal(t, plenty, metering.GasLeft())
+	})
+
+	t.Run("a missing vector handle fails with the legacy error", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, _ := newManagedVecDecodeFixture(true, plenty)
+
+		items, _, err := ctx.ReadManagedVecOfManagedBuffers(9_999)
+
+		require.Equal(t, vmhost.ErrNoManagedBufferUnderThisHandle, err)
+		require.Nil(t, items)
+	})
+
+	t.Run("a missing item handle fails before any item is cloned", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, metering := newManagedVecDecodeFixture(true, plenty)
+		present := ctx.NewManagedBufferFromBytes([]byte("present"))
+		vec := ctx.NewManagedBufferFromBytes(managedVecOfHandles(present, 9_999))
+
+		items, _, err := ctx.ReadManagedVecOfManagedBuffers(vec)
+
+		require.Equal(t, vmhost.ErrNoManagedBufferUnderThisHandle, err)
+		require.Nil(t, items)
+		require.Equal(t, plenty-2*handleLen*dataCopyPerByte, metering.GasLeft())
+	})
+
+	t.Run("a vector that is not a whole number of handles is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, _ := newManagedVecDecodeFixture(true, plenty)
+		vec := ctx.NewManagedBufferFromBytes([]byte{0, 0, 0})
+
+		items, _, err := ctx.ReadManagedVecOfManagedBuffers(vec)
+
+		require.EqualError(t, err, "invalid managed vector of managed buffer handles")
+		require.Nil(t, items)
+	})
+}
+
+// TestManagedTypesContext_ReadManagedVecOfManagedBuffers_FixAuditV6_ClonesOnlyWhatIsPaid counts
+// the clones GetBytes makes, which gas alone cannot see. It is not parallel: AllocsPerRun reads
+// process-wide counters, and top-level sequential tests run before the parallel ones are released.
+func TestManagedTypesContext_ReadManagedVecOfManagedBuffers_FixAuditV6_ClonesOnlyWhatIsPaid(t *testing.T) {
+	const dataCopyPerByte = 50
+
+	t.Run("an underfunded vector is not cloned", func(t *testing.T) {
+		ctx, _ := newManagedVecDecodeFixture(true, 8*dataCopyPerByte-1)
+		item := ctx.NewManagedBufferFromBytes([]byte("item"))
+		vec := ctx.NewManagedBufferFromBytes(managedVecOfHandles(item, item))
+
+		allocs := testing.AllocsPerRun(10, func() {
+			_, _, _ = ctx.ReadManagedVecOfManagedBuffers(vec)
+		})
+
+		require.Zero(t, allocs)
+	})
+
+	t.Run("a repeated handle clones the vector and no item", func(t *testing.T) {
+		const numItems, itemLen = 1000, 1024
+		gasLeft := uint64((numItems*handleLen + 3*itemLen) * dataCopyPerByte)
+		ctx, metering := newManagedVecDecodeFixture(true, gasLeft)
+		item := ctx.NewManagedBufferFromBytes(make([]byte, itemLen))
+		handles := make([]int32, numItems)
+		for i := range handles {
+			handles[i] = item
+		}
+		vec := ctx.NewManagedBufferFromBytes(managedVecOfHandles(handles...))
+
+		allocs := testing.AllocsPerRun(10, func() {
+			// every run must pay for the vector, as the first one did
+			metering.GasLeftMock = gasLeft
+			_, _, _ = ctx.ReadManagedVecOfManagedBuffers(vec)
+		})
+
+		require.Equal(t, float64(1), allocs)
+	})
 }

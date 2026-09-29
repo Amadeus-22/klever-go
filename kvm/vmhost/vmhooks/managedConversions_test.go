@@ -1,18 +1,22 @@
 package vmhooks
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"math/big"
 	"testing"
 
+	commonMock "github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/kvm/config"
 	mock "github.com/klever-io/klever-go/kvm/mock/context"
 	"github.com/klever-io/klever-go/vmcommon"
 
 	"github.com/klever-io/klever-go/kapps"
+	"github.com/klever-io/klever-go/kvm/vmhost"
 	hostmock "github.com/klever-io/klever-go/kvm/vmhost/mock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestWriteLastClaim(t *testing.T) {
@@ -186,7 +190,7 @@ func TestReadKDATransfer(t *testing.T) {
 			ass := assert.New(t)
 			tc.mock()
 
-			res, err := readKDATransfer(mockManagedTypes, tc.data)
+			res, err := readKDATransfer(kdaTransfersHost(mockManagedTypes, kdaTransfersMetering(1_000_000_000), false), tc.data)
 			ass.Equal(tc.expectedError, err)
 			ass.Equal(tc.expectedResult, res)
 		})
@@ -293,7 +297,7 @@ func TestReadKDATransfers(t *testing.T) {
 			ass := assert.New(t)
 			tc.mock()
 
-			res, err := readKDATransfers(mockManagedTypes, 1)
+			res, err := readKDATransfers(kdaTransfersHost(mockManagedTypes, kdaTransfersMetering(1_000_000_000), false), 1)
 			ass.Equal(tc.expectedError, err)
 
 			for i := range tc.expectedResult {
@@ -302,6 +306,368 @@ func TestReadKDATransfers(t *testing.T) {
 		})
 	}
 
+}
+
+// kdaTransfersRepeatedHandleMock serves a vector of numRecords records that all name the same
+// token identifier buffer of tokenLen bytes. It counts how many token identifier clones were made.
+func kdaTransfersRepeatedHandleMock(numRecords int, tokenLen int) (*hostmock.ManagedTypesContextMock, *int) {
+	const vecHandle, tokenHandle, valueHandle = int32(1), int32(2), int32(3)
+
+	vec := make([]byte, 0, numRecords*kdaTransferLen)
+	for i := 0; i < numRecords; i++ {
+		record := make([]byte, kdaTransferLen)
+		binary.BigEndian.PutUint32(record[0:4], uint32(tokenHandle))
+		binary.BigEndian.PutUint32(record[12:16], uint32(valueHandle))
+		vec = append(vec, record...)
+	}
+	token := make([]byte, tokenLen)
+
+	clones := 0
+	mockManagedTypes := &hostmock.ManagedTypesContextMock{
+		GetLengthCalled: func(handle int32) int32 {
+			switch handle {
+			case vecHandle:
+				return int32(len(vec))
+			case tokenHandle:
+				return int32(len(token))
+			}
+			return -1
+		},
+		GetBytesCalled: func(handle int32) ([]byte, error) {
+			switch handle {
+			case vecHandle:
+				return append([]byte(nil), vec...), nil
+			case tokenHandle:
+				clones++
+				return append([]byte(nil), token...), nil
+			}
+			return nil, vmhost.ErrNoManagedBufferUnderThisHandle
+		},
+		GetBigIntCalled: func(handle int32) (*big.Int, error) {
+			return big.NewInt(10), nil
+		},
+	}
+
+	return mockManagedTypes, &clones
+}
+
+const kdaTransfersTransferValue = 100_000
+
+// kdaTransfersMetering has gasLeft gas, copies at one gas per byte and prices each transfer at
+// kdaTransfersTransferValue. Its UseAndTraceGas deducts nothing, so pre-fork charges leave gasLeft as is.
+func kdaTransfersMetering(gasLeft uint64) *mock.MeteringContextMock {
+	return &mock.MeteringContextMock{
+		GasCost: &config.GasCost{
+			BaseOperationCost: config.BaseOperationCost{DataCopyPerByte: 1},
+			BaseOpsAPICost:    config.BaseOpsAPICost{TransferValue: kdaTransfersTransferValue},
+		},
+		GasLeftMock: gasLeft,
+	}
+}
+
+// kdaTransfersHost wires the managed types and metering the decoders read, on the given side of the fork.
+func kdaTransfersHost(managedTypes vmhost.ManagedTypesContext, metering vmhost.MeteringContext, fixAuditV6 bool) *mock.VMHostMock {
+	return &mock.VMHostMock{
+		ManagedTypesContext:   managedTypes,
+		MeteringContext:       metering,
+		ForkControllerContext: &commonMock.ForkControllerStub{FixAuditChangesV6Value: fixAuditV6},
+	}
+}
+
+func TestReadKDATransfers_FixAuditV6_RepeatedHandleStopsAtGasLimit(t *testing.T) {
+	t.Parallel()
+
+	const numRecords, tokenLen = 1000, 1024
+	const vecLen = numRecords * kdaTransferLen
+	mockManagedTypes, clones := kdaTransfersRepeatedHandleMock(numRecords, tokenLen)
+	// enough for the vector and exactly three token identifiers. TransferValue is one gas, so the
+	// TransferValue check (numRecords gas, only checked) passes and the token identifiers hit the limit
+	metering := kdaTransfersMetering(vecLen + 3*tokenLen)
+	metering.GasCost.BaseOpsAPICost.TransferValue = 1
+
+	res, err := readKDATransfers(kdaTransfersHost(mockManagedTypes, metering, true), 1)
+
+	assert.Equal(t, vmhost.ErrNotEnoughGas, err)
+	assert.Nil(t, res)
+	assert.Equal(t, 3, *clones)
+}
+
+func TestReadKDATransfers_FixAuditV6_VectorChargedBeforeClone(t *testing.T) {
+	t.Parallel()
+
+	const numRecords = 1000
+	mockManagedTypes, clones := kdaTransfersRepeatedHandleMock(numRecords, 8)
+	vecClones := 0
+	getBytes := mockManagedTypes.GetBytesCalled
+	mockManagedTypes.GetBytesCalled = func(handle int32) ([]byte, error) {
+		if handle == 1 {
+			vecClones++
+		}
+		return getBytes(handle)
+	}
+	metering := kdaTransfersMetering(numRecords*kdaTransferLen - 1)
+
+	res, err := readKDATransfers(kdaTransfersHost(mockManagedTypes, metering, true), 1)
+
+	assert.Equal(t, vmhost.ErrNotEnoughGas, err)
+	assert.Nil(t, res)
+	assert.Equal(t, 0, vecClones)
+	assert.Equal(t, 0, *clones)
+}
+
+func TestReadKDATransfers_FixAuditV6_ChargesEveryRecord(t *testing.T) {
+	t.Parallel()
+
+	const numRecords, tokenLen = 4, 8
+	const gasLeft = uint64(1_000_000_000)
+	mockManagedTypes, clones := kdaTransfersRepeatedHandleMock(numRecords, tokenLen)
+	metering := kdaTransfersMetering(gasLeft)
+
+	res, err := readKDATransfers(kdaTransfersHost(mockManagedTypes, metering, true), 1)
+
+	assert.Nil(t, err)
+	assert.Len(t, res, numRecords)
+	assert.Equal(t, numRecords, *clones)
+	assert.Equal(t, uint64(numRecords*kdaTransferLen+numRecords*tokenLen), gasLeft-metering.GasLeft())
+}
+
+func TestReadKDATransfers_FixAuditV6_MissingTokenHandle(t *testing.T) {
+	t.Parallel()
+
+	const gasLeft = uint64(1_000_000_000)
+	mockManagedTypes, _ := kdaTransfersRepeatedHandleMock(1, 8)
+	getBytes := mockManagedTypes.GetBytesCalled
+	mockManagedTypes.GetLengthCalled = func(handle int32) int32 {
+		if handle == 1 {
+			return kdaTransferLen
+		}
+		return -1
+	}
+	mockManagedTypes.GetBytesCalled = func(handle int32) ([]byte, error) {
+		if handle != 1 {
+			return nil, vmhost.ErrNoManagedBufferUnderThisHandle
+		}
+		return getBytes(handle)
+	}
+	metering := kdaTransfersMetering(gasLeft)
+
+	res, err := readKDATransfers(kdaTransfersHost(mockManagedTypes, metering, true), 1)
+
+	assert.Equal(t, vmhost.ErrNoManagedBufferUnderThisHandle, err)
+	assert.Nil(t, res)
+	assert.Equal(t, uint64(kdaTransferLen), gasLeft-metering.GasLeft())
+}
+
+func TestReadKDATransfers_FixAuditV6Off_KeepsLegacyCharge(t *testing.T) {
+	t.Parallel()
+
+	const numRecords, tokenLen = 4, 8
+	const gasLeft = uint64(1_000_000_000)
+	mockManagedTypes, clones := kdaTransfersRepeatedHandleMock(numRecords, tokenLen)
+	metering := kdaTransfersMetering(gasLeft)
+	var charged []uint64
+	metering.UseAndTraceGasCalled = func(gas uint64) {
+		charged = append(charged, gas)
+	}
+
+	res, err := readKDATransfers(kdaTransfersHost(mockManagedTypes, metering, false), 1)
+
+	assert.Nil(t, err)
+	assert.Len(t, res, numRecords)
+	assert.Equal(t, numRecords, *clones)
+	// nothing went through the bounded charge, which would have deducted from gasLeft
+	assert.Equal(t, gasLeft, metering.GasLeft())
+	assert.Equal(t, []uint64{numRecords * kdaTransferLen, tokenLen, tokenLen, tokenLen, tokenLen}, charged)
+}
+
+func TestReadKDATransfers_FixAuditV6_TooManyRecordsForTheGasLeft(t *testing.T) {
+	t.Parallel()
+
+	const numRecords = 1000
+	const vecLen = numRecords * kdaTransferLen
+	mockManagedTypes, clones := kdaTransfersRepeatedHandleMock(numRecords, 3)
+	metering := kdaTransfersMetering(vecLen + numRecords*kdaTransfersTransferValue - 1)
+
+	res, err := readKDATransfers(kdaTransfersHost(mockManagedTypes, metering, true), 1)
+
+	assert.Equal(t, vmhost.ErrNotEnoughGas, err)
+	assert.Nil(t, res)
+	assert.Equal(t, 0, *clones)
+	// only the vector was paid for, and the check itself charges nothing
+	assert.Equal(t, uint64(numRecords*kdaTransfersTransferValue-1), metering.GasLeft())
+}
+
+func TestReadKDATransfers_FixAuditV6_OneGasBudget(t *testing.T) {
+	t.Parallel()
+
+	const numRecords, tokenLen = 4, 3
+	const vecLen = numRecords * kdaTransferLen
+	const transfersGas = numRecords * kdaTransfersTransferValue
+
+	// the bounded byte charges and the TransferValue check draw on the same balance, one gas per byte
+	newFixture := func(gasLeft uint64) (*mock.VMHostMock, *mock.MeteringContextMock, *int) {
+		mockManagedTypes, clones := kdaTransfersRepeatedHandleMock(numRecords, tokenLen)
+		metering := kdaTransfersMetering(gasLeft)
+		return kdaTransfersHost(mockManagedTypes, metering, true), metering, clones
+	}
+
+	t.Run("enough for the bytes and every transfer decodes and leaves the transfers' gas", func(t *testing.T) {
+		t.Parallel()
+
+		host, metering, clones := newFixture(vecLen + numRecords*tokenLen + transfersGas)
+
+		res, err := readKDATransfers(host, 1)
+
+		require.Nil(t, err)
+		require.Len(t, res, numRecords)
+		require.Equal(t, numRecords, *clones)
+		// the check charges nothing: TransferValue is charged later, by the transfer itself
+		require.Equal(t, uint64(transfersGas), metering.GasLeft())
+	})
+
+	t.Run("the check sees the balance after the vector charge", func(t *testing.T) {
+		t.Parallel()
+
+		// enough for every transfer before the vector is paid for, one short after
+		host, metering, clones := newFixture(vecLen + transfersGas - 1)
+
+		res, err := readKDATransfers(host, 1)
+
+		require.Equal(t, vmhost.ErrNotEnoughGas, err)
+		require.Nil(t, res)
+		require.Zero(t, *clones)
+		require.Equal(t, uint64(transfersGas-1), metering.GasLeft())
+	})
+}
+
+func TestReadKDATransfers_FixAuditV6_VectorAboveTheCap(t *testing.T) {
+	t.Parallel()
+
+	const gasLeft = uint64(1_000_000_000)
+	mockManagedTypes, clones := kdaTransfersRepeatedHandleMock(1, 3)
+	mockManagedTypes.GetLengthCalled = func(handle int32) int32 {
+		return vmhost.MaxTotalArgumentsBytes + kdaTransferLen
+	}
+	vecReads := 0
+	getBytes := mockManagedTypes.GetBytesCalled
+	mockManagedTypes.GetBytesCalled = func(handle int32) ([]byte, error) {
+		vecReads++
+		return getBytes(handle)
+	}
+	metering := kdaTransfersMetering(gasLeft)
+
+	res, err := readKDATransfers(kdaTransfersHost(mockManagedTypes, metering, true), 1)
+
+	require.Equal(t, vmhost.ErrManagedBufferLengthExceedsMaximum, err)
+	require.Nil(t, res)
+	require.Zero(t, vecReads)
+	require.Zero(t, *clones)
+	require.Equal(t, gasLeft, metering.GasLeft())
+}
+
+// Every readKDATransfers case on both sides of the fork. Pre-fork each buffer is cloned and then
+// charged through UseAndTraceGas, which the mock only records; post-fork it is charged, bounded,
+// before it is cloned, which deducts from gasLeft. charged adds the two, so an honest vector is
+// seen to cost the same on both sides.
+func TestReadKDATransfers_PreForkVersusPostFork(t *testing.T) {
+	t.Parallel()
+
+	const numRecords, tokenLen = 4, 8
+	const vecLen = numRecords * kdaTransferLen
+	const gasLeft = uint64(1_000_000_000)
+
+	type outcome struct {
+		err       error
+		transfers int
+		charged   uint64
+		clones    int
+	}
+
+	run := func(fixAuditV6 bool, adjust func(*hostmock.ManagedTypesContextMock)) outcome {
+		mockManagedTypes, clones := kdaTransfersRepeatedHandleMock(numRecords, tokenLen)
+		if adjust != nil {
+			adjust(mockManagedTypes)
+		}
+		metering := kdaTransfersMetering(gasLeft)
+		traced := uint64(0)
+		metering.UseAndTraceGasCalled = func(gas uint64) { traced += gas }
+
+		res, err := readKDATransfers(kdaTransfersHost(mockManagedTypes, metering, fixAuditV6), 1)
+
+		return outcome{err: err, transfers: len(res), charged: traced + gasLeft - metering.GasLeft(), clones: *clones}
+	}
+
+	missingVector := func(m *hostmock.ManagedTypesContextMock) {
+		m.GetLengthCalled = func(int32) int32 { return -1 }
+		m.GetBytesCalled = func(int32) ([]byte, error) { return nil, vmhost.ErrNoManagedBufferUnderThisHandle }
+	}
+	missingToken := func(m *hostmock.ManagedTypesContextMock) {
+		getLength, getBytes := m.GetLengthCalled, m.GetBytesCalled
+		m.GetLengthCalled = func(handle int32) int32 {
+			if handle != 1 {
+				return -1
+			}
+			return getLength(handle)
+		}
+		m.GetBytesCalled = func(handle int32) ([]byte, error) {
+			if handle != 1 {
+				return nil, vmhost.ErrNoManagedBufferUnderThisHandle
+			}
+			return getBytes(handle)
+		}
+	}
+	// reports a vector above the cap while serving the same small one, so only the length check differs
+	vectorAboveTheCap := func(m *hostmock.ManagedTypesContextMock) {
+		getLength := m.GetLengthCalled
+		m.GetLengthCalled = func(handle int32) int32 {
+			if handle == 1 {
+				return vmhost.MaxTotalArgumentsBytes + kdaTransferLen
+			}
+			return getLength(handle)
+		}
+	}
+
+	honest := outcome{transfers: numRecords, charged: vecLen + numRecords*tokenLen, clones: numRecords}
+
+	cases := []struct {
+		name     string
+		adjust   func(*hostmock.ManagedTypesContextMock)
+		preFork  outcome
+		postFork outcome
+	}{
+		{
+			name:     "an honest vector decodes for the same gas",
+			preFork:  honest,
+			postFork: honest,
+		},
+		{
+			name:     "a missing vector fails the same way and charges nothing",
+			adjust:   missingVector,
+			preFork:  outcome{err: vmhost.ErrNoManagedBufferUnderThisHandle},
+			postFork: outcome{err: vmhost.ErrNoManagedBufferUnderThisHandle},
+		},
+		{
+			name:     "a missing token identifier fails the same way after the vector is paid for",
+			adjust:   missingToken,
+			preFork:  outcome{err: vmhost.ErrNoManagedBufferUnderThisHandle, charged: vecLen},
+			postFork: outcome{err: vmhost.ErrNoManagedBufferUnderThisHandle, charged: vecLen},
+		},
+		{
+			name:     "a vector above the cap is still decoded pre-fork and rejected post-fork before anything is charged",
+			adjust:   vectorAboveTheCap,
+			preFork:  honest,
+			postFork: outcome{err: vmhost.ErrManagedBufferLengthExceedsMaximum},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, tc.preFork, run(false, tc.adjust), "pre-fork")
+			require.Equal(t, tc.postFork, run(true, tc.adjust), "post-fork")
+		})
+	}
 }
 
 func TestWriteKDATransfers(t *testing.T) {
@@ -1012,7 +1378,8 @@ func TestReadDestinationArguments(t *testing.T) {
 		},
 	}
 	host := &mock.VMHostMock{
-		ManagedTypesContext: mockManagedTypes,
+		ForkControllerContext: &commonMock.ForkControllerStub{},
+		ManagedTypesContext:   mockManagedTypes,
 		MeteringContext: &mock.MeteringContextMock{
 			GasCost: &config.GasCost{},
 		},
@@ -1058,7 +1425,8 @@ func TestReadDestinationFunctionArguments(t *testing.T) {
 		},
 	}
 	host := &mock.VMHostMock{
-		ManagedTypesContext: mockManagedTypes,
+		ForkControllerContext: &commonMock.ForkControllerStub{},
+		ManagedTypesContext:   mockManagedTypes,
 		MeteringContext: &mock.MeteringContextMock{
 			GasCost: &config.GasCost{},
 		},
@@ -1096,6 +1464,45 @@ func TestReadDestinationFunctionArguments(t *testing.T) {
 	assert.Nil(t, input)
 }
 
+func TestReadDestinationArguments_FixAuditV6_ChargesDecodedArgumentsOnce(t *testing.T) {
+	t.Parallel()
+
+	const dataCopyPerByte = 50
+	const actualLen = uint64(9)
+
+	charged := func(fixAuditV6 bool) []uint64 {
+		var charges []uint64
+		host := &mock.VMHostMock{
+			ForkControllerContext: &commonMock.ForkControllerStub{FixAuditChangesV6Value: fixAuditV6},
+			ManagedTypesContext: &hostmock.ManagedTypesContextMock{
+				GetBytesCalled: func(handle int32) ([]byte, error) {
+					return []byte("destination"), nil
+				},
+				ReadManagedVecOfManagedBuffersCalled: func(managedVecHandle int32) ([][]byte, uint64, error) {
+					return [][]byte{[]byte("arguments")}, actualLen, nil
+				},
+			},
+			MeteringContext: &mock.MeteringContextMock{
+				GasCost: &config.GasCost{BaseOperationCost: config.BaseOperationCost{DataCopyPerByte: dataCopyPerByte}},
+				UseAndTraceGasCalled: func(gas uint64) {
+					charges = append(charges, gas)
+				},
+			},
+		}
+
+		input, err := readDestinationArguments(host, 1, 2)
+		require.NoError(t, err)
+		require.Equal(t, [][]byte{[]byte("arguments")}, input.arguments)
+
+		return charges
+	}
+
+	// pre-fork the decoded bytes are charged a second time on top of the decode's own charge
+	require.Equal(t, []uint64{dataCopyPerByte * actualLen}, charged(false))
+	// post-fork the decode's charge is the only one
+	require.Empty(t, charged(true))
+}
+
 func TestReadDestinationValueArguments(t *testing.T) {
 	t.Parallel()
 	mockManagedTypes := &hostmock.ManagedTypesContextMock{
@@ -1111,7 +1518,8 @@ func TestReadDestinationValueArguments(t *testing.T) {
 	}
 
 	host := &mock.VMHostMock{
-		ManagedTypesContext: mockManagedTypes,
+		ForkControllerContext: &commonMock.ForkControllerStub{},
+		ManagedTypesContext:   mockManagedTypes,
 		MeteringContext: &mock.MeteringContextMock{
 			GasCost: &config.GasCost{},
 		},
@@ -1163,7 +1571,8 @@ func TestReadDestinationValueFunctionArguments(t *testing.T) {
 		},
 	}
 	host := &mock.VMHostMock{
-		ManagedTypesContext: mockManagedTypes,
+		ForkControllerContext: &commonMock.ForkControllerStub{},
+		ManagedTypesContext:   mockManagedTypes,
 		MeteringContext: &mock.MeteringContextMock{
 			GasCost: &config.GasCost{},
 		},
@@ -1200,4 +1609,134 @@ func TestReadDestinationValueFunctionArguments(t *testing.T) {
 	input, err = readDestinationValueFunctionArguments(host, 1, 2, 3, 4)
 	assert.Equal(t, mockError, err)
 	assert.Nil(t, input)
+}
+
+func TestReadDestinationFunctionArguments_FixAuditV6_FunctionNameLength(t *testing.T) {
+	t.Parallel()
+
+	const destHandle, functionHandle, argumentsHandle = int32(1), int32(2), int32(3)
+
+	readers := map[string]func(host vmhost.VMHost) (*vmInputData, error){
+		"readDestinationFunctionArguments": func(host vmhost.VMHost) (*vmInputData, error) {
+			return readDestinationFunctionArguments(host, destHandle, functionHandle, argumentsHandle)
+		},
+		"readDestinationValueFunctionArguments": func(host vmhost.VMHost) (*vmInputData, error) {
+			return readDestinationValueFunctionArguments(host, destHandle, 4, functionHandle, argumentsHandle)
+		},
+	}
+	cases := []struct {
+		name          string
+		fixAuditV6    bool
+		nameLen       int
+		expectedError error
+	}{
+		{name: "post-fork, the longest valid name is read", fixAuditV6: true, nameLen: vmhost.MaxFunctionNameLength - 1},
+		{name: "post-fork, a name at the limit is rejected before anything is read", fixAuditV6: true, nameLen: vmhost.MaxFunctionNameLength, expectedError: vmhost.ErrInvalidFunctionName},
+		{name: "pre-fork, a name at the limit is still read", fixAuditV6: false, nameLen: vmhost.MaxFunctionNameLength},
+	}
+
+	for readerName, read := range readers {
+		for _, tc := range cases {
+			t.Run(readerName+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				function := bytes.Repeat([]byte{'f'}, tc.nameLen)
+				reads := 0
+				mockManagedTypes := &hostmock.ManagedTypesContextMock{
+					GetLengthCalled: func(handle int32) int32 {
+						if handle == functionHandle {
+							return int32(len(function))
+						}
+						return -1
+					},
+					GetBytesCalled: func(handle int32) ([]byte, error) {
+						reads++
+						if handle == functionHandle {
+							return function, nil
+						}
+						return []byte("destination"), nil
+					},
+					GetBigIntCalled: func(handle int32) (*big.Int, error) {
+						return big.NewInt(10), nil
+					},
+					ReadManagedVecOfManagedBuffersCalled: func(managedVecHandle int32) ([][]byte, uint64, error) {
+						reads++
+						return [][]byte{[]byte("arguments")}, 1, nil
+					},
+				}
+				host := &mock.VMHostMock{
+					ForkControllerContext: &commonMock.ForkControllerStub{FixAuditChangesV6Value: tc.fixAuditV6},
+					ManagedTypesContext:   mockManagedTypes,
+					MeteringContext:       &mock.MeteringContextMock{GasCost: &config.GasCost{}},
+				}
+
+				input, err := read(host)
+
+				require.Equal(t, tc.expectedError, err)
+				if tc.expectedError != nil {
+					require.Nil(t, input)
+					require.Zero(t, reads)
+					return
+				}
+				require.Equal(t, string(function), input.function)
+			})
+		}
+	}
+}
+
+func TestReadDestinationArguments_FixAuditV6_DestinationLength(t *testing.T) {
+	t.Parallel()
+
+	const destHandle, argumentsHandle = int32(1), int32(3)
+
+	cases := []struct {
+		name          string
+		fixAuditV6    bool
+		destLen       int
+		expectedError error
+	}{
+		{name: "post-fork, an address is read", fixAuditV6: true, destLen: vmhost.AddressLen},
+		{name: "post-fork, a destination longer than an address is rejected before anything is read", fixAuditV6: true, destLen: vmhost.AddressLen + 1, expectedError: vmhost.ErrInvalidArgument},
+		{name: "pre-fork, a destination longer than an address is still read", fixAuditV6: false, destLen: vmhost.AddressLen + 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			destination := bytes.Repeat([]byte{'d'}, tc.destLen)
+			reads := 0
+			mockManagedTypes := &hostmock.ManagedTypesContextMock{
+				GetLengthCalled: func(handle int32) int32 {
+					if handle == destHandle {
+						return int32(len(destination))
+					}
+					return -1
+				},
+				GetBytesCalled: func(handle int32) ([]byte, error) {
+					reads++
+					return destination, nil
+				},
+				ReadManagedVecOfManagedBuffersCalled: func(managedVecHandle int32) ([][]byte, uint64, error) {
+					reads++
+					return [][]byte{[]byte("arguments")}, 1, nil
+				},
+			}
+			host := &mock.VMHostMock{
+				ForkControllerContext: &commonMock.ForkControllerStub{FixAuditChangesV6Value: tc.fixAuditV6},
+				ManagedTypesContext:   mockManagedTypes,
+				MeteringContext:       &mock.MeteringContextMock{GasCost: &config.GasCost{}},
+			}
+
+			input, err := readDestinationArguments(host, destHandle, argumentsHandle)
+
+			require.Equal(t, tc.expectedError, err)
+			if tc.expectedError != nil {
+				require.Nil(t, input)
+				require.Zero(t, reads)
+				return
+			}
+			require.Equal(t, destination, input.destination)
+		})
+	}
 }

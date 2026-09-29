@@ -95,7 +95,7 @@ const (
 	DeployContract
 )
 const maxNumArgumentsFromMemory = 16000000
-const maxTotalArgumentsBytes = 16000000
+const maxTotalArgumentsBytes = vmhost.MaxTotalArgumentsBytes
 const maxNumTopics = 16000000
 
 var logEEI = logger.GetOrCreate("vm/eei")

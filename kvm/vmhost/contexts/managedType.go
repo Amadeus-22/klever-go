@@ -778,6 +778,10 @@ func (context *managedTypesContext) InsertSlice(mBufferHandle int32, startPositi
 func (context *managedTypesContext) ReadManagedVecOfManagedBuffers(
 	managedVecHandle int32,
 ) ([][]byte, uint64, error) {
+	if context.host.ForkController().FixAuditChangesV6() {
+		return context.readManagedVecOfManagedBuffersBounded(managedVecHandle)
+	}
+
 	managedVecBytes, err := context.GetBytes(managedVecHandle)
 	if err != nil {
 		return nil, 0, err
@@ -801,6 +805,72 @@ func (context *managedTypesContext) ReadManagedVecOfManagedBuffers(
 		context.ConsumeGasForBytes(itemBytes)
 
 		sumOfItemByteLengths += uint64(len(itemBytes))
+		result = append(result, itemBytes)
+	}
+
+	return result, sumOfItemByteLengths, nil
+}
+
+// readManagedVecOfManagedBuffersBounded is ReadManagedVecOfManagedBuffers once FixAuditChangesV6
+// is active. The vector and the items are charged, bounded, before anything is cloned, and the
+// items' total length is capped, so a vector that repeats one large handle can no longer clone it
+// once per occurrence whatever the gas left. It charges the same gas as the legacy path, so an
+// honest call costs the same. Every item handle is checked before the first item clone, so a
+// missing one fails without doing any work.
+func (context *managedTypesContext) readManagedVecOfManagedBuffersBounded(
+	managedVecHandle int32,
+) ([][]byte, uint64, error) {
+	vecLen := context.GetLength(managedVecHandle)
+	if vecLen < 0 {
+		return nil, 0, vmhost.ErrNoManagedBufferUnderThisHandle
+	}
+	// the gas already bounds the vector well below the cap; the cap keeps that true whatever the schedule
+	if vecLen > vmhost.MaxTotalArgumentsBytes {
+		return nil, 0, vmhost.ErrManagedBufferLengthExceedsMaximum
+	}
+	// #nosec G115
+	err := context.ConsumeGasForByteLenBounded(uint64(vecLen))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	managedVecBytes, err := context.GetBytes(managedVecHandle)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(managedVecBytes)%handleLen != 0 {
+		return nil, 0, errors.New("invalid managed vector of managed buffer handles")
+	}
+
+	numBuffers := len(managedVecBytes) / handleLen
+	sumOfItemByteLengths := uint64(0)
+	for i := 0; i < len(managedVecBytes); i += handleLen {
+		itemHandle := int32(binary.BigEndian.Uint32(managedVecBytes[i : i+handleLen])) // #nosec G115
+		itemLen := context.GetLength(itemHandle)
+		if itemLen < 0 {
+			return nil, 0, vmhost.ErrNoManagedBufferUnderThisHandle
+		}
+
+		// #nosec G115
+		sumOfItemByteLengths += uint64(itemLen)
+		// the same cap the arguments read from wasm memory are held to
+		if sumOfItemByteLengths > vmhost.MaxTotalArgumentsBytes {
+			return nil, 0, vmhost.ErrManagedBufferLengthExceedsMaximum
+		}
+	}
+
+	err = context.ConsumeGasForByteLenBounded(sumOfItemByteLengths)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	result := make([][]byte, 0, numBuffers)
+	for i := 0; i < len(managedVecBytes); i += handleLen {
+		itemHandle := int32(binary.BigEndian.Uint32(managedVecBytes[i : i+handleLen])) // #nosec G115
+		itemBytes, err := context.GetBytes(itemHandle)
+		if err != nil {
+			return nil, 0, err
+		}
 		result = append(result, itemBytes)
 	}
 

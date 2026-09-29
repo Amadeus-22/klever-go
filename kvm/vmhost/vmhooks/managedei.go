@@ -135,24 +135,38 @@ func (context *VMHooksImpl) ManagedWriteLog(
 	metering := context.GetMeteringContext()
 	managedType := context.GetManagedTypesContext()
 	metering.StartGasTracing(managedWriteLogName)
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
 
 	topics, sumOfTopicByteLengths, err := managedType.ReadManagedVecOfManagedBuffers(topicsHandle)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
 	}
 
+	// post-fork the data is paid, bounded, before it is cloned
+	if fixAuditV6 {
+		err = consumeGasForBufferLenBounded(managedType, dataHandle)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return
+		}
+	}
 	dataBytes, err := managedType.GetBytes(dataHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return
 	}
-	managedType.ConsumeGasForBytes(dataBytes)
+	if !fixAuditV6 {
+		managedType.ConsumeGasForBytes(dataBytes)
+	}
 	dataByteLen := uint64(len(dataBytes))
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.Log
-	gasForData := math.MulUint64(
-		metering.GasSchedule().BaseOperationCost.DataCopyPerByte,
-		sumOfTopicByteLengths+dataByteLen)
-	gasToUse = math.AddUint64(gasToUse, gasForData)
+	// pre-fork the topics and the data were charged per byte a second time here, on top of the
+	// copies already charged above; post-fork each byte is paid once, as in WriteEventLog
+	if !fixAuditV6 {
+		gasForData := math.MulUint64(
+			metering.GasSchedule().BaseOperationCost.DataCopyPerByte,
+			sumOfTopicByteLengths+dataByteLen)
+		gasToUse = math.AddUint64(gasToUse, gasForData)
+	}
 	metering.UseAndTraceGas(gasToUse)
 
 	output.WriteLog(runtime.GetContextAddress(), topics, [][]byte{dataBytes})
@@ -677,6 +691,12 @@ func ManagedDeleteContractWithHost(
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.CreateContract
 	metering.UseAndTraceGas(gasToUse)
 
+	// the destination is an address; post-fork a longer one is rejected before it is cloned
+	err := checkMBufferMaxLength(host, destHandle, vmhost.ErrInvalidArgument, vmhost.AddressLen)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
+
 	calledSCAddress, err := managedType.GetBytes(destHandle)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
@@ -776,8 +796,12 @@ func (context *VMHooksImpl) ManagedCreateContract(
 		return 1
 	}
 
-	gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, actualLen)
-	metering.UseAndTraceGas(gasToUse)
+	// pre-fork the arguments were charged per byte a second time here, on top of the decode;
+	// post-fork the decode's charge is the only one
+	if !host.ForkController().FixAuditChangesV6() {
+		gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, actualLen)
+		metering.UseAndTraceGas(gasToUse)
+	}
 
 	codeMetadata, err := managedType.GetBytes(codeMetadataHandle)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
@@ -918,7 +942,6 @@ func (context *VMHooksImpl) ManagedMultiTransferKDANFTExecute(
 	argumentsHandle int32,
 ) int32 {
 	host := context.GetVMHost()
-	managedType := host.ManagedTypes()
 	runtime := host.Runtime()
 	metering := host.Metering()
 	metering.StartGasTracing(managedMultiTransferKDANFTExecuteName)
@@ -928,7 +951,7 @@ func (context *VMHooksImpl) ManagedMultiTransferKDANFTExecute(
 		return -1
 	}
 
-	transfers, err := readKDATransfers(managedType, tokenTransfersHandle)
+	transfers, err := readKDATransfers(host, tokenTransfersHandle)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}

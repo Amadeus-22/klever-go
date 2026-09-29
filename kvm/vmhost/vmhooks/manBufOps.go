@@ -49,19 +49,26 @@ func consumeGasForBuffersBounded(host vmhost.VMHost, mBufferHandles ...int32) er
 
 	managedType := host.ManagedTypes()
 	for _, mBufferHandle := range mBufferHandles {
-		length := managedType.GetLength(mBufferHandle)
-		if length <= 0 {
-			continue
-		}
-
-		// #nosec G115
-		err := managedType.ConsumeGasForByteLenBounded(uint64(length))
+		err := consumeGasForBufferLenBounded(managedType, mBufferHandle)
 		if err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// consumeGasForBufferLenBounded charges the per-byte copy of the buffer at mBufferHandle before
+// it is cloned, returning ErrNotEnoughGas instead of overdrawing. A missing handle charges
+// nothing and is left for the following GetBytes to report.
+func consumeGasForBufferLenBounded(managedType vmhost.ManagedTypesContext, mBufferHandle int32) error {
+	length := managedType.GetLength(mBufferHandle)
+	if length <= 0 {
+		return nil
+	}
+
+	// #nosec G115
+	return managedType.ConsumeGasForByteLenBounded(uint64(length))
 }
 
 // validateCappedLength rejects a caller-supplied length that is negative or above the
