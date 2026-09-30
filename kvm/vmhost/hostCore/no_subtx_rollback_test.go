@@ -23,8 +23,8 @@ import (
 //
 // Most tests also record the balances while the call is still running. They show the transfer is
 // still settled after the sub-call failed, which is why the abort matters. If sub-call rollback is
-// ever added, those in-flight assertions are expected to change; the output-state rollback of
-// KLC-2687 has to land with it, or a contract could observe a transfer that was reverted.
+// ever added, those in-flight assertions are expected to change. The output state already rolls
+// back with a failed transfer-and-execute (KLC-2687, transfer_execute_output_state_test.go).
 
 const (
 	noRollbackKDAAmount      = int64(1000)
@@ -34,6 +34,8 @@ const (
 	noRollbackFailingMethod  = "fail"
 	noRollbackPayingMethod   = "payThenFail"
 	noRollbackAcceptMethod   = "accept"
+	noRollbackPayOutMethod   = "payOut"
+	noRollbackPayUnfunded    = "payUnfunded"
 	noRollbackCallerFunction = "callChild"
 )
 
@@ -73,7 +75,9 @@ func balancesOf(t *testing.T, world *worldmock.MockWorld, token []byte) balances
 }
 
 // childMethods gives the child a method that fails outright, one that first pays the third party
-// out of the account it runs as and then fails, and one that succeeds without doing anything.
+// out of the account it runs as and then fails, one that succeeds without doing anything, one that
+// pays the parent back through a transfer-and-execute with no follow-up call, and one whose payback
+// fails because the child holds none of the token.
 func childMethods(t *testing.T) func(*mock.InstanceMock, interface{}) {
 	return func(instance *mock.InstanceMock, _ interface{}) {
 		instance.AddMockMethod(noRollbackAcceptMethod, func() *mock.InstanceMock {
@@ -81,6 +85,22 @@ func childMethods(t *testing.T) func(*mock.InstanceMock, interface{}) {
 		})
 		instance.AddMockMethod(noRollbackFailingMethod, func() *mock.InstanceMock {
 			instance.Host.Runtime().SignalUserError("child failed")
+			return instance
+		})
+		instance.AddMockMethod(noRollbackPayOutMethod, func() *mock.InstanceMock {
+			transfer := &vmcommon.KDATransfer{
+				KDAValue:     big.NewInt(noRollbackKLVAmount),
+				KDATokenName: kdautils.KLVIdentifier,
+			}
+			vmhooks.TransferKDANFTExecuteWithTypedArgs(instance.Host, test.ParentAddress, []*vmcommon.KDATransfer{transfer}, 0, nil, nil)
+			return instance
+		})
+		instance.AddMockMethod(noRollbackPayUnfunded, func() *mock.InstanceMock {
+			transfer := &vmcommon.KDATransfer{
+				KDAValue:     big.NewInt(1),
+				KDATokenName: []byte("UNFUNDED-0000"),
+			}
+			vmhooks.TransferKDANFTExecuteWithTypedArgs(instance.Host, test.ParentAddress, []*vmcommon.KDATransfer{transfer}, 0, nil, nil)
 			return instance
 		})
 		instance.AddMockMethod(noRollbackPayingMethod, func() *mock.InstanceMock {
@@ -121,6 +141,8 @@ func runSubCall(
 			test.CreateMockContract(test.ParentAddress).
 				WithBalance(testConfig.ParentBalance).
 				WithConfig(testConfig).
+				// the child's payOut pays the parent back without a follow-up call
+				WithCodeMetadata((&vmcommon.CodeMetadata{PayableBySC: true}).ToBytes()).
 				WithMethods(func(instance *mock.InstanceMock, _ interface{}) {
 					instance.AddMockMethod(noRollbackCallerFunction, func() *mock.InstanceMock {
 						returnCode = callerBody(instance.Host)
@@ -141,6 +163,7 @@ func runSubCall(
 		WithSetup(func(host vmhost.VMHost, mockWorld *worldmock.MockWorld) {
 			world = mockWorld
 			setupNoRollbackHost(t, host, mockWorld)
+			recordTransferReceipts(t, mockWorld)
 
 			caller, err := mockWorld.AccountsCacher.LoadUser(test.ParentAddress)
 			require.NoError(t, err)
@@ -183,14 +206,7 @@ func Test_NoSubTxRollback_TransferKDANFTExecute(t *testing.T) {
 			KDATokenName: test.KDATestTokenName,
 		}
 
-		return vmhooks.TransferKDANFTExecuteWithTypedArgs(
-			host,
-			test.ChildAddress,
-			[]*vmcommon.KDATransfer{transfer},
-			noRollbackFollowUpGas,
-			[]byte(noRollbackFailingMethod),
-			nil,
-		)
+		return transferToChildAndCall(host, []*vmcommon.KDATransfer{transfer}, noRollbackFailingMethod)
 	})
 
 	require.Equal(t, int32(1), returnCode)
@@ -243,14 +259,7 @@ func multiTransferThenAccept(secondToken []byte) func(host vmhost.VMHost) int32 
 			{KDAValue: big.NewInt(1), KDATokenName: secondToken},
 		}
 
-		return vmhooks.TransferKDANFTExecuteWithTypedArgs(
-			host,
-			test.ChildAddress,
-			transfers,
-			noRollbackFollowUpGas,
-			[]byte(noRollbackAcceptMethod),
-			nil,
-		)
+		return transferToChildAndCall(host, transfers, noRollbackAcceptMethod)
 	}
 }
 

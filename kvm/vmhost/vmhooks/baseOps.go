@@ -615,8 +615,18 @@ func TransferKDANFTExecuteWithTypedArgs(
 		Sender:         sender,
 		Transfers:      transfers,
 	}
+	// The transfer records itself in the output state. If it or the follow-up call fails, restore
+	// the output as if neither happened, so no contract can observe a transfer that was not kept
+	// (KLC-2687). The balances are not restored here: the transfer is already settled and nothing
+	// below the transaction undoes it, so failing the whole execution is what rolls it back
+	// (KLC-2686). Restore before faulting, because the fault writes the return code into the
+	// output state.
+	output.PushState()
+
 	gasLimitForExec, executeErr := output.TransferKDA(transfersArgs, contractCallInput)
-	if WithFaultAndHost(host, executeErr, runtime.BaseOpsErrorShouldFailExecution()) {
+	if executeErr != nil {
+		output.PopSetActiveState()
+		WithFaultAndHost(host, executeErr, runtime.BaseOpsErrorShouldFailExecution())
 		return 1
 	}
 
@@ -626,13 +636,13 @@ func TransferKDANFTExecuteWithTypedArgs(
 		_, executeErr := executeOnDestContextFromAPI(host, contractCallInput)
 		if executeErr != nil {
 			logEEI.Trace("KDA post-transfer execution failed", "error", executeErr)
+			output.PopSetActiveState()
 			WithFaultAndHost(host, executeErr, runtime.BaseOpsErrorShouldFailExecution())
 			return 1
 		}
-
-		return 0
 	}
 
+	output.PopDiscard()
 	return 0
 }
 
