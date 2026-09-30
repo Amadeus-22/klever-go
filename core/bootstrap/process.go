@@ -397,7 +397,7 @@ func (e *epochStartBootstrap) Bootstrap() (Parameters, error) {
 		return Parameters{}, err
 	}
 
-	e.prevEpochStartMeta, err = e.epochStartMetaBlockSyncer.SyncPrevEpochStartMeta(timeToWait, e.epochStartMeta.GetEpoch()-1)
+	e.prevEpochStartMeta, err = syncPrevEpochStartMeta(e.epochStartMetaBlockSyncer, e.epochStartMeta, timeToWait)
 	if err != nil {
 		return Parameters{}, err
 	}

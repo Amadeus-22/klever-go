@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"maps"
 	"math"
 	"sync"
 	"time"
@@ -20,8 +21,19 @@ const durationBetweenReRequests = 1 * time.Second
 const durationBetweenCheckingNumConnectedPeers = 500 * time.Millisecond
 const minNumPeersToConsiderMetaBlockValid = 1
 const minNumConnectedPeers = 1
+const logFromPeer = "from peer"
 
 var _ process.InterceptorProcessor = (*epochStartBlockProcessor)(nil)
+
+// metaBlockVote is the latest epoch start metablock a peer delivered. The header hash identifies
+// the block; the hash of the whole metablock also covers the signatures, transaction hashes and
+// results, which the header hash leaves out. Both the header and the copy returned need the
+// quorum.
+type metaBlockVote struct {
+	headerHash string
+	blockHash  string
+	metaBlock  *block.Block
+}
 
 type epochStartBlockProcessor struct {
 	messenger                         Messenger
@@ -29,11 +41,11 @@ type epochStartBlockProcessor struct {
 	marshalizer                       marshal.Marshalizer
 	hasher                            hashing.Hasher
 	mutReceivedMetaBlocks             sync.RWMutex
-	mapReceivedMetaBlocks             map[string]*block.Block
-	mapMetaBlocksFromPeers            map[string][]core.PeerID
-	chanConsensusReached              chan bool
-	metaBlock                         *block.Block
-	peerCountTarget                   int
+	mapVotes                          map[core.PeerID]metaBlockVote
+	expectedEpoch                     uint32
+	hasExpectedEpoch                  bool
+	startPeerCountFloor               int
+	consensusPercentage               int
 	minNumConnectedPeers              int
 	minNumOfPeersToConsiderBlockValid int
 }
@@ -75,21 +87,26 @@ func NewEpochStartBlockProcessor(
 		requestHandler:                    handler,
 		marshalizer:                       marshalizer,
 		hasher:                            hasher,
+		consensusPercentage:               int(consensusPercentage),
 		minNumConnectedPeers:              minNumConnectedPeersConfig,
 		minNumOfPeersToConsiderBlockValid: minNumOfPeersToConsiderBlockValidConfig,
 		mutReceivedMetaBlocks:             sync.RWMutex{},
-		mapReceivedMetaBlocks:             make(map[string]*block.Block),
-		mapMetaBlocksFromPeers:            make(map[string][]core.PeerID),
-		chanConsensusReached:              make(chan bool, 1),
+		mapVotes:                          make(map[core.PeerID]metaBlockVote),
 	}
 
 	processor.waitForEnoughNumConnectedPeers(messenger)
-	percentage := float64(consensusPercentage) / 100.0
-	peerCountTarget := int(percentage * float64(len(messenger.ConnectedPeers())))
-	processor.peerCountTarget = peerCountTarget
 
-	log.Debug("consensus percentage for epoch start meta block ", "value (%)", consensusPercentage, "peerCountTarget", peerCountTarget)
+	log.Debug("consensus percentage for epoch start meta block ", "value (%)", consensusPercentage,
+		"connected peers", len(messenger.ConnectedPeers()))
 	return processor, nil
+}
+
+// computePeerCountTarget returns how many distinct connected peers must deliver the same
+// metablock for it to be accepted: the consensus percentage of the connected peers, rounded up,
+// and never below minNumOfPeersToConsiderBlockValid. It is recomputed on every check so a
+// target sampled while few peers were connected does not stick.
+func (e *epochStartBlockProcessor) computePeerCountTarget(numConnectedPeers int) int {
+	return max((e.consensusPercentage*numConnectedPeers+99)/100, e.minNumOfPeersToConsiderBlockValid)
 }
 
 // Validate will return nil as there is no need for validation
@@ -133,13 +150,43 @@ func (e *epochStartBlockProcessor) Save(data process.InterceptedData, fromConnec
 		return nil
 	}
 
-	mbHash := interceptedHdr.Hash()
+	log.Debug("received epoch start meta", "epoch", metaBlock.GetEpoch(), logFromPeer, fromConnectedPeer.Pretty())
+	// the peer is the message author: direct sends pin it to the sending peer, and pubsub only
+	// accepts gossip signed by its author's key (StrictSign), so a peer cannot vote under another
+	// peer's ID. A relayed message from a peer we are not connected to could never count, so it
+	// is dropped before it is marshaled and hashed
+	if !e.messenger.IsConnected(fromConnectedPeer) {
+		log.Debug("ignoring epoch start meta from a peer that is not connected", "peer", fromConnectedPeer.Pretty())
+		return nil
+	}
+	metaBlockBuff, err := e.marshalizer.Marshal(metaBlock)
+	if err != nil {
+		log.Debug("ignoring epoch start meta that cannot be marshaled", "error", err)
+		return nil
+	}
 
-	log.Debug("received epoch start meta", "epoch", metaBlock.GetEpoch(), "from peer", fromConnectedPeer.Pretty())
 	e.mutReceivedMetaBlocks.Lock()
-	e.mapReceivedMetaBlocks[string(mbHash)] = metaBlock
-	e.addToPeerList(string(mbHash), fromConnectedPeer)
-	e.mutReceivedMetaBlocks.Unlock()
+	defer e.mutReceivedMetaBlocks.Unlock()
+
+	if e.hasExpectedEpoch && metaBlock.GetEpoch() != e.expectedEpoch {
+		log.Debug("ignoring epoch start meta for another epoch",
+			"epoch", metaBlock.GetEpoch(), "expected", e.expectedEpoch, logFromPeer, fromConnectedPeer.Pretty())
+		return nil
+	}
+
+	// a peer's newer answer replaces its older one. Messages are handled on separate goroutines,
+	// so an older answer can arrive last: a vote only moves to a block at least as new
+	previousVote, voted := e.mapVotes[fromConnectedPeer]
+	if voted && previousVote.metaBlock.GetNonce() > metaBlock.GetNonce() {
+		log.Debug("ignoring an epoch start meta older than the peer's vote",
+			"nonce", metaBlock.GetNonce(), "vote nonce", previousVote.metaBlock.GetNonce(), logFromPeer, fromConnectedPeer.Pretty())
+		return nil
+	}
+	e.mapVotes[fromConnectedPeer] = metaBlockVote{
+		headerHash: string(interceptedHdr.Hash()),
+		blockHash:  string(e.hasher.Compute(string(metaBlockBuff))),
+		metaBlock:  metaBlock,
+	}
 
 	return nil
 }
@@ -149,66 +196,28 @@ func (e *epochStartBlockProcessor) Notify(data process.InterceptedData, fromConn
 	return nil
 }
 
-// this func should be called under mutex protection
-func (e *epochStartBlockProcessor) addToPeerList(hash string, peer core.PeerID) {
-	peersListForHash := e.mapMetaBlocksFromPeers[hash]
-	for _, pid := range peersListForHash {
-		if pid == peer {
-			return
-		}
-	}
-	e.mapMetaBlocksFromPeers[hash] = append(e.mapMetaBlocksFromPeers[hash], peer)
-}
-
 // GetEpochStartBlock will return the metablock after it is confirmed or an error if the number of tries was exceeded
 // This is a blocking method which will end after the consensus for the meta block is obtained or the context is done
 func (e *epochStartBlockProcessor) GetEpochStartBlock(ctx context.Context) (*block.Block, error) {
-	originalIntra, originalCross, err := e.requestHandler.GetNumPeersToQuery(common.BlocksTopic)
-	if err != nil {
-		return nil, err
-	}
+	// votes that arrived before the fetch started are kept
+	e.beginFetch(false, 0)
 
-	defer func() {
-		err = e.requestHandler.SetNumPeersToQuery(common.BlocksTopic, originalIntra, originalCross)
-		if err != nil {
-			log.Warn("epoch bootstrapper: error setting num of peers intra/cross for resolver",
-				"resolver", common.BlocksTopic,
-				"error", err)
-		}
-	}()
-
-	err = e.requestMetaBlock()
-	if err != nil {
-		return nil, err
-	}
-
-	chanRequests := time.After(durationBetweenReRequests)
-	chanCheckMaps := time.After(durationBetweenChecks)
-	for {
-		select {
-		case <-e.chanConsensusReached:
-			return e.metaBlock, nil
-		case <-ctx.Done():
-			return e.getMostReceivedMetaBlock()
-		case <-chanRequests:
-			err = e.requestMetaBlock()
-			if err != nil {
-				return nil, err
-			}
-			chanRequests = time.After(durationBetweenReRequests)
-		case <-chanCheckMaps:
-			e.checkMaps()
-			chanCheckMaps = time.After(durationBetweenChecks)
-		}
-	}
+	return e.fetch(ctx, e.requestMetaBlock)
 }
 
 // GetPrevEpochStartBlock will return the metablock after it is confirmed or an error if the number of tries was exceeded
 // This is a blocking method which will end after the consensus for the meta block is obtained or the context is done
 func (e *epochStartBlockProcessor) GetPrevEpochStartBlock(ctx context.Context, epoch uint32) (*block.Block, error) {
-	e.mapReceivedMetaBlocks = make(map[string]*block.Block, 0)
-	e.mapMetaBlocksFromPeers = make(map[string][]core.PeerID, 0)
+	e.beginFetch(true, epoch)
 
+	return e.fetch(ctx, func() error {
+		return e.requestMetaBlockByEpoch(epoch)
+	})
+}
+
+// fetch sends the request, repeats it every durationBetweenReRequests and checks the votes every
+// durationBetweenChecks until a metablock has the quorum or the context is done
+func (e *epochStartBlockProcessor) fetch(ctx context.Context, request func() error) (*block.Block, error) {
 	originalIntra, originalCross, err := e.requestHandler.GetNumPeersToQuery(common.BlocksTopic)
 	if err != nil {
 		return nil, err
@@ -223,7 +232,7 @@ func (e *epochStartBlockProcessor) GetPrevEpochStartBlock(ctx context.Context, e
 		}
 	}()
 
-	err = e.requestMetaBlockByEpoch(epoch)
+	err = request()
 	if err != nil {
 		return nil, err
 	}
@@ -232,41 +241,136 @@ func (e *epochStartBlockProcessor) GetPrevEpochStartBlock(ctx context.Context, e
 	chanCheckMaps := time.After(durationBetweenChecks)
 	for {
 		select {
-		case <-e.chanConsensusReached:
-			return e.metaBlock, nil
 		case <-ctx.Done():
-			return e.getMostReceivedMetaBlock()
+			// one last check against the same target: there is no weaker fallback, so without
+			// consensus the fetch fails and the bootstrap can be retried
+			return e.getConfirmedMetaBlock()
 		case <-chanRequests:
-			err = e.requestMetaBlock()
+			err = request()
 			if err != nil {
 				return nil, err
 			}
 			chanRequests = time.After(durationBetweenReRequests)
 		case <-chanCheckMaps:
-			e.checkMaps()
+			metaBlock, found := e.checkMaps()
+			if found {
+				return metaBlock, nil
+			}
 			chanCheckMaps = time.After(durationBetweenChecks)
 		}
 	}
 }
 
-func (e *epochStartBlockProcessor) getMostReceivedMetaBlock() (*block.Block, error) {
-	e.mutReceivedMetaBlocks.RLock()
-	defer e.mutReceivedMetaBlocks.RUnlock()
+// beginFetch prepares the state for a fetch in a single critical section, so no Save can land
+// between the steps:
+//   - the previous epoch fetch drops the votes of the latest epoch fetch and makes Save ignore
+//     metablocks for any other epoch, so late answers to the latest request cannot vote
+//   - a strict majority of the peers connected now floors every target of the fetch, so the
+//     peers left after others disconnect cannot decide on their own, while peers that stay can
+//     still meet it after attacker connections drop
+func (e *epochStartBlockProcessor) beginFetch(prevEpoch bool, epoch uint32) {
+	numConnectedPeers := len(uniquePeers(e.messenger.ConnectedPeers()))
 
-	var mostReceivedHash string
-	maxLength := e.minNumOfPeersToConsiderBlockValid - 1
-	for hash, entry := range e.mapMetaBlocksFromPeers {
-		if len(entry) > maxLength {
-			maxLength = len(entry)
-			mostReceivedHash = hash
-		}
+	e.mutReceivedMetaBlocks.Lock()
+	defer e.mutReceivedMetaBlocks.Unlock()
+
+	if prevEpoch {
+		e.mapVotes = make(map[core.PeerID]metaBlockVote)
 	}
+	e.expectedEpoch = epoch
+	e.hasExpectedEpoch = prevEpoch
+	e.startPeerCountFloor = numConnectedPeers/2 + 1
+}
 
-	if len(mostReceivedHash) == 0 {
+func (e *epochStartBlockProcessor) getConfirmedMetaBlock() (*block.Block, error) {
+	metaBlock, found := e.checkMaps()
+	if !found {
 		return nil, common.ErrTimeoutWaitingForBlock
 	}
 
-	return e.mapReceivedMetaBlocks[mostReceivedHash], nil
+	return metaBlock, nil
+}
+
+// selectMetaBlock returns the metablock that won the vote of the connected peers. Each connected
+// peer holds one vote, for the latest metablock it delivered, and peers that are no longer
+// connected hold none. The winning header needs the peer count target, never below a strict
+// majority of the peers connected when the fetch started, and an outright lead. The copy returned
+// needs the same target among that header's voters, so peers pairing the header with forged
+// signatures or transaction data cannot have their copy returned without the quorum. Checking
+// the header first keeps a failed quorum apart from copies of an agreed header that split. A tie
+// at either step selects nothing, so the choice never depends on map iteration order.
+// This func should be called under mutex protection.
+func (e *epochStartBlockProcessor) selectMetaBlock(connectedPeers map[core.PeerID]struct{}) (*block.Block, bool) {
+	target := max(e.computePeerCountTarget(len(connectedPeers)), e.startPeerCountFloor)
+
+	votesPerHeader := make(map[string]int)
+	for pid := range connectedPeers {
+		vote, voted := e.mapVotes[pid]
+		if voted {
+			votesPerHeader[vote.headerHash]++
+		}
+	}
+	headerHash, votes, found := outrightLeader(votesPerHeader)
+	if !found || votes < target {
+		return nil, false
+	}
+
+	votesPerBlock := make(map[string]int)
+	metaBlocks := make(map[string]*block.Block)
+	for pid := range connectedPeers {
+		vote, voted := e.mapVotes[pid]
+		if voted && vote.headerHash == headerHash {
+			votesPerBlock[vote.blockHash]++
+			metaBlocks[vote.blockHash] = vote.metaBlock
+		}
+	}
+	blockHash, blockVotes, found := outrightLeader(votesPerBlock)
+	if !found || blockVotes < target {
+		log.Debug("no copy of the agreed epoch start header has the quorum",
+			"copies", len(votesPerBlock), "votes", blockVotes, "target", target)
+		return nil, false
+	}
+
+	log.Info("got consensus for epoch start metablock", "len", votes, "target", target)
+	return metaBlocks[blockHash], true
+}
+
+// outrightLeader returns the key with the most votes, and found only when no other key has as many
+func outrightLeader(votesPerKey map[string]int) (string, int, bool) {
+	leader := ""
+	votes := 0
+	runnerUpVotes := 0
+	for key, keyVotes := range votesPerKey {
+		switch {
+		case keyVotes > votes:
+			runnerUpVotes = votes
+			votes = keyVotes
+			leader = key
+		case keyVotes > runnerUpVotes:
+			runnerUpVotes = keyVotes
+		}
+	}
+
+	return leader, votes, votes > runnerUpVotes
+}
+
+// dropVotesOfDisconnectedPeers keeps the stored votes bounded by the connected peers; the
+// dropped votes could not count anyway.
+// This func should be called under mutex protection.
+func (e *epochStartBlockProcessor) dropVotesOfDisconnectedPeers(connectedPeers map[core.PeerID]struct{}) {
+	maps.DeleteFunc(e.mapVotes, func(pid core.PeerID, _ metaBlockVote) bool {
+		_, connected := connectedPeers[pid]
+		return !connected
+	})
+}
+
+func uniquePeers(peers []core.PeerID) map[core.PeerID]struct{} {
+	unique := make(map[core.PeerID]struct{}, len(peers))
+	for _, pid := range peers {
+		unique[pid] = struct{}{}
+	}
+
+	return unique
 }
 
 func (e *epochStartBlockProcessor) requestMetaBlock() error {
@@ -292,31 +396,17 @@ func (e *epochStartBlockProcessor) requestMetaBlockByEpoch(epoch uint32) error {
 	return nil
 }
 
-func (e *epochStartBlockProcessor) checkMaps() {
-	e.mutReceivedMetaBlocks.RLock()
-	defer e.mutReceivedMetaBlocks.RUnlock()
+// checkMaps returns the metablock the connected peers agree on, if any. It runs on the fetch
+// loop, which returns the selected block straight away.
+func (e *epochStartBlockProcessor) checkMaps() (*block.Block, bool) {
+	connectedPeers := uniquePeers(e.messenger.ConnectedPeers())
 
-	for hash, peersList := range e.mapMetaBlocksFromPeers {
-		log.Debug("metablock from peers", "num peers", len(peersList), "target", e.peerCountTarget, "hash", []byte(hash))
-		found := e.processEntry(peersList, hash)
-		if found {
-			break
-		}
-	}
-}
+	e.mutReceivedMetaBlocks.Lock()
+	defer e.mutReceivedMetaBlocks.Unlock()
 
-func (e *epochStartBlockProcessor) processEntry(
-	peersList []core.PeerID,
-	hash string,
-) bool {
-	if len(peersList) >= e.peerCountTarget {
-		log.Info("got consensus for epoch start metablock", "len", len(peersList))
-		e.metaBlock = e.mapReceivedMetaBlocks[hash]
-		e.chanConsensusReached <- true
-		return true
-	}
+	e.dropVotesOfDisconnectedPeers(connectedPeers)
 
-	return false
+	return e.selectMetaBlock(connectedPeers)
 }
 
 // RegisterHandler registers a callback function to be notified of incoming epoch start metablocks

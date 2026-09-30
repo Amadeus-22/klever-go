@@ -694,6 +694,55 @@ func TestLibp2pMessenger_BroadcastDataBetween2PeersShouldWork(t *testing.T) {
 	_ = mes2.Close()
 }
 
+// The fast bootstrap quorum counts one vote per gossip author, so a production messenger must
+// only deliver gossip signed by the key of the peer it names as its author.
+func TestNetworkMessenger_GossipShouldBeSignedByItsAuthor(t *testing.T) {
+	sender, err := libp2p.NewNetworkMessenger(createMockNetworkArgs())
+	require.NoError(t, err)
+	receiver, err := libp2p.NewNetworkMessenger(createMockNetworkArgs())
+	require.NoError(t, err)
+	defer func() {
+		_ = sender.Close()
+		_ = receiver.Close()
+	}()
+
+	require.NoError(t, sender.ConnectToPeer(getConnectableAddress(receiver)))
+	require.NoError(t, sender.CreateTopic("test", false))
+	require.NoError(t, receiver.CreateTopic("test", false))
+
+	type delivery struct {
+		message           p2p.MessageP2P
+		fromConnectedPeer core.PeerID
+	}
+	chanDelivered := make(chan delivery, 1)
+	err = receiver.RegisterMessageProcessor("test", &mock.MessageProcessorStub{
+		ProcessMessageCalled: func(message p2p.MessageP2P, fromConnectedPeer core.PeerID) error {
+			select {
+			case chanDelivered <- delivery{message: message, fromConnectedPeer: fromConnectedPeer}:
+			default:
+			}
+			return nil
+		},
+	})
+	require.NoError(t, err)
+
+	// resend until the topic subscriptions have propagated, instead of sleeping a fixed time
+	timeout := time.After(timeoutWaitResponses)
+	for {
+		sender.Broadcast("test", []byte("signed gossip"))
+		select {
+		case delivered := <-chanDelivered:
+			assert.NotEmpty(t, delivered.message.Signature(), "production gossip must be signed")
+			assert.Equal(t, sender.ID(), delivered.message.Peer())
+			assert.Equal(t, sender.ID(), delivered.fromConnectedPeer)
+			return
+		case <-timeout:
+			require.Fail(t, "the gossip never reached the receiver")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 func TestLibp2pMessenger_BroadcastOnChannelBlockingShouldLimitNumberOfGoRoutines(t *testing.T) {
 	if testing.Short() {
 		t.Skip("this test does not perform well in TC with race detector on")

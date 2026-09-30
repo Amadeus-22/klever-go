@@ -125,7 +125,17 @@ func (ms *MessengerStub) TrimConnections() {
 
 // IsConnected -
 func (ms *MessengerStub) IsConnected(peerID core.PeerID) bool {
-	return ms.IsConnectedCalled(peerID)
+	if ms.IsConnectedCalled != nil {
+		return ms.IsConnectedCalled(peerID)
+	}
+
+	for _, connected := range ms.ConnectedPeers() {
+		if connected == peerID {
+			return true
+		}
+	}
+
+	return false
 }
 
 // ConnectedPeers -

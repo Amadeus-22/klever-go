@@ -50,6 +50,7 @@ type Messenger interface {
 	UnregisterAllMessageProcessors() error
 	UnjoinAllTopics() error
 	ConnectedPeers() []core.PeerID
+	IsConnected(peerID core.PeerID) bool
 }
 
 // RequestHandler defines which methods a request handler should implement
