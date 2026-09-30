@@ -96,13 +96,24 @@ func NewDropWarner(window time.Duration) *DropWarner {
 }
 
 // Fire records one occurrence and reports (count, true) with the number folded into the window
-// at most once per window; otherwise (0, false). See dropWarner.fire.
+// at most once per window; otherwise (0, false). See dropWarner.fire. A nil warner budgets
+// nothing: it reports every occurrence on its own, so a nil *DropWarner held as a
+// panicguard.Budget still logs every panic instead of panicking inside the recover.
 func (d *DropWarner) Fire() (int64, bool) {
+	if d == nil {
+		return 1, true
+	}
+
 	return d.w.fire()
 }
 
 // Flush reports any occurrences still pending in the current window. See dropWarner.flush.
+// A nil warner never holds any.
 func (d *DropWarner) Flush() (int64, bool) {
+	if d == nil {
+		return 0, false
+	}
+
 	return d.w.flush()
 }
 

@@ -96,6 +96,9 @@ type logSender struct {
 	// handshakeFailWarn budgets the failed-handshake line. Process-wide by default, since the
 	// event is the same whichever route served it; a test gives a sender its own.
 	handshakeFailWarn *clientSocket.DropWarner
+	// loopPanicWarn budgets the recovered-panic line of the ping and monitor loops, shared
+	// process-wide by default for the same reason; a test gives a sender its own.
+	loopPanicWarn *clientSocket.DropWarner
 }
 
 // defaultHandshakeFailWarn is the one budget every sender in the process shares: a failed
@@ -103,6 +106,10 @@ type logSender struct {
 // will — so a line per failure would hand it the log volume, exactly what /subscribe's
 // equivalent already guards against.
 var defaultHandshakeFailWarn = clientSocket.NewDropWarner(clientSocket.PeerDrivenLogWindow)
+
+// defaultLoopPanicWarn is the budget every sender's detached loops share: /log can be served
+// unauthenticated, so the reconnect rate behind a reproducible panic is the peer's.
+var defaultLoopPanicWarn = clientSocket.NewDropWarner(clientSocket.PeerDrivenLogWindow)
 
 // NewLogSender returns a new component that is able to communicate with the log viewer application.
 // After the correct handshake it will send all logs that come through the logger subsystem.
@@ -133,6 +140,7 @@ func NewLogSender(marshalizer marshal.Marshalizer, conn wsConn, log logger.Logge
 		pongWait:          pongWait,
 		writeWait:         writeWait,
 		handshakeFailWarn: defaultHandshakeFailWarn,
+		loopPanicWarn:     defaultLoopPanicWarn,
 	}
 
 	return ls, nil
@@ -207,11 +215,11 @@ func (ls *logSender) StartSendingBlocking() {
 	ls.loops.Add(2)
 	go func() {
 		defer ls.loops.Done()
-		shared.SafeRun(ls.log, "/log pingLoop", ls.conn, func() { ls.pingLoop(done) })
+		shared.SafeRun(ls.log, "/log pingLoop", ls.conn, ls.loopPanicWarn, func() { ls.pingLoop(done) })
 	}()
 	go func() {
 		defer ls.loops.Done()
-		shared.SafeRun(ls.log, "/log monitorConnection", ls.conn, ls.monitorConnection)
+		shared.SafeRun(ls.log, "/log monitorConnection", ls.conn, ls.loopPanicWarn, ls.monitorConnection)
 	}()
 	ls.doSendContinuously()
 }

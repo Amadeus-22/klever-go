@@ -9,6 +9,7 @@ import (
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/network/api/shared"
+	clientSocket "github.com/klever-io/klever-go/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -64,7 +65,7 @@ func TestSafeGo_RunsFnOnItsOwnGoroutine(t *testing.T) {
 	// of detached, SafeGo would block on that gate and never return, so the first wait
 	// below fails by name rather than the earlier version's "close(done)" passing either way.
 	go func() {
-		shared.SafeGo(log, "happy", conn, func() {
+		shared.SafeGo(log, "happy", conn, nil, func() {
 			<-gate
 			close(done)
 		})
@@ -93,7 +94,7 @@ func TestSafeGo_RecoversPanicLogsAndClosesConn(t *testing.T) {
 	conn := &closerStub{closed: make(chan struct{})}
 	deferRan := make(chan struct{})
 
-	shared.SafeGo(log, "boom-routine", conn, func() {
+	shared.SafeGo(log, "boom-routine", conn, nil, func() {
 		defer close(deferRan) // stands in for a limiter release; must run during the unwind
 		panic("boom")
 	})
@@ -125,7 +126,7 @@ func TestSafeGo_PanicValueCannotForgeALogLine(t *testing.T) {
 	}}
 	conn := &closerStub{closed: make(chan struct{})}
 
-	shared.SafeGo(log, "forge-routine", conn, func() {
+	shared.SafeGo(log, "forge-routine", conn, nil, func() {
 		panic("bad key \"x\"\nERROR forged entry")
 	})
 
@@ -144,4 +145,50 @@ func TestSafeGo_PanicValueCannotForgeALogLine(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("panic must be logged")
 	}
+}
+
+// TestSafeRun_PanicLogIsBudgetedButCloseIsNot: the routes behind SafeRun are peer-driven, so
+// repeated panics inside one window fold into one line. Every panicked connection is still
+// closed; the budget throttles the log, not the teardown.
+func TestSafeRun_PanicLogIsBudgetedButCloseIsNot(t *testing.T) {
+	t.Parallel()
+
+	lines := 0
+	log := &mock.LoggerStub{LogCalled: func(_ logger.LogLevel, message string, _ ...interface{}) {
+		if message == "panic in detached websocket goroutine" {
+			lines++
+		}
+	}}
+	budget := clientSocket.NewDropWarner(time.Hour)
+
+	for i := 0; i < 3; i++ {
+		conn := &closerStub{closed: make(chan struct{})}
+		shared.SafeRun(log, "budgeted", conn, budget, func() { panic("boom") })
+		wait(t, conn.closed, "every panicked connection must be closed, logged or not")
+	}
+
+	require.Equal(t, 1, lines, "three panics inside one window must fold into one line")
+}
+
+// TestSafeRun_TypedNilBudgetLogsAndCloses covers a nil *DropWarner held as the budget: the
+// interface is non-nil, so the barrier calls Fire on it, which must neither panic inside the
+// recover nor keep the connection from closing.
+func TestSafeRun_TypedNilBudgetLogsAndCloses(t *testing.T) {
+	t.Parallel()
+
+	logged := 0
+	log := &mock.LoggerStub{LogCalled: func(level logger.LogLevel, _ string, _ ...interface{}) {
+		if level == logger.LogError {
+			logged++
+		}
+	}}
+	conn := &closerStub{closed: make(chan struct{})}
+	var budget *clientSocket.DropWarner
+
+	require.NotPanics(t, func() {
+		shared.SafeRun(log, "nil-budget", conn, budget, func() { panic("boom") })
+	})
+
+	wait(t, conn.closed, "conn must be closed after a panic")
+	require.Equal(t, 1, logged, "a nil budget logs every panic")
 }

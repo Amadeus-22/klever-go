@@ -54,6 +54,22 @@ func (ls *logSender) SetHandshakeFailBudget(w *clientSocket.DropWarner) {
 	ls.handshakeFailWarn = w
 }
 
+// SetLoopPanicBudget gives this sender its own budget for its loops' recovered panics, so a test
+// that expects the panic line is not racing every other sender for the shared one.
+func (ls *logSender) SetLoopPanicBudget(w *clientSocket.DropWarner) {
+	ls.loopPanicWarn = w
+}
+
+// LoopPanicBudget exposes the budget this sender's loops will draw on.
+func (ls *logSender) LoopPanicBudget() *clientSocket.DropWarner {
+	return ls.loopPanicWarn
+}
+
+// DefaultLoopPanicBudget exposes the process-wide budget every production sender's loops share.
+func DefaultLoopPanicBudget() *clientSocket.DropWarner {
+	return defaultLoopPanicWarn
+}
+
 // IsTeardownError exposes the write-failure classification.
 var IsTeardownError = isTeardownError
 

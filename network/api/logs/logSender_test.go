@@ -803,6 +803,8 @@ func TestLogSender_PanicRecoveryCompletesBeforeReturn(t *testing.T) {
 
 	ls, err := logs.NewLogSender(&mock.MarshalizerStub{}, conn, log, false)
 	require.NoError(t, err)
+	// Its own budget: the shared one may already be spent by another panicking test.
+	ls.SetLoopPanicBudget(clientSocket.NewDropWarner(time.Hour))
 
 	ls.StartSendingBlocking()
 
@@ -840,6 +842,45 @@ func TestLogSender_HandshakeFailuresAreBudgeted(t *testing.T) {
 	}
 
 	assert.Equal(t, 1, lines, "twenty failed handshakes inside one window must fold into one line")
+}
+
+// TestLogSender_LoopPanicsAreBudgeted: /log can be served unauthenticated, so a peer that can
+// reproduce a panic in a loop reconnects at will. Senders share one budget by default, and a
+// panic per connection inside one window is one line.
+func TestLogSender_LoopPanicsAreBudgeted(t *testing.T) {
+	t.Parallel()
+
+	budget := clientSocket.NewDropWarner(time.Hour)
+	var lines atomic.Int32
+	log := &mock.LoggerStub{
+		LogCalled: func(level logger.LogLevel, message string, args ...interface{}) {
+			if message == "panic in detached websocket goroutine" {
+				lines.Add(1)
+			}
+		},
+	}
+
+	for i := 0; i < 5; i++ {
+		readCount := 0
+		conn := &mock.WsConnStub{}
+		conn.SetCloseHandler(func() error { return nil })
+		conn.SetReadMessageHandler(func() (messageType int, p []byte, err error) {
+			readCount++
+			if readCount == 1 {
+				return websocket.TextMessage, []byte(core.DefaultLogProfileIdentifier), nil
+			}
+			panic("boom inside monitorConnection")
+		})
+
+		ls, err := logs.NewLogSender(&mock.MarshalizerStub{}, conn, log, false)
+		require.NoError(t, err)
+		assert.Same(t, logs.DefaultLoopPanicBudget(), ls.LoopPanicBudget(),
+			"production senders must share one budget, or a peer reconnecting gets a line per connection")
+		ls.SetLoopPanicBudget(budget)
+		ls.StartSendingBlocking()
+	}
+
+	assert.EqualValues(t, 1, lines.Load(), "five panicked connections inside one window must fold into one line")
 }
 
 // TestIsTeardownError pins which write failures are the connection going away, logged as such,

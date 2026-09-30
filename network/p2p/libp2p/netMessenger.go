@@ -782,13 +782,15 @@ func (netMes *networkMessenger) BroadcastOnChannelBlocking(channel string, topic
 	}
 
 	netMes.goRoutinesThrottler.StartProcessing()
+	// Deferred: a panic on the send (a closed channel, say) would otherwise leak the slot, and a
+	// caller that recovers it would, one leak at a time, starve every broadcast on this throttler.
+	defer netMes.goRoutinesThrottler.EndProcessing()
 
 	sendable := &p2p.SendableData{
 		Buff:  buff,
 		Topic: topic,
 	}
 	netMes.outgoingPLB.GetChannelOrDefault(channel) <- sendable
-	netMes.goRoutinesThrottler.EndProcessing()
 	return nil
 }
 

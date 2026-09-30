@@ -789,6 +789,31 @@ func TestLibp2pMessenger_BroadcastOnChannelBlockingShouldLimitNumberOfGoRoutines
 	_ = mes.Close()
 }
 
+func TestLibp2pMessenger_BroadcastOnChannelBlockingReleasesSlotOnPanic(t *testing.T) {
+	closed := make(chan *p2p.SendableData)
+	close(closed)
+
+	mes, _ := libp2p.NewNetworkMessenger(createMockNetworkArgs())
+	mes.SetLoadBalancer(&mock.ChannelLoadBalancerStub{
+		CollectOneElementFromChannelsCalled: func() *p2p.SendableData {
+			return nil
+		},
+		GetChannelOrDefaultCalled: func(pipe string) chan *p2p.SendableData {
+			return closed
+		},
+	})
+
+	// Each send panics on the closed channel. A caller that recovers must not have spent a
+	// throttler slot, or after BroadcastGoRoutines panics every broadcast is refused.
+	for i := 0; i < libp2p.BroadcastGoRoutines+1; i++ {
+		assert.Panics(t, func() {
+			_ = mes.BroadcastOnChannelBlocking("test", "test", []byte("test message"))
+		})
+	}
+
+	_ = mes.Close()
+}
+
 func TestLibp2pMessenger_BroadcastDataBetween2PeersWithLargeMsgShouldWork(t *testing.T) {
 	msg := make([]byte, libp2p.MaxSendBuffSize)
 
