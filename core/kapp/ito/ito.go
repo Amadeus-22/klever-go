@@ -808,12 +808,7 @@ func (i *itoKapp) Config(sender []byte, tc *transaction.ConfigITOContract) (tran
 
 			newPacks := make([]*kapps.Pack, len(packInfo.Packs))
 			for index, pack := range packInfo.Packs {
-				invalidPrice := pack.Price < 0
-				if !i.forkController.KdaFpr() {
-					invalidPrice = pack.Price <= 0
-				}
-
-				if pack.Amount <= 0 || invalidPrice {
+				if pack.Amount <= 0 || i.isInvalidPackPrice(pack.Price) {
 					return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
 				}
 
@@ -1072,6 +1067,17 @@ func (i *itoKapp) processPackData(ctx kapp.KappContext, key string, packData *tr
 	return &kapps.PackData{Packs: newPacks}, transaction.Transaction_Ok, nil
 }
 
+// isInvalidPackPrice reports whether ConfigITO or the SetITOPrices trigger must reject a
+// pack price. KdaFpr relaxed both paths to accept a zero price, which SetPrices never
+// did; FixAuditChangesV6 rejects it again so all three paths agree.
+func (i *itoKapp) isInvalidPackPrice(price int64) bool {
+	if !i.forkController.KdaFpr() || i.forkController.FixAuditChangesV6() {
+		return price <= 0
+	}
+
+	return price < 0
+}
+
 func (i *itoKapp) SetPrices(sender []byte, tc *transaction.SetITOPricesContract) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
@@ -1182,12 +1188,7 @@ func (i *itoKapp) SetITOPrices(triggerContract *transaction.ITOTriggerContract, 
 
 		newPacks := make([]*kapps.Pack, len(packData.Packs))
 		for index, pack := range packData.Packs {
-			invalidPrice := pack.Price < 0
-			if !i.forkController.KdaFpr() {
-				invalidPrice = pack.Price <= 0
-			}
-
-			if pack.Amount <= 0 || invalidPrice || (ito.MaxAmount > 0 && pack.Amount > ito.MaxAmount) {
+			if pack.Amount <= 0 || i.isInvalidPackPrice(pack.Price) || (ito.MaxAmount > 0 && pack.Amount > ito.MaxAmount) {
 				ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPrice, common.ErrInvalidValue.Error())
 				return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
 			}
