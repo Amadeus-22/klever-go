@@ -1159,3 +1159,51 @@ func TestMBufferStorageLoadFromAddressChargesPerByteBeforeLoad(t *testing.T) {
 			postForkConsumed)
 	})
 }
+
+// A big float rounded in place keeps an inexact accuracy (an int64 above 2^53 set into a
+// 53-bit float is Below). Any nested call used to reset that accuracy by cloning the caller's big
+// floats; from FixAuditChangesV6 the nested call moves them instead (KLC-2678), so
+// MBufferFromBigFloat resets it itself, and the encoding round-trips through MBufferToBigFloat
+// with or without a nested call before it.
+func TestMBufferFromBigFloatEncodesAnInexactValueAsExact(t *testing.T) {
+	const above53Bits = int64(1)<<53 + 1
+
+	encodeRounded := func(t *testing.T, fixAuditV6 bool) (*vmhooks.VMHooksImpl, int32, []byte) {
+		fc := commonMock.NewForkControllerStub()
+		fc.FixAuditChangesV6Value = fixAuditV6
+		vmHost, err := hostCore.NewVMHost(worldmock.NewMockWorld(), makeHostParametersWithFork(fc))
+		require.NoError(t, err)
+		hooks := vmhooks.NewVMHooksImpl(vmHost)
+		provideGas(hooks, 1_000_000)
+
+		managedType := hooks.GetManagedTypesContext()
+		bigFloatHandle, err := managedType.PutBigFloat(big.NewFloat(0))
+		require.NoError(t, err)
+		hooks.BigFloatSetInt64(bigFloatHandle, above53Bits)
+		stored, err := managedType.GetBigFloat(bigFloatHandle)
+		require.NoError(t, err)
+		require.Equal(t, big.Below, stored.Acc(), "the stored value must keep the inexact accuracy")
+		mBufferHandle := managedType.NewManagedBuffer()
+
+		require.Equal(t, int32(0), hooks.MBufferFromBigFloat(mBufferHandle, bigFloatHandle))
+		encoded, err := managedType.GetBytes(mBufferHandle)
+		require.NoError(t, err)
+		return hooks, mBufferHandle, encoded
+	}
+
+	t.Run("from FixAuditChangesV6 the encoding is exact and decodes", func(t *testing.T) {
+		hooks, mBufferHandle, encoded := encodeRounded(t, true)
+		require.Equal(t, []byte{1, 10, 0, 0, 0, 53}, encoded[:6])
+
+		decodedHandle := int32(100)
+		require.Equal(t, int32(0), hooks.MBufferToBigFloat(mBufferHandle, decodedHandle))
+		decoded, err := hooks.GetManagedTypesContext().GetBigFloat(decodedHandle)
+		require.NoError(t, err)
+		require.Equal(t, 0, big.NewFloat(float64(above53Bits)).Cmp(decoded))
+	})
+
+	t.Run("before FixAuditChangesV6 the encoding carries the inexact accuracy", func(t *testing.T) {
+		_, _, encoded := encodeRounded(t, false)
+		require.Equal(t, []byte{1, 2, 0, 0, 0, 53}, encoded[:6])
+	})
+}

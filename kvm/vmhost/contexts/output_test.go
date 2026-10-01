@@ -338,7 +338,7 @@ func TestOutputContext_Transfer(t *testing.T) {
 	balance := big.NewInt(10000)
 	valueToTransfer := big.NewInt(1000)
 
-	host := &contextmock.VMHostMock{}
+	host := &contextmock.VMHostMock{ForkControllerContext: commonMock.NewForkControllerStub()}
 	host.RuntimeContext = &contextmock.RuntimeContextMock{VMInput: &vmcommon.ContractCallInput{}}
 	mockWorld := worldmock.NewMockWorld()
 	mockWorld.PutAccount(&worldmock.Account{
@@ -380,7 +380,7 @@ func TestOutputContext_Transfer_Errors_And_Checks(t *testing.T) {
 		Balance: big.NewInt(2000),
 	})
 
-	host := &contextmock.VMHostMock{}
+	host := &contextmock.VMHostMock{ForkControllerContext: commonMock.NewForkControllerStub()}
 	outputContext, _ := NewOutputContext(host)
 	blockchainContext, _ := NewBlockchainContext(host, mockWorld)
 
@@ -441,7 +441,7 @@ func TestOutputContext_Transfer_IsAccountPayable(t *testing.T) {
 		},
 	})
 
-	host := &contextmock.VMHostMock{}
+	host := &contextmock.VMHostMock{ForkControllerContext: commonMock.NewForkControllerStub()}
 	oc, _ := NewOutputContext(host)
 	bc, _ := NewBlockchainContext(host, mockWorld)
 
@@ -462,6 +462,55 @@ func TestOutputContext_Transfer_IsAccountPayable(t *testing.T) {
 	err = oc.TransferValueOnly(receiverPayable, sender, valueToTransfer, true)
 
 	require.Nil(t, err)
+}
+
+// TestOutputContext_TransferValueOnly_FixAuditV6_RecordsACopy pins that, once FixAuditChangesV6 is
+// active, the recorded output transfer does not share the caller's big int: a nested call's value
+// is the caller's own managed big int, which the caller gets back after the call (KLC-2678).
+func TestOutputContext_TransferValueOnly_FixAuditV6_RecordsACopy(t *testing.T) {
+	t.Parallel()
+
+	sender := []byte("sender")
+	receiver := []byte("receiver")
+
+	recordedTransferValue := func(fixAuditV6 bool, value *big.Int) *big.Int {
+		mockWorld := worldmock.NewMockWorld()
+		mockWorld.PutAccount(&worldmock.Account{Address: sender, Balance: big.NewInt(10000)})
+		mockWorld.PutAccount(&worldmock.Account{Address: receiver, Balance: big.NewInt(0)})
+
+		host := &contextmock.VMHostMock{
+			ForkControllerContext: &commonMock.ForkControllerStub{FixAuditChangesV6Value: fixAuditV6},
+		}
+		host.RuntimeContext = &contextmock.RuntimeContextMock{VMInput: &vmcommon.ContractCallInput{}}
+		outputContext, _ := NewOutputContext(host)
+		blockchainContext, _ := NewBlockchainContext(host, mockWorld)
+		host.OutputContext = outputContext
+		host.BlockchainContext = blockchainContext
+
+		require.NoError(t, outputContext.TransferValueOnly(receiver, sender, value, false))
+
+		receiverAccount, _ := outputContext.GetOutputAccount(receiver)
+		require.Len(t, receiverAccount.OutputTransfers, 1)
+		return receiverAccount.OutputTransfers[0].KDATransfers.KDAValue
+	}
+
+	t.Run("from FixAuditChangesV6 the amount is copied", func(t *testing.T) {
+		t.Parallel()
+
+		value := big.NewInt(1000)
+		recorded := recordedTransferValue(true, value)
+		value.SetInt64(1_000_000)
+
+		require.NotSame(t, value, recorded)
+		require.Equal(t, big.NewInt(1000), recorded)
+	})
+
+	t.Run("before FixAuditChangesV6 the pointer is recorded", func(t *testing.T) {
+		t.Parallel()
+
+		value := big.NewInt(1000)
+		require.Same(t, value, recordedTransferValue(false, value))
+	})
 }
 
 func TestOutputContext_WriteLog(t *testing.T) {

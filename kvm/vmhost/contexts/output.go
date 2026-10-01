@@ -372,12 +372,19 @@ func (context *outputContext) TransferValueOnly(destination []byte, sender []byt
 	_, _ = context.GetOutputAccount(sender)
 	// add output transfer to destination account
 	destinationAccount, _ := context.GetOutputAccount(destination)
+	recordedValue := value
+	if context.host.ForkController().FixAuditChangesV6() {
+		// value can be the caller's own managed big int, which FixAuditChangesV6 hands back to the
+		// caller after a nested call instead of a clone (KLC-2678); record the amount transferred,
+		// not a pointer the caller could later rewrite into a forged back-transfer
+		recordedValue = big.NewInt(0).Set(value)
+	}
 	outputTransfer := vmcommon.OutputTransfer{
 		Index:         context.NextOutputTransferIndex(),
 		SenderAddress: sender,
 		RcvAddr:       destination,
 		KDATransfers: vmcommon.KDATransfer{
-			KDAValue:     value,
+			KDAValue:     recordedValue,
 			KDATokenName: kdautils.KLVIdentifier,
 		},
 	}

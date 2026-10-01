@@ -181,7 +181,9 @@ type InstanceTracker interface {
 	TrackedInstances() map[string]executor.Instance
 }
 
-// ManagedTypesContext defines the functionality needed for interacting with the big int context
+// ManagedTypesContext defines the functionality needed for interacting with the big int context.
+// Once FixAuditChangesV6 is active its PushState moves the active values onto the stack and leaves
+// an empty active state, so a push must be undone with PopSetActiveState, never PopDiscard.
 type ManagedTypesContext interface {
 	StateStack
 

@@ -805,6 +805,10 @@ func (context *VMHooksImpl) MBufferFromBigFloat(mBufferHandle, bigFloatHandle in
 		return 1
 	}
 
+	if context.host.ForkController().FixAuditChangesV6() {
+		value = new(big.Float).Set(value)
+	}
+
 	encodedFloat, err := value.GobEncode()
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1

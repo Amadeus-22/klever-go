@@ -84,6 +84,9 @@ func TestManagedTypesContext_Randomness(t *testing.T) {
 func TestManagedTypesContext_ClearStateStack(t *testing.T) {
 	t.Parallel()
 	host := &contextmock.VMHostStub{
+		ForkControllerCalled: func() core.ForkController {
+			return &commonMock.ForkControllerStub{}
+		},
 		BlockchainCalled: func() vmhost.BlockchainContext {
 			return &contextmock.BlockchainContextMock{}
 		},
@@ -158,7 +161,26 @@ func TestManagedTypesContext_ClearStateStack(t *testing.T) {
 
 func TestManagedTypesContext_InitPushPopState(t *testing.T) {
 	t.Parallel()
-	host := &contextmock.VMHostStub{}
+
+	t.Run("deep copy before FixAuditChangesV6", func(t *testing.T) {
+		t.Parallel()
+		testManagedTypesContextInitPushPopState(t, false)
+	})
+	t.Run("move after FixAuditChangesV6", func(t *testing.T) {
+		t.Parallel()
+		testManagedTypesContextInitPushPopState(t, true)
+	})
+}
+
+// testManagedTypesContextInitPushPopState walks the state stack the way nested calls use it, a
+// PushState always followed by an InitState, so it must pass whichever way PushState stacks the values.
+func testManagedTypesContextInitPushPopState(t *testing.T, fixAuditV6 bool) {
+	forkController := &commonMock.ForkControllerStub{FixAuditChangesV6Value: fixAuditV6}
+	host := &contextmock.VMHostStub{
+		ForkControllerCalled: func() core.ForkController {
+			return forkController
+		},
+	}
 	intValue1, intValue2, intValue3 := int64(100), int64(200), int64(-42)
 	floatValue1, floatValue2, floatValue3 := 307.72, 78.008, -37.84732
 	p224ec, p256ec, p384ec, p521ec := elliptic.P224().Params(), elliptic.P256().Params(), elliptic.P384().Params(), elliptic.P521().Params()
@@ -1311,4 +1333,101 @@ func TestManagedTypesContext_ConsumeGasForThisIntNumberOfBytesBounded(t *testing
 		require.ErrorIs(t, err, vmhost.ErrNotEnoughGas)
 		require.Equal(t, gasLeft, metering.GasLeft())
 	})
+}
+
+// newPushStateFixture builds a managed types context behind a host whose fork controller reports
+// FixAuditChangesV6 as fixAuditV6, holding numHandles big ints and one big float.
+func newPushStateFixture(fixAuditV6 bool, numHandles int) *managedTypesContext {
+	forkController := &commonMock.ForkControllerStub{FixAuditChangesV6Value: fixAuditV6}
+	host := &contextmock.VMHostStub{
+		ForkControllerCalled: func() core.ForkController {
+			return forkController
+		},
+	}
+	managedTypesCtx, _ := NewManagedTypesContext(host)
+	managedTypesCtx.InitState()
+	for i := 0; i < numHandles; i++ {
+		managedTypesCtx.NewBigIntFromInt64(int64(i))
+	}
+	_, _ = managedTypesCtx.PutBigFloat(big.NewFloat(1.5))
+
+	return managedTypesCtx
+}
+
+func TestManagedTypesContext_PushState_FixAuditV6(t *testing.T) {
+	t.Parallel()
+
+	t.Run("stacks the caller's values as they are and leaves an empty active state", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := newPushStateFixture(true, 2)
+		bigInt, _ := ctx.GetBigInt(0)
+		bigFloat, _ := ctx.GetBigFloat(0)
+
+		ctx.PushState()
+
+		require.Len(t, ctx.managedTypesStack, 1)
+		require.Same(t, bigInt, ctx.managedTypesStack[0].bigIntValues[0])
+		require.Same(t, bigFloat, ctx.managedTypesStack[0].bigFloatValues[0])
+		_, err := ctx.GetBigInt(0)
+		require.ErrorIs(t, err, vmhost.ErrNoBigIntUnderThisHandle)
+		_, err = ctx.GetBigFloat(0)
+		require.ErrorIs(t, err, vmhost.ErrNoBigFloatUnderThisHandle)
+	})
+
+	t.Run("a nested call reusing the caller's handles leaves the caller's values intact", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := newPushStateFixture(true, 2)
+
+		ctx.PushState()
+		ctx.InitState()
+		ctx.GetBigIntOrCreate(0).SetInt64(-7)
+		ctx.GetBigIntOrCreate(5).SetInt64(9)
+		ctx.PopSetActiveState()
+
+		bigInt0, err := ctx.GetBigInt(0)
+		require.NoError(t, err)
+		require.Equal(t, big.NewInt(0), bigInt0)
+		bigInt1, err := ctx.GetBigInt(1)
+		require.NoError(t, err)
+		require.Equal(t, big.NewInt(1), bigInt1)
+		_, err = ctx.GetBigInt(5)
+		require.ErrorIs(t, err, vmhost.ErrNoBigIntUnderThisHandle)
+	})
+
+	t.Run("before the fork the stacked values are deep copies", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := newPushStateFixture(false, 2)
+		bigInt, _ := ctx.GetBigInt(0)
+
+		ctx.PushState()
+
+		require.NotSame(t, bigInt, ctx.managedTypesStack[0].bigIntValues[0])
+		require.Equal(t, bigInt, ctx.managedTypesStack[0].bigIntValues[0])
+		activeBigInt, err := ctx.GetBigInt(0)
+		require.NoError(t, err)
+		require.Same(t, bigInt, activeBigInt)
+	})
+}
+
+// TestManagedTypesContext_PushState_FixAuditV6_DoesNotCopyHandles counts what PushState allocates,
+// which gas cannot see since it charges none. It is not parallel: AllocsPerRun reads process-wide
+// counters, and top-level sequential tests run before the parallel ones are released.
+func TestManagedTypesContext_PushState_FixAuditV6_DoesNotCopyHandles(t *testing.T) {
+	const numHandles = 10_000
+
+	pushAndPopAllocs := func(fixAuditV6 bool) float64 {
+		ctx := newPushStateFixture(fixAuditV6, numHandles)
+		return testing.AllocsPerRun(10, func() {
+			ctx.PushState()
+			ctx.PopSetActiveState()
+		})
+	}
+
+	// the same handful of fresh empty maps and back transfers whatever the handle count
+	require.Less(t, pushAndPopAllocs(true), float64(20))
+	// the deep copy allocates at least one big int per handle
+	require.Greater(t, pushAndPopAllocs(false), float64(numHandles))
 }

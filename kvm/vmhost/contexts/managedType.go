@@ -145,8 +145,16 @@ func (context *managedTypesContext) InitState() {
 	}
 }
 
-// PushState appends the values map to the state stack
+// PushState saves the active values on the state stack. Before FixAuditChangesV6 it stacks a deep
+// copy and leaves the active values in place; once it is active it moves the active values onto
+// the stack and leaves a fresh, empty active state, so it must be paired with PopSetActiveState,
+// never PopDiscard, or the caller's values are lost.
 func (context *managedTypesContext) PushState() {
+	if context.host.ForkController().FixAuditChangesV6() {
+		context.pushStateByMove()
+		return
+	}
+
 	newBigIntState, newBigFloatState, newEcState, newmBufferState, newmMapState := context.clone()
 	newTransfers := context.cloneBackTransfers()
 	context.managedTypesStack = append(context.managedTypesStack, managedTypesState{
@@ -157,6 +165,19 @@ func (context *managedTypesContext) PushState() {
 		mMapValues:     newmMapState,
 		backTransfers:  newTransfers,
 	})
+}
+
+// pushStateByMove is PushState once FixAuditChangesV6 is active. Every nested call starts on a
+// fresh state (InitState right after PushState), so the caller's values can go onto the stack as
+// they are instead of being deep-copied. The copy cost time and memory in proportion to the number
+// of handles and charged no gas, so a contract could make a nested call clone a large handle set
+// for free. The active state is replaced straight away, so nothing reachable from it shares a map
+// with the stacked state, and PopSetActiveState hands the caller back its own maps.
+func (context *managedTypesContext) pushStateByMove() {
+	stackedState := context.managedTypesValues
+	stackedState.backTransfers = context.cloneBackTransfers()
+	context.managedTypesStack = append(context.managedTypesStack, stackedState)
+	context.InitState()
 }
 
 // PopSetActiveState removes the latest entry from the state stack and sets it as the current values map
