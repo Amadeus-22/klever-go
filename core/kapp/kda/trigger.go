@@ -280,7 +280,7 @@ func (k *kdaKapp) updateMetadata(sender []byte, tc *transaction.AssetTriggerCont
 	case kapps.KDAData_NonFungible:
 		return k.updateMetadataV1(tc, kdaKApp, assetID, asset, txData)
 	case kapps.KDAData_SemiFungible:
-		return k.updateMetadataV2(assetID, txData)
+		return k.updateMetadataV2(assetID, asset, txData)
 	default:
 		return transaction.Transaction_AssetTypeInvalid, common.ErrAssetTypeInvalid
 	}
@@ -353,7 +353,7 @@ func (k *kdaKapp) updateMetadataV1(tc *transaction.AssetTriggerContract, kdaKApp
 	return k.updateKApp(kdaKApp, assetID[0], asset)
 }
 
-func (k *kdaKapp) updateMetadataV2(assetID [][]byte, txData [][]byte) (transaction.Transaction_TXResultCode, error) {
+func (k *kdaKapp) updateMetadataV2(assetID [][]byte, asset *kapps.KDAData, txData [][]byte) (transaction.Transaction_TXResultCode, error) {
 	// check if asset has nonce Metadata only supported with NFT/SFTs
 	if len(assetID) != 2 {
 		return transaction.Transaction_AssetTypeInvalid, common.ErrAssetIDInvalid
@@ -373,6 +373,19 @@ func (k *kdaKapp) updateMetadataV2(assetID [][]byte, txData [][]byte) (transacti
 			return transaction.Transaction_ParameterInvalid, process.ErrInvalidArgument
 		}
 		args = append(args, decoded)
+	}
+
+	// Stopped SFTs refuse metadata rewrites once the nonce has a Name or Attributes;
+	// the first write to an empty nonce is still allowed, mirroring the NFT branch.
+	if k.forkController.FixAuditChangesV6() && asset.GetAttributes().GetIsNFTMetadataChangeStopped() {
+		meta, err := k.KAppController.GetSystemAccountKApp().SFTGetMeta(assetID[0], assetID[1])
+		if err != nil {
+			return transaction.Transaction_AssetError, err
+		}
+
+		if len(meta.GetMetadata().GetName()) > 0 || len(meta.GetMetadata().GetAttributes()) > 0 {
+			return transaction.Transaction_NFTMetadataChangeStopped, process.ErrNFTMetadataChangeStopped
+		}
 	}
 
 	if err := k.KAppController.GetSystemAccountKApp().SFTSetMetadata(assetID[0], assetID[1], args); err != nil {
