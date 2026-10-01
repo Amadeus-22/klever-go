@@ -231,15 +231,39 @@ func (context *VMHooksImpl) ManagedGetReturnData(resultID int32, resultHandle in
 	output := context.GetOutputContext()
 	metering := context.GetMeteringContext()
 	managedType := context.GetManagedTypesContext()
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetReturnData
-	metering.UseGasAndAddTracedGas(managedGetReturnDataName, gasToUse)
+	if !fixAuditV6 {
+		metering.UseGasAndAddTracedGas(managedGetReturnDataName, gasToUse)
+	} else {
+		err := metering.UseGasBoundedAndAddTracedGas(managedGetReturnDataName, gasToUse)
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return
+		}
+	}
 
 	returnData := output.ReturnData()
 	// #nosec G115
 	if resultID >= int32(len(returnData)) || resultID < 0 {
 		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
 		return
+	}
+
+	// pre-fork the item was copied for the flat cost alone, into a new handle when resultHandle had
+	// none; post-fork a new handle is priced as MBufferNewFromBytes and the item's bytes are paid,
+	// bounded, before anything is copied
+	if fixAuditV6 {
+		if managedType.GetLength(resultHandle) < 0 {
+			err := metering.UseGasBounded(metering.GasSchedule().ManagedBufferAPICost.MBufferNewFromBytes)
+			if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+				return
+			}
+		}
+		err := managedType.ConsumeGasForByteLenBounded(uint64(len(returnData[resultID])))
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return
+		}
 	}
 
 	managedType.SetBytes(resultHandle, returnData[resultID])
