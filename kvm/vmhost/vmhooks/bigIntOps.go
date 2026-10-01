@@ -937,6 +937,18 @@ func (context *VMHooksImpl) BigIntShl(destinationHandle, opHandle, bits int32) {
 		_ = context.WithFault(vmhost.ErrShiftNegative, runtime.BigIntAPIErrorShouldFailExecution())
 		return
 	}
+	if context.host.ForkController().FixAuditChangesV6() {
+		resultByteLen := int64(0)
+		if a.Sign() != 0 {
+			resultByteLen = (int64(a.BitLen()) + int64(bits) + 7) / 8
+		}
+		err = managedType.ConsumeGasForThisIntNumberOfBytesBounded(resultByteLen)
+		if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
+			return
+		}
+		dest.Lsh(a, uint(bits))
+		return
+	}
 	dest.Lsh(a, uint(bits))
 	managedType.ConsumeGasForBigIntCopy(dest)
 

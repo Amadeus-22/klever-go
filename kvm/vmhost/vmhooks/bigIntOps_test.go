@@ -2,10 +2,12 @@ package vmhooks_test
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"testing"
 
+	commonMock "github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	"github.com/klever-io/klever-go/kvm/executor"
 	mock "github.com/klever-io/klever-go/kvm/mock/context"
@@ -913,5 +915,134 @@ func TestBigIntPow(t *testing.T) {
 			require.Equal(t, vmhost.ErrBadLowerBounds.Error(), returnMessageFor(true, smallNegative))
 			require.Equal(t, vmhost.ErrBadLowerBounds.Error(), returnMessageFor(true, hugeNegative))
 		})
+	})
+}
+
+func TestBigIntShl(t *testing.T) {
+	newHooks := func(t *testing.T, fixAuditV6 bool, gas uint64) (vmhost.VMHost, *vmhooks.VMHooksImpl) {
+		forkController := commonMock.NewForkControllerStub()
+		forkController.FixAuditChangesV6Value = fixAuditV6
+		vmHost, err := hostCore.NewVMHost(worldmock.NewMockWorld(), makeHostParametersWithFork(forkController))
+		require.NoError(t, err)
+		hooks := vmhooks.NewVMHooksImpl(vmHost)
+
+		it, ok := vmHost.Runtime().GetInstanceTracker().(InstanceTracker)
+		require.True(t, ok)
+		it.ReplaceInstance(mock.NewInstanceMock(nil))
+
+		provideGas(hooks, gas)
+		return vmHost, hooks
+	}
+
+	runShl := func(t *testing.T, fixAuditV6 bool, gas uint64, value *big.Int, bits int32) (vmhost.VMHost, *vmhooks.VMHooksImpl, int32) {
+		vmHost, hooks := newHooks(t, fixAuditV6, gas)
+
+		sourceHandle := hooks.GetManagedTypesContext().NewBigInt(value)
+		destHandle := hooks.BigIntNew(7)
+
+		hooks.BigIntShl(destHandle, sourceHandle, bits)
+
+		return vmHost, hooks, destHandle
+	}
+
+	requireDestination := func(t *testing.T, vmHost vmhost.VMHost, destHandle int32, expected *big.Int) {
+		result, err := vmHost.ManagedTypes().GetBigInt(destHandle)
+		require.NoError(t, err)
+		require.Equal(t, 0, expected.Cmp(result), "expected %s, got %s", expected, result)
+	}
+
+	shlGasUsed := func(t *testing.T, fixAuditV6 bool, value *big.Int, bits int32) uint64 {
+		vmHost, hooks, destHandle := runShl(t, fixAuditV6, 100_000_000, value, bits)
+
+		requireDestination(t, vmHost, destHandle, new(big.Int).Lsh(value, uint(bits)))
+
+		return hooks.GetRuntimeContext().GetPointsUsed()
+	}
+
+	t.Run("result size gas is unchanged across fork", func(t *testing.T) {
+		cases := []struct {
+			value *big.Int
+			bits  int32
+		}{
+			{value: big.NewInt(5), bits: 0},
+			{value: big.NewInt(3), bits: 4},
+			{value: big.NewInt(1), bits: 255},
+			{value: big.NewInt(1), bits: 256},
+			{value: big.NewInt(0xFF), bits: 249},
+			{value: big.NewInt(1), bits: 1000},
+			{value: big.NewInt(0), bits: 1000},
+			{value: new(big.Int).Lsh(big.NewInt(1), 400), bits: 8},
+		}
+		for _, tc := range cases {
+			require.Equal(t, shlGasUsed(t, false, tc.value, tc.bits), shlGasUsed(t, true, tc.value, tc.bits),
+				"%s << %d", tc.value, tc.bits)
+		}
+	})
+
+	t.Run("charges the result size above the normal cost threshold", func(t *testing.T) {
+		vmHost, _ := newHooks(t, true, 0)
+		copyPerByte := vmHost.Metering().GasSchedule().BigIntAPICost.CopyPerByteForTooBig
+		require.NotZero(t, copyPerByte)
+
+		resultByteLen := uint64((1 + 1000 + 7) / 8)
+		require.Equal(t, resultByteLen*copyPerByte, shlGasUsed(t, true, big.NewInt(1), 1000)-shlGasUsed(t, true, big.NewInt(1), 4))
+	})
+
+	t.Run("zero value charges no result size gas", func(t *testing.T) {
+		require.Equal(t, shlGasUsed(t, true, big.NewInt(0), 0), shlGasUsed(t, true, big.NewInt(0), math.MaxInt32))
+	})
+
+	t.Run("affordability boundary", func(t *testing.T) {
+		value := big.NewInt(0xFF)
+		const bits = int32(249)
+		exactGas := shlGasUsed(t, true, value, bits)
+
+		t.Run("succeeds with exactly the gas it needs", func(t *testing.T) {
+			vmHost, hooks, destHandle := runShl(t, true, exactGas, value, bits)
+
+			requireDestination(t, vmHost, destHandle, new(big.Int).Lsh(value, uint(bits)))
+			require.Equal(t, vmcommon.Ok, vmHost.Output().ReturnCode())
+			require.Zero(t, hooks.GetMeteringContext().GasLeft())
+		})
+
+		t.Run("rejects one gas unit short without shifting", func(t *testing.T) {
+			vmHost, _, destHandle := runShl(t, true, exactGas-1, value, bits)
+
+			requireDestination(t, vmHost, destHandle, big.NewInt(7))
+			require.Equal(t, vmhost.ErrNotEnoughGas.Error(), vmHost.Output().ReturnMessage())
+		})
+	})
+
+	t.Run("rejects an unaffordable result before shifting", func(t *testing.T) {
+		const gasProvided = uint64(1_000_000)
+		vmHost, hooks, destHandle := runShl(t, true, gasProvided, big.NewInt(1), math.MaxInt32)
+
+		requireDestination(t, vmHost, destHandle, big.NewInt(7))
+		require.Equal(t, gasProvided, hooks.GetRuntimeContext().GetPointsUsed())
+		require.Equal(t, vmcommon.VMExecutionFailed, vmHost.Output().ReturnCode())
+		require.Equal(t, vmhost.ErrNotEnoughGas.Error(), vmHost.Output().ReturnMessage())
+	})
+
+	t.Run("negative operands are rejected regardless of fork", func(t *testing.T) {
+		cases := []struct {
+			name  string
+			value int64
+			bits  int32
+		}{
+			{name: "negative source", value: -1, bits: 8},
+			{name: "negative shift", value: 1, bits: -1},
+		}
+		for _, fixAuditV6 := range []bool{false, true} {
+			t.Run(fmt.Sprintf("FixAuditChangesV6=%t", fixAuditV6), func(t *testing.T) {
+				for _, tc := range cases {
+					t.Run(tc.name, func(t *testing.T) {
+						vmHost, _, destHandle := runShl(t, fixAuditV6, 1_000_000, big.NewInt(tc.value), tc.bits)
+
+						requireDestination(t, vmHost, destHandle, big.NewInt(7))
+						require.Equal(t, vmhost.ErrShiftNegative.Error(), vmHost.Output().ReturnMessage())
+					})
+				}
+			})
+		}
 	})
 }

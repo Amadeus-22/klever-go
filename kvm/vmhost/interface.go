@@ -188,6 +188,7 @@ type ManagedTypesContext interface {
 	GetRandReader() io.Reader
 	ConsumeGasForThisBigIntNumberOfBytes(byteLen *big.Int) error
 	ConsumeGasForThisIntNumberOfBytes(byteLen int)
+	ConsumeGasForThisIntNumberOfBytesBounded(byteLen int64) error
 	ConsumeGasForBytes(bytes []byte)
 	ConsumeGasForByteLenBounded(byteLen uint64) error
 	ConsumeGasForAppend(mBufferHandle int32, dataLength int32) error

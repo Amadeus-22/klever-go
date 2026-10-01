@@ -21,6 +21,7 @@ type ManagedTypesContextMock struct {
 	GetRandReaderCalled                            func() io.Reader
 	ConsumeGasForThisBigIntNumberOfBytesCalled     func(byteLen *big.Int) error
 	ConsumeGasForThisIntNumberOfBytesCalled        func(byteLen int)
+	ConsumeGasForThisIntNumberOfBytesBoundedCalled func(byteLen int64) error
 	ConsumeGasForBytesCalled                       func(bytes []byte)
 	ConsumeGasForByteLenBoundedCalled              func(byteLen uint64) error
 	ConsumeGasForAppendCalled                      func(mBufferHandle int32, dataLength int32) error
@@ -120,6 +121,13 @@ func (m *ManagedTypesContextMock) ConsumeGasForThisIntNumberOfBytes(byteLen int)
 	if m.ConsumeGasForThisIntNumberOfBytesCalled != nil {
 		m.ConsumeGasForThisIntNumberOfBytesCalled(byteLen)
 	}
+}
+
+func (m *ManagedTypesContextMock) ConsumeGasForThisIntNumberOfBytesBounded(byteLen int64) error {
+	if m.ConsumeGasForThisIntNumberOfBytesBoundedCalled != nil {
+		return m.ConsumeGasForThisIntNumberOfBytesBoundedCalled(byteLen)
+	}
+	return nil
 }
 
 func (m *ManagedTypesContextMock) ConsumeGasForBytes(bytes []byte) {

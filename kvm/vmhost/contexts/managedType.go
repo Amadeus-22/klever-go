@@ -244,6 +244,18 @@ func (context *managedTypesContext) ConsumeGasForThisIntNumberOfBytes(byteLen in
 	}
 }
 
+// ConsumeGasForThisIntNumberOfBytesBounded charges byteLen * CopyPerByteForTooBig when byteLen exceeds
+// maxBigIntByteLenForNormalCost. Unlike ConsumeGasForThisIntNumberOfBytes, it charges nothing and returns
+// ErrNotEnoughGas when the gas left cannot cover it.
+func (context *managedTypesContext) ConsumeGasForThisIntNumberOfBytesBounded(byteLen int64) error {
+	if byteLen <= maxBigIntByteLenForNormalCost {
+		return nil
+	}
+	metering := context.host.Metering()
+	gasToUse := math.MulUint64(uint64(byteLen), metering.GasSchedule().BigIntAPICost.CopyPerByteForTooBig)
+	return metering.UseGasBounded(gasToUse)
+}
+
 // ConsumeGasForBytes uses gas for the given bytes
 func (context *managedTypesContext) ConsumeGasForBytes(bytes []byte) {
 	metering := context.host.Metering()

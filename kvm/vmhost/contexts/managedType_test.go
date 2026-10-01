@@ -1257,3 +1257,58 @@ func TestManagedTypesContext_ReadManagedVecOfManagedBuffers_FixAuditV6_ClonesOnl
 		require.Equal(t, float64(1), allocs)
 	})
 }
+
+func TestManagedTypesContext_ConsumeGasForThisIntNumberOfBytesBounded(t *testing.T) {
+	t.Parallel()
+
+	const copyPerByteForTooBig = 1_000
+
+	newFixture := func(gasLeft uint64) (*managedTypesContext, *contextmock.MeteringContextMock) {
+		metering := &contextmock.MeteringContextMock{
+			GasCost:     &config.GasCost{BigIntAPICost: config.BigIntAPICost{CopyPerByteForTooBig: copyPerByteForTooBig}},
+			GasLeftMock: gasLeft,
+		}
+		host := &contextmock.VMHostStub{
+			MeteringCalled: func() vmhost.MeteringContext {
+				return metering
+			},
+		}
+		managedTypesCtx, _ := NewManagedTypesContext(host)
+		return managedTypesCtx, metering
+	}
+
+	t.Run("charges nothing up to the normal cost threshold", func(t *testing.T) {
+		t.Parallel()
+
+		for _, byteLen := range []int64{0, 1, maxBigIntByteLenForNormalCost} {
+			ctx, metering := newFixture(0)
+
+			require.NoError(t, ctx.ConsumeGasForThisIntNumberOfBytesBounded(byteLen))
+			require.Equal(t, uint64(0), metering.GasLeft())
+		}
+	})
+
+	t.Run("charges every byte above the normal cost threshold", func(t *testing.T) {
+		t.Parallel()
+
+		const byteLen = maxBigIntByteLenForNormalCost + 1
+		const gasLeft = uint64(1_000_000)
+		ctx, metering := newFixture(gasLeft)
+
+		require.NoError(t, ctx.ConsumeGasForThisIntNumberOfBytesBounded(byteLen))
+		require.Equal(t, gasLeft-byteLen*copyPerByteForTooBig, metering.GasLeft())
+	})
+
+	t.Run("refuses without charging when gas is short", func(t *testing.T) {
+		t.Parallel()
+
+		const byteLen = 1 << 28
+		const gasLeft = uint64(1_000_000)
+		ctx, metering := newFixture(gasLeft)
+
+		err := ctx.ConsumeGasForThisIntNumberOfBytesBounded(byteLen)
+
+		require.ErrorIs(t, err, vmhost.ErrNotEnoughGas)
+		require.Equal(t, gasLeft, metering.GasLeft())
+	})
+}
