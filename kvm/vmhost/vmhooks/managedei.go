@@ -608,7 +608,8 @@ func (context *VMHooksImpl) ManagedUpgradeFromSourceContract(
 		gas,
 		codeMetadata,
 	)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution())
 }
 
 // ManagedUpgradeContract VMHooks implementation.
@@ -658,7 +659,8 @@ func (context *VMHooksImpl) ManagedUpgradeContract(
 	lenReturnData := len(host.Output().ReturnData())
 
 	upgradeContract(host, vmInput.destination, code, codeMetadata, vmInput.value.Bytes(), vmInput.arguments, gas)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution())
 }
 
 // ManagedDeleteContract VMHooks implementation.
@@ -760,7 +762,10 @@ func (context *VMHooksImpl) ManagedDeployFromSourceContract(
 	}
 
 	managedType.SetBytes(resultAddressHandle, newAddress)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return 1
+	}
 
 	return 0
 }
@@ -820,22 +825,28 @@ func (context *VMHooksImpl) ManagedCreateContract(
 	}
 
 	managedType.SetBytes(resultAddressHandle, newAddress)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return 1
+	}
 
 	return 0
 }
 
+// setReturnDataIfExists writes the return data the call added after oldLen into resultHandle as a
+// managed vector. From FixAuditChangesV6 the conversion is charged per item, bounded, and fails
+// with ErrNotEnoughGas instead of making handles it cannot pay for.
 func setReturnDataIfExists(
 	host vmhost.VMHost,
 	oldLen int,
 	resultHandle int32,
-) {
+) error {
 	returnData := host.Output().ReturnData()
 	if len(returnData) > oldLen {
-		host.ManagedTypes().WriteManagedVecOfManagedBuffers(returnData[oldLen:], resultHandle)
-	} else {
-		host.ManagedTypes().SetBytes(resultHandle, make([]byte, 0))
+		return host.ManagedTypes().WriteManagedVecOfManagedBuffers(returnData[oldLen:], resultHandle)
 	}
+	host.ManagedTypes().SetBytes(resultHandle, make([]byte, 0))
+	return nil
 }
 
 // ManagedExecuteReadOnly VMHooks implementation.
@@ -864,7 +875,10 @@ func (context *VMHooksImpl) ManagedExecuteReadOnly(
 		vmInput.destination,
 		vmInput.arguments,
 	)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	if WithFaultAndHost(host, err, host.Runtime().BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
 	return returnVal
 }
 
@@ -896,7 +910,10 @@ func (context *VMHooksImpl) ManagedExecuteOnSameContext(
 		vmInput.destination,
 		vmInput.arguments,
 	)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	if WithFaultAndHost(host, err, host.Runtime().BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
 	return returnVal
 }
 
@@ -928,7 +945,10 @@ func (context *VMHooksImpl) ManagedExecuteOnDestContext(
 		vmInput.destination,
 		vmInput.arguments,
 	)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	if WithFaultAndHost(host, err, host.Runtime().BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
 	return returnVal
 }
 

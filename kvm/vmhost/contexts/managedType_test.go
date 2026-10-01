@@ -1431,3 +1431,116 @@ func TestManagedTypesContext_PushState_FixAuditV6_DoesNotCopyHandles(t *testing.
 	// the deep copy allocates at least one big int per handle
 	require.Greater(t, pushAndPopAllocs(false), float64(numHandles))
 }
+
+// newManagedVecEncodeFixture is newManagedVecDecodeFixture with MBufferNewFromBytes priced too, so
+// the per-item charge of the post-fork conversion is visible.
+func newManagedVecEncodeFixture(fixAuditV6 bool, gasLeft uint64) (*managedTypesContext, *contextmock.MeteringContextMock) {
+	ctx, metering := newManagedVecDecodeFixture(fixAuditV6, gasLeft)
+	metering.GasCost.ManagedBufferAPICost.MBufferNewFromBytes = 2000
+	return ctx, metering
+}
+
+func TestManagedTypesContext_WriteManagedVecOfManagedBuffers_FixAuditV6(t *testing.T) {
+	t.Parallel()
+
+	const dataCopyPerByte = 50
+	const mBufferNewFromBytes = 2000
+	const plenty = uint64(1_000_000_000)
+
+	t.Run("pre-fork charges only the bytes, after the handles are made", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, metering := newManagedVecEncodeFixture(false, plenty)
+		destination := ctx.NewManagedBuffer()
+		handlesBefore := len(ctx.managedTypesValues.mBufferValues)
+		var legacyCharges []uint64
+		var handlesAtCharge []int
+		metering.UseAndTraceGasCalled = func(gas uint64) {
+			legacyCharges = append(legacyCharges, gas)
+			handlesAtCharge = append(handlesAtCharge, len(ctx.managedTypesValues.mBufferValues))
+		}
+
+		err := ctx.WriteManagedVecOfManagedBuffers([][]byte{[]byte("abc"), {}, {}}, destination)
+
+		require.NoError(t, err)
+		require.Equal(t, []uint64{3 * dataCopyPerByte}, legacyCharges)
+		require.Equal(t, []int{handlesBefore + 3}, handlesAtCharge)
+		require.Equal(t, plenty, metering.GasLeft())
+		require.Equal(t, int32(3*handleLen), ctx.GetLength(destination))
+	})
+
+	t.Run("post-fork charges every item and its bytes once", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, metering := newManagedVecEncodeFixture(true, plenty)
+		var legacyCharges []uint64
+		metering.UseAndTraceGasCalled = func(gas uint64) {
+			legacyCharges = append(legacyCharges, gas)
+		}
+		destination := ctx.NewManagedBuffer()
+
+		err := ctx.WriteManagedVecOfManagedBuffers([][]byte{[]byte("abc"), {}, {}}, destination)
+
+		require.NoError(t, err)
+		require.Nil(t, legacyCharges)
+		require.Equal(t, plenty-3*mBufferNewFromBytes-3*dataCopyPerByte, metering.GasLeft())
+
+		vec, err := ctx.GetBytes(destination)
+		require.NoError(t, err)
+		require.Len(t, vec, 3*handleLen)
+		var items [][]byte
+		for i := 0; i < len(vec); i += handleLen {
+			item, err := ctx.GetBytes(int32(binary.BigEndian.Uint32(vec[i : i+handleLen]))) // #nosec G115
+			require.NoError(t, err)
+			items = append(items, item)
+		}
+		require.Equal(t, [][]byte{[]byte("abc"), {}, {}}, items)
+	})
+
+	t.Run("an empty item is no longer free", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, metering := newManagedVecEncodeFixture(true, plenty)
+
+		err := ctx.WriteManagedVecOfManagedBuffers([][]byte{{}}, ctx.NewManagedBuffer())
+
+		require.NoError(t, err)
+		require.Equal(t, plenty-mBufferNewFromBytes, metering.GasLeft())
+	})
+
+	t.Run("a conversion funded to the last unit of gas succeeds", func(t *testing.T) {
+		t.Parallel()
+
+		data := [][]byte{[]byte("abc"), {}, []byte("de")}
+		gasLeft := uint64(3*mBufferNewFromBytes + 5*dataCopyPerByte)
+		ctx, metering := newManagedVecEncodeFixture(true, gasLeft)
+		destination := ctx.NewManagedBuffer()
+		handlesBefore := len(ctx.managedTypesValues.mBufferValues)
+
+		err := ctx.WriteManagedVecOfManagedBuffers(data, destination)
+
+		require.NoError(t, err)
+		require.Zero(t, metering.GasLeft())
+		require.Equal(t, handlesBefore+3, len(ctx.managedTypesValues.mBufferValues))
+		require.Equal(t, int32(3*handleLen), ctx.GetLength(destination))
+	})
+
+	t.Run("an underfunded conversion makes no handle", func(t *testing.T) {
+		t.Parallel()
+
+		const numItems = 1000
+		gasLeft := uint64(numItems*mBufferNewFromBytes - 1)
+		ctx, metering := newManagedVecEncodeFixture(true, gasLeft)
+		destination := ctx.NewManagedBufferFromBytes([]byte("sentinel"))
+		handlesBefore := len(ctx.managedTypesValues.mBufferValues)
+
+		err := ctx.WriteManagedVecOfManagedBuffers(make([][]byte, numItems), destination)
+
+		require.Equal(t, vmhost.ErrNotEnoughGas, err)
+		require.Equal(t, gasLeft, metering.GasLeft())
+		require.Equal(t, handlesBefore, len(ctx.managedTypesValues.mBufferValues))
+		destinationBytes, err := ctx.GetBytes(destination)
+		require.NoError(t, err)
+		require.Equal(t, []byte("sentinel"), destinationBytes)
+	})
+}

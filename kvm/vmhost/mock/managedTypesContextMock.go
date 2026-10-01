@@ -59,7 +59,7 @@ type ManagedTypesContextMock struct {
 	DeleteSliceCalled                              func(mBufferHandle int32, startPosition int32, lengthOfSlice int32) ([]byte, error)
 	InsertSliceCalled                              func(mBufferHandle int32, startPosition int32, slice []byte) ([]byte, error)
 	ReadManagedVecOfManagedBuffersCalled           func(managedVecHandle int32) ([][]byte, uint64, error)
-	WriteManagedVecOfManagedBuffersCalled          func(data [][]byte, destinationHandle int32)
+	WriteManagedVecOfManagedBuffersCalled          func(data [][]byte, destinationHandle int32) error
 	NewManagedMapCalled                            func() int32
 	ManagedMapPutCalled                            func(mMapHandle int32, keyHandle int32, valueHandle int32) error
 	ManagedMapGetCalled                            func(mMapHandle int32, keyHandle int32, outValueHandle int32) error
@@ -385,10 +385,11 @@ func (m *ManagedTypesContextMock) ReadManagedVecOfManagedBuffers(managedVecHandl
 	return nil, 0, nil
 }
 
-func (m *ManagedTypesContextMock) WriteManagedVecOfManagedBuffers(data [][]byte, destinationHandle int32) {
+func (m *ManagedTypesContextMock) WriteManagedVecOfManagedBuffers(data [][]byte, destinationHandle int32) error {
 	if m.WriteManagedVecOfManagedBuffersCalled != nil {
-		m.WriteManagedVecOfManagedBuffersCalled(data, destinationHandle)
+		return m.WriteManagedVecOfManagedBuffersCalled(data, destinationHandle)
 	}
+	return nil
 }
 
 func (m *ManagedTypesContextMock) NewManagedMap() int32 {

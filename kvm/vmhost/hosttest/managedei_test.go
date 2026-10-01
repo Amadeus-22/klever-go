@@ -1123,7 +1123,7 @@ func Test_ManagedDeleteContract(t *testing.T) {
 						managedTypes := host.ManagedTypes()
 
 						argumentsHandle := managedTypes.NewManagedBuffer()
-						managedTypes.WriteManagedVecOfManagedBuffers([][]byte{{1, 2}, {3, 4}}, argumentsHandle)
+						require.NoError(t, managedTypes.WriteManagedVecOfManagedBuffers([][]byte{{1, 2}, {3, 4}}, argumentsHandle))
 
 						destHandle := managedTypes.NewManagedBufferFromBytes(test.ParentAddress)
 
@@ -1159,10 +1159,10 @@ var (
 	failingChildDeleteTarget = test.MakeTestSCAddressWithDefaultVM("failingTarget")
 )
 
-func deleteContractWithHost(host vmhost.VMHost, target []byte) {
+func deleteContractWithHost(t *testing.T, host vmhost.VMHost, target []byte) {
 	managedTypes := host.ManagedTypes()
 	argumentsHandle := managedTypes.NewManagedBuffer()
-	managedTypes.WriteManagedVecOfManagedBuffers(nil, argumentsHandle)
+	require.NoError(t, managedTypes.WriteManagedVecOfManagedBuffers(nil, argumentsHandle))
 	destHandle := managedTypes.NewManagedBufferFromBytes(target)
 
 	vmhooks.ManagedDeleteContractWithHost(host, destHandle, 100000, argumentsHandle)
@@ -1206,16 +1206,16 @@ func runManagedDeleteContractScenario(t *testing.T, fixAuditChangesV6 uint32, pa
 						return childInstance
 					})
 					childInstance.AddMockMethod("deleteChildTarget", func() *mock.InstanceMock {
-						deleteContractWithHost(childInstance.Host, childDeleteTarget)
+						deleteContractWithHost(t, childInstance.Host, childDeleteTarget)
 						return childInstance
 					})
 					childInstance.AddMockMethod("deleteChildTargetAndFail", func() *mock.InstanceMock {
-						deleteContractWithHost(childInstance.Host, failingChildDeleteTarget)
+						deleteContractWithHost(t, childInstance.Host, failingChildDeleteTarget)
 						childInstance.Host.Runtime().SignalUserError("child failed after delete")
 						return childInstance
 					})
 					childInstance.AddMockMethod("deleteParentTargetOnSameContext", func() *mock.InstanceMock {
-						deleteContractWithHost(childInstance.Host, parentDeleteTarget)
+						deleteContractWithHost(t, childInstance.Host, parentDeleteTarget)
 						return childInstance
 					})
 				}),
@@ -1241,7 +1241,7 @@ func runManagedDeleteContractScenario(t *testing.T, fixAuditChangesV6 uint32, pa
 
 func Test_ManagedDeleteContract_ListedOnceAfterNestedCalls(t *testing.T) {
 	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
-		deleteContractWithHost(host, parentDeleteTarget)
+		deleteContractWithHost(t, host, parentDeleteTarget)
 		callChildOnDestContextTimes(t, host, "doNothing", 10)
 	})
 
@@ -1250,7 +1250,7 @@ func Test_ManagedDeleteContract_ListedOnceAfterNestedCalls(t *testing.T) {
 
 func Test_ManagedDeleteContract_RepeatedAfterNestedCallsBeforeFixAuditChangesV6(t *testing.T) {
 	vmOutput := runManagedDeleteContractScenario(t, 1_000_000, func(host vmhost.VMHost) {
-		deleteContractWithHost(host, parentDeleteTarget)
+		deleteContractWithHost(t, host, parentDeleteTarget)
 		callChildOnDestContextTimes(t, host, "doNothing", 3)
 	})
 
@@ -1262,7 +1262,7 @@ func Test_ManagedDeleteContract_RepeatedAfterNestedCallsBeforeFixAuditChangesV6(
 
 func Test_ManagedDeleteContract_ParentAndChildDeletionsListedOnce(t *testing.T) {
 	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
-		deleteContractWithHost(host, parentDeleteTarget)
+		deleteContractWithHost(t, host, parentDeleteTarget)
 		callChildOnDestContextTimes(t, host, "deleteChildTarget", 1)
 		callChildOnDestContextTimes(t, host, "doNothing", 5)
 	})
@@ -1272,8 +1272,8 @@ func Test_ManagedDeleteContract_ParentAndChildDeletionsListedOnce(t *testing.T) 
 
 func Test_ManagedDeleteContract_RepeatedDeleteListedOncePerCall(t *testing.T) {
 	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
-		deleteContractWithHost(host, parentDeleteTarget)
-		deleteContractWithHost(host, parentDeleteTarget)
+		deleteContractWithHost(t, host, parentDeleteTarget)
+		deleteContractWithHost(t, host, parentDeleteTarget)
 		callChildOnDestContextTimes(t, host, "doNothing", 5)
 	})
 

@@ -228,7 +228,7 @@ type ManagedTypesContext interface {
 	DeleteSlice(mBufferHandle int32, startPosition int32, lengthOfSlice int32) ([]byte, error)
 	InsertSlice(mBufferHandle int32, startPosition int32, slice []byte) ([]byte, error)
 	ReadManagedVecOfManagedBuffers(managedVecHandle int32) ([][]byte, uint64, error)
-	WriteManagedVecOfManagedBuffers(data [][]byte, destinationHandle int32)
+	WriteManagedVecOfManagedBuffers(data [][]byte, destinationHandle int32) error
 	NewManagedMap() int32
 	ManagedMapPut(mMapHandle int32, keyHandle int32, valueHandle int32) error
 	ManagedMapGet(mMapHandle int32, keyHandle int32, outValueHandle int32) error

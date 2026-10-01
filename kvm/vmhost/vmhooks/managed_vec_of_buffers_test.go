@@ -204,7 +204,10 @@ type callingHook struct {
 	preForkGas uint64
 	// chargedTwicePreFork is whether the hook billed the decoded arguments a second time pre-fork
 	chargedTwicePreFork bool
-	call                func(host vmhost.VMHost, argumentsHandle int32) func()
+	// returnItems is how many return items the hook converts into the result vector, each charged
+	// MBufferNewFromBytes post-fork
+	returnItems uint64
+	call        func(host vmhost.VMHost, argumentsHandle int32) func()
 }
 
 func callingHooks() []callingHook {
@@ -233,23 +236,23 @@ func callingHooks() []callingHook {
 			dst, fn, result := buffer(host, test.ChildAddress), buffer(host, []byte(managedHookChildFunction)), buffer(host, nil)
 			return func() { _ = hooks(host).ManagedExecuteReadOnly(childGas, dst, fn, args, result) }
 		}},
-		{name: "managedCreateContract", preForkGas: 8096, chargedTwicePreFork: true, call: func(host vmhost.VMHost, args int32) func() {
+		{name: "managedCreateContract", preForkGas: 8096, chargedTwicePreFork: true, returnItems: 1, call: func(host vmhost.VMHost, args int32) func() {
 			value, code, meta := zero(host), buffer(host, childCode), buffer(host, upgradeableMetadata)
 			address, result := buffer(host, nil), buffer(host, nil)
 			return func() { _ = hooks(host).ManagedCreateContract(childGas, value, code, meta, args, address, result) }
 		}},
-		{name: "managedDeployFromSourceContract", preForkGas: 8096, chargedTwicePreFork: true, call: func(host vmhost.VMHost, args int32) func() {
+		{name: "managedDeployFromSourceContract", preForkGas: 8096, chargedTwicePreFork: true, returnItems: 1, call: func(host vmhost.VMHost, args int32) func() {
 			value, source, meta := zero(host), buffer(host, test.ChildAddress), buffer(host, upgradeableMetadata)
 			address, result := buffer(host, nil), buffer(host, nil)
 			return func() {
 				_ = hooks(host).ManagedDeployFromSourceContract(childGas, value, source, meta, args, address, result)
 			}
 		}},
-		{name: "managedUpgradeContract", preForkGas: 8598, chargedTwicePreFork: true, call: func(host vmhost.VMHost, args int32) func() {
+		{name: "managedUpgradeContract", preForkGas: 8598, chargedTwicePreFork: true, returnItems: 1, call: func(host vmhost.VMHost, args int32) func() {
 			dst, value, code, meta, result := buffer(host, test.ChildAddress), zero(host), buffer(host, childCode), buffer(host, upgradeableMetadata), buffer(host, nil)
 			return func() { hooks(host).ManagedUpgradeContract(dst, childGas, value, code, meta, args, result) }
 		}},
-		{name: "managedUpgradeFromSourceContract", preForkGas: 8598, chargedTwicePreFork: true, call: func(host vmhost.VMHost, args int32) func() {
+		{name: "managedUpgradeFromSourceContract", preForkGas: 8598, chargedTwicePreFork: true, returnItems: 1, call: func(host vmhost.VMHost, args int32) func() {
 			dst, value, source, meta, result := buffer(host, test.ChildAddress), zero(host), buffer(host, test.ChildAddress), buffer(host, upgradeableMetadata), buffer(host, nil)
 			return func() { hooks(host).ManagedUpgradeFromSourceContract(dst, childGas, value, source, meta, args, result) }
 		}},
@@ -281,12 +284,13 @@ func TestManagedVecOfBuffers_CallArguments_PostForkPaysEachByteOnce(t *testing.T
 		require.Equal(t, hook.preForkGas, pre.gasUsed, hook.name)
 
 		// the hooks that billed the decoded arguments twice save exactly one DataCopyPerByte per
-		// argument byte post-fork; managedDeleteContract never did, so its gas does not move
+		// argument byte post-fork; managedDeleteContract never did, so its gas does not move. Each
+		// return item converted into the result vector costs MBufferNewFromBytes post-fork
 		saving := uint64(0)
 		if hook.chargedTwicePreFork {
 			saving = argumentBytes * mainnetDataCopyPerByte
 		}
-		require.Equal(t, pre.gasUsed-saving, post.gasUsed, hook.name)
+		require.Equal(t, pre.gasUsed-saving+hook.returnItems*testMBufferNewFromBytes, post.gasUsed, hook.name)
 	}
 }
 

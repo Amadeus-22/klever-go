@@ -914,7 +914,11 @@ func (context *managedTypesContext) readManagedVecOfManagedBuffersBounded(
 func (context *managedTypesContext) WriteManagedVecOfManagedBuffers(
 	data [][]byte,
 	destinationHandle int32,
-) {
+) error {
+	if context.host.ForkController().FixAuditChangesV6() {
+		return context.writeManagedVecOfManagedBuffersBounded(data, destinationHandle)
+	}
+
 	sumOfItemByteLengths := uint64(0)
 	destinationBytes := make([]byte, handleLen*len(data))
 	dataIndex := 0
@@ -928,6 +932,40 @@ func (context *managedTypesContext) WriteManagedVecOfManagedBuffers(
 	context.SetBytes(destinationHandle, destinationBytes)
 	metering := context.host.Metering()
 	metering.UseAndTraceGas(sumOfItemByteLengths * metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
+	return nil
+}
+
+// writeManagedVecOfManagedBuffersBounded is WriteManagedVecOfManagedBuffers once FixAuditChangesV6
+// is active. The legacy path charged only the items' bytes, after the handles were made, so an
+// empty item became a handle for free. Here every item is charged the price of MBufferNewFromBytes
+// on top of its bytes, bounded and before the first handle is made, so an underfunded conversion
+// makes no handle at all.
+func (context *managedTypesContext) writeManagedVecOfManagedBuffersBounded(
+	data [][]byte,
+	destinationHandle int32,
+) error {
+	sumOfItemByteLengths := uint64(0)
+	for _, itemBytes := range data {
+		sumOfItemByteLengths += uint64(len(itemBytes))
+	}
+
+	metering := context.host.Metering()
+	gasSchedule := metering.GasSchedule()
+	gasForItems := math.MulUint64(uint64(len(data)), gasSchedule.ManagedBufferAPICost.MBufferNewFromBytes)
+	gasForBytes := math.MulUint64(sumOfItemByteLengths, gasSchedule.BaseOperationCost.DataCopyPerByte)
+	err := metering.UseGasBounded(math.AddUint64(gasForItems, gasForBytes))
+	if err != nil {
+		return err
+	}
+
+	destinationBytes := make([]byte, handleLen*len(data))
+	for i, itemBytes := range data {
+		itemHandle := context.NewManagedBufferFromBytes(itemBytes)
+		binary.BigEndian.PutUint32(destinationBytes[i*handleLen:], uint32(itemHandle)) // #nosec G115
+	}
+	context.SetBytes(destinationHandle, destinationBytes)
+
+	return nil
 }
 
 // NewManagedMap creates a new empty managed map in the managed buffers map and returns the handle

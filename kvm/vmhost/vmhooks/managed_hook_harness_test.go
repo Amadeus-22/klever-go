@@ -1,12 +1,12 @@
 package vmhooks_test
 
 import (
+	"math/big"
 	"runtime"
 	"testing"
 
 	blockchainConfig "github.com/klever-io/klever-go/config"
 	mock "github.com/klever-io/klever-go/kvm/mock/context"
-	"github.com/klever-io/klever-go/kvm/mock/contracts"
 	worldmock "github.com/klever-io/klever-go/kvm/mock/world"
 	test "github.com/klever-io/klever-go/kvm/testcommon"
 	"github.com/klever-io/klever-go/kvm/vmhost"
@@ -19,8 +19,59 @@ import (
 
 const mainnetDataCopyPerByte = 50
 
+// testMBufferNewFromBytes is MBufferNewFromBytes in the test gas schedule the harness runs on
+const testMBufferNewFromBytes = 1
+
 // managedHookChildFunction is the endpoint of the child contract the calling hooks target.
 const managedHookChildFunction = "deposit"
+
+// managedHookEmptyItemsFunction is both the child endpoint that emits empty return items and the
+// marker that makes the child's init and upgrade emit them: called with the arguments
+// [managedHookEmptyItemsFunction, n], any of the three finishes n empty return items instead of
+// what it would otherwise return. n is read as a big-endian unsigned integer.
+const managedHookEmptyItemsFunction = "emitEmptyItems"
+
+// managedHookFailAfterItemsFunction is managedHookEmptyItemsFunction for a child that fails with
+// managedHookChildFailure once its items are finished.
+const managedHookFailAfterItemsFunction = "emitEmptyItemsAndFail"
+
+// managedHookChildFailure is the error of a child asked for managedHookFailAfterItemsFunction.
+const managedHookChildFailure = "child failed after its return items"
+
+// finishEmptyItemsIfAsked finishes the empty return items the arguments ask for, and reports
+// whether they asked.
+func finishEmptyItemsIfAsked(host vmhost.VMHost) bool {
+	arguments := host.Runtime().Arguments()
+	if len(arguments) != 2 {
+		return false
+	}
+	function := string(arguments[0])
+	if function != managedHookEmptyItemsFunction && function != managedHookFailAfterItemsFunction {
+		return false
+	}
+	numItems := new(big.Int).SetBytes(arguments[1]).Uint64()
+	for i := uint64(0); i < numItems; i++ {
+		host.Output().Finish(nil)
+	}
+	if function == managedHookFailAfterItemsFunction {
+		host.Runtime().SignalUserError(managedHookChildFailure)
+	}
+	return true
+}
+
+// childMethodMock adds a child method that finishes the empty items it is asked for, and otherwise
+// finishes defaultReturn, as contracts.InitFunctionMock and contracts.UpgradeFunctionMock do.
+func childMethodMock(name string, defaultReturn []byte) func(*mock.InstanceMock, any) {
+	return func(childInstance *mock.InstanceMock, _ any) {
+		childInstance.AddMockMethod(name, func() *mock.InstanceMock {
+			host := childInstance.Host
+			if !finishEmptyItemsIfAsked(host) && defaultReturn != nil {
+				host.Output().Finish(defaultReturn)
+			}
+			return childInstance
+		})
+	}
+}
 
 func preForkV6EnableEpochs() blockchainConfig.EnableEpochs {
 	return blockchainConfig.EnableEpochs{FixAuditChangesV5: 0, FixAuditChangesV6: 1_000_000}
@@ -47,6 +98,18 @@ func runManagedHook(
 	t *testing.T,
 	epochs blockchainConfig.EnableEpochs,
 	gasLeftBeforeHook uint64,
+	prepare func(host vmhost.VMHost) func(),
+) managedHookRun {
+	return runManagedHookInWorld(t, epochs, gasLeftBeforeHook, nil, prepare)
+}
+
+// runManagedHookInWorld is runManagedHook with setupWorld, when not nil, run on the host and the
+// world once the world's built-in functions are in place.
+func runManagedHookInWorld(
+	t *testing.T,
+	epochs blockchainConfig.EnableEpochs,
+	gasLeftBeforeHook uint64,
+	setupWorld func(host vmhost.VMHost, world *worldmock.MockWorld),
 	prepare func(host vmhost.VMHost) func(),
 ) managedHookRun {
 	var run managedHookRun
@@ -85,8 +148,10 @@ func runManagedHook(
 				WithOwnerAddress(test.ParentAddress).
 				WithCodeMetadata([]byte{vmcommon.MetadataUpgradeable, 0}).
 				WithMethods(
-					contracts.InitFunctionMock,
-					contracts.UpgradeFunctionMock,
+					childMethodMock(vmhost.InitFunctionName, []byte(vmhost.InitFunctionName)),
+					childMethodMock(vmhost.ContractsUpgradeFunctionName, []byte(vmhost.UpgradeFunctionName)),
+					childMethodMock(managedHookEmptyItemsFunction, nil),
+					childMethodMock(managedHookFailAfterItemsFunction, nil),
 					func(childInstance *mock.InstanceMock, _ any) {
 						childInstance.AddMockMethod(managedHookChildFunction, func() *mock.InstanceMock { return childInstance })
 					}),
@@ -96,6 +161,9 @@ func runManagedHook(
 			caller, err := world.AccountsCacher.LoadUser(test.ParentAddress)
 			require.NoError(t, err)
 			require.NoError(t, caller.AddToBalance(1000, test.KDATestTokenName, true))
+			if setupWorld != nil {
+				setupWorld(host, world)
+			}
 		}).
 		WithInput(test.CreateTestContractCallInputBuilder().
 			WithRecipientAddr(test.ParentAddress).
