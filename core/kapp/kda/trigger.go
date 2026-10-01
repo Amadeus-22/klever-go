@@ -485,6 +485,13 @@ func (k *kdaKapp) updateRoyaltiesReceiver(sender []byte, tc *transaction.AssetTr
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
 
+	// The royalties stop freezes the payout address too, as UpdateRoyalties already enforces
+	if k.forkController.FixAuditChangesV6() && asset.Attributes.GetIsRoyaltiesChangeStopped() {
+		ctx := k.KAppController.GetCurrentKAppContext()
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldRoyaltiesChangeStopped, common.ErrAssetTriggerInvalid.Error())
+		return transaction.Transaction_RoyaltiesChangeStopped, common.ErrAssetTriggerInvalid
+	}
+
 	if len(tc.GetToAddress()) != k.pubkeyConv.Len() {
 		return transaction.Transaction_AccountError, process.ErrInvalidRcvAddr
 	}

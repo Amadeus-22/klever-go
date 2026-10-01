@@ -1493,19 +1493,20 @@ func TestKDATrigger_HandleStopRoyaltiesChange(t *testing.T) {
 }
 
 func TestKDATrigger_UpdateRoyaltiesReceiver(t *testing.T) {
-	kdaKApp := kda.NewKDAKappForTests()
-
 	assetID := [][]byte{defaultAssetID}
 	owner := makeAddress("owner")
 	admin := makeAddress("admin")
 	nonOwner := makeAddress("nonOwner")
 	newReceiver := makeAddress("newReceiver")
+	// a committed receiver that is not the owner, the case the stop protects
+	thirdParty := makeAddress("thirdParty")
 
 	tests := []struct {
 		name          string
 		sender        []byte
 		asset         *kapps.KDAData
 		toAddress     []byte
+		fixV6         bool
 		expectedCode  transaction.Transaction_TXResultCode
 		expectedError error
 	}{
@@ -1554,6 +1555,108 @@ func TestKDATrigger_UpdateRoyaltiesReceiver(t *testing.T) {
 			expectedCode:  transaction.Transaction_AccountError,
 			expectedError: process.ErrInvalidRcvAddr,
 		},
+		{
+			name:   "Royalties change stopped with fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     newReceiver,
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_RoyaltiesChangeStopped,
+			expectedError: common.ErrAssetTriggerInvalid,
+		},
+		{
+			name:   "Royalties change stopped before fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     newReceiver,
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
+		{
+			name:   "Royalties change stopped by non-owner with fix",
+			sender: nonOwner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     newReceiver,
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_AccountNotOwner,
+			expectedError: common.ErrAccNotOwner,
+		},
+		{
+			name:   "Royalties change stopped by admin with fix",
+			sender: admin,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				AdminAddress: admin,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     newReceiver,
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_RoyaltiesChangeStopped,
+			expectedError: common.ErrAssetTriggerInvalid,
+		},
+		{
+			name:   "Royalties change stopped with invalid receiver address and fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     []byte("invalidAddress"),
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_RoyaltiesChangeStopped,
+			expectedError: common.ErrAssetTriggerInvalid,
+		},
+		{
+			name:   "Royalties change stopped with invalid receiver address before fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     []byte("invalidAddress"),
+			expectedCode:  transaction.Transaction_AccountError,
+			expectedError: process.ErrInvalidRcvAddr,
+		},
+		{
+			name:   "Nil attributes with fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+			},
+			toAddress:     newReceiver,
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
+		{
+			name:   "Royalties change not stopped with fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{},
+			},
+			toAddress:     newReceiver,
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
 	}
 
 	kdaAccHandler := &mock.KAppAccountHandlerStub{
@@ -1568,6 +1671,13 @@ func TestKDATrigger_UpdateRoyaltiesReceiver(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			kdaKApp := kda.NewKDAKappForTests()
+			fc := mock.NewForkControllerStub()
+			fc.SetFork("FixAuditChangesV6", tt.fixV6)
+			kdaKApp.SetForkController(fc)
+
+			previousReceiver := tt.asset.Royalties.GetAddress()
+
 			tc := &transaction.AssetTriggerContract{
 				ToAddress: tt.toAddress,
 			}
@@ -1576,9 +1686,122 @@ func TestKDATrigger_UpdateRoyaltiesReceiver(t *testing.T) {
 			assert.Equal(t, tt.expectedError, err)
 			if err == nil {
 				assert.Equal(t, tt.toAddress, tt.asset.Royalties.Address)
+			} else {
+				assert.Equal(t, previousReceiver, tt.asset.Royalties.Address)
 			}
 		})
 	}
+}
+
+// KLC-2737: once royalty changes are stopped, the receiver is frozen too,
+// through the native trigger and the smart-contract builtin alike
+func TestKDATrigger_ChangeRoyaltiesReceiverAfterStop(t *testing.T) {
+	newReceiver := makeAddress("newReceiver")
+	admin := makeAddress("admin")
+	thirdParty := makeAddress("thirdParty")
+
+	assetTypes := []transaction.CreateAssetContract_EnumAssetType{
+		transaction.CreateAssetContract_Fungible,
+		transaction.CreateAssetContract_NonFungible,
+		transaction.CreateAssetContract_SemiFungible,
+	}
+	stops := []string{"none", "trigger", "create"}
+	paths := []string{"trigger", "builtin"}
+	senders := map[string][]byte{"owner": defaultSender, "admin": admin}
+
+	for _, assetType := range assetTypes {
+		for _, stop := range stops {
+			for _, path := range paths {
+				for senderName, sender := range senders {
+					for _, fixV6 := range []bool{true, false} {
+						name := fmt.Sprintf("%s/stop=%s/%s/%s/fixV6=%v", assetType, stop, path, senderName, fixV6)
+						t.Run(name, func(t *testing.T) {
+							kc, err := createMockControllers()
+							require.NoError(t, err)
+							kc.GetForkController().(*mock.ForkControllerStub).SetFork("FixAuditChangesV6", fixV6)
+
+							_, err = kc.GetKDAKApp().Create(defaultSender, &transaction.CreateAssetContract{
+								Type:         assetType,
+								Name:         defaultTicker,
+								Ticker:       defaultTicker,
+								OwnerAddress: defaultSender,
+								AdminAddress: admin,
+								Properties:   &transaction.PropertiesInfo{CanMint: true},
+								Royalties:    &transaction.RoyaltiesInfo{Address: thirdParty},
+								Attributes: &transaction.AttributesInfo{
+									IsRoyaltiesChangeStopped: stop == "create",
+								},
+							})
+							require.NoError(t, err)
+
+							if stop == "trigger" {
+								_, err = kc.GetKDAKApp().Trigger(defaultSender, &transaction.AssetTriggerContract{
+									TriggerType: transaction.AssetTriggerContract_StopRoyaltiesChange,
+									AssetID:     defaultAssetID,
+								}, nil)
+								require.NoError(t, err)
+							}
+
+							ctx := kc.GetCurrentKAppContext()
+
+							switch path {
+							case "trigger":
+								_, err = kc.GetKDAKApp().Trigger(sender, &transaction.AssetTriggerContract{
+									TriggerType: transaction.AssetTriggerContract_ChangeRoyaltiesReceiver,
+									AssetID:     defaultAssetID,
+									ToAddress:   newReceiver,
+								}, nil)
+							case "builtin":
+								builtin, errNew := builtInFunctions.NewKleverAssetTriggerFunc(
+									0,
+									&mock.ProtoMarshalizerMock{},
+									kc.GetAccountsKApp().GetAccountsCacher(),
+									kc.GetForkController(),
+									kc,
+								)
+								require.NoError(t, errNew)
+
+								_, err = builtin.ProcessBuiltinFunction(&vmcommon.ContractCallInput{
+									VMInput: vmcommon.VMInput{
+										CallerAddr: sender,
+										Arguments: [][]byte{
+											big.NewInt(int64(transaction.AssetTriggerContract_ChangeRoyaltiesReceiver)).Bytes(),
+											defaultAssetID,
+											newReceiver,
+										},
+									},
+								})
+							}
+
+							_, asset, errGet := kc.GetKDAKApp().GetKDA(defaultAssetID)
+							require.NoError(t, errGet)
+
+							if stop != "none" && fixV6 {
+								require.Equal(t, common.ErrAssetTriggerInvalid, err)
+								assert.Equal(t, thirdParty, asset.Royalties.Address)
+								assert.True(t, hasErrorReceipt(ctx, common.ErrFieldRoyaltiesChangeStopped))
+								return
+							}
+
+							require.NoError(t, err)
+							assert.Equal(t, newReceiver, asset.Royalties.Address)
+							assert.False(t, hasErrorReceipt(ctx, common.ErrFieldRoyaltiesChangeStopped))
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func hasErrorReceipt(ctx kapp.KappContext, field string) bool {
+	for _, receipt := range ctx.Receipts().GetByType(int8(kapp.ReceiptTypeError)) {
+		if data := receipt.GetData(); len(data) > 1 && string(data[1]) == field {
+			return true
+		}
+	}
+
+	return false
 }
 
 func TestKDATrigger_UpdateStaking(t *testing.T) {

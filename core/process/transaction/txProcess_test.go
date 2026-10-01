@@ -3250,6 +3250,131 @@ func TestTxProcessor_ProcessAssetTriggerWrongValsShouldErr(t *testing.T) {
 	assert.Equal(t, process.ErrInvalidRcvAddr, err)
 }
 
+func TestTxProcessor_ChangeRoyaltiesReceiverAfterStop(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name               string
+		fixAuditV6Epoch    uint32
+		expectedErr        error
+		expectedResultCode transaction.Transaction_TXResultCode
+	}{
+		{
+			name:               "refused once FixAuditChangesV6 is active",
+			fixAuditV6Epoch:    0,
+			expectedErr:        common.ErrAssetTriggerInvalid,
+			expectedResultCode: transaction.Transaction_RoyaltiesChangeStopped,
+		},
+		{
+			name:               "allowed before FixAuditChangesV6",
+			fixAuditV6Epoch:    math.MaxUint32,
+			expectedErr:        nil,
+			expectedResultCode: transaction.Transaction_Ok,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			args := createBaseKAppsProcessingArgs()
+			kdaKapp := loadKAppAccount(args.AccountsCacher, kapps.KDAKAppAddress)
+			stakingKapp := loadKAppAccount(args.AccountsCacher, kapps.StakingKAppAddress)
+			proposalKapp := loadKAppAccount(args.AccountsCacher, kapps.ProposalKAppAddress)
+			initKLVAndKFIintoKapps(kdaKapp, stakingKapp)
+			err := args.AccountsCacher.SaveAll()
+			require.Nil(t, err)
+
+			forkController, err := fork.NewForkController(config.EnableEpochs{
+				FixAuditChangesV6: tc.fixAuditV6Epoch,
+			}, &commonMock.EpochNotifierStub{})
+			require.NoError(t, err)
+			args.ForkController = forkController
+
+			args.KAppController, err = kappcontroller.NewKappController(kappcontroller.ArgsNewKApp{
+				Hasher:         args.Hasher,
+				Marshalizer:    args.Marshalizer,
+				PubkeyConv:     args.PubkeyConv,
+				ForkController: forkController,
+				AccountsCacher: args.AccountsCacher,
+				RatingsData:    args.RatingsData,
+			})
+			require.NoError(t, err)
+
+			pc := initProposalKapp(proposalKapp)
+			InitKapps(args.KAppController, args.AccountsCacher, pc)
+
+			execTx, err := pTX.NewTxProcessor(args)
+			require.Nil(t, err)
+
+			block := createBlockHeader()
+			run := func(contract proto.Message, cType transaction.TXContract_ContractType) (*transaction.Transaction, error) {
+				tx, errMock := createTransactionMock(contract, cType, testOwnerAddress, 0)
+				require.NoError(t, errMock)
+
+				_, hash, errPre := execTx.PreProcessTransaction(tx)
+				require.NoError(t, errPre)
+
+				return tx, execTx.ProcessTransaction(block, hash, tx)
+			}
+
+			createContract := transaction.CreateAssetContract{
+				Type:         transaction.CreateAssetContract_NonFungible,
+				Name:         []byte("NFT"),
+				Ticker:       []byte("NFT"),
+				OwnerAddress: testOwnerAddress,
+				MaxSupply:    10_000,
+				Properties:   &transaction.PropertiesInfo{CanMint: true},
+				Royalties:    &transaction.RoyaltiesInfo{Address: testReferralAddress},
+			}
+			createTx, err := createTransactionMock(&createContract, transaction.TXContract_CreateAssetContractType, testOwnerAddress, 0)
+			require.NoError(t, err)
+
+			ownerAcc, hash, err := execTx.PreProcessTransaction(createTx)
+			require.NoError(t, err)
+
+			err = execTx.ProcessTransaction(block, hash, createTx)
+			require.NoError(t, err)
+
+			assetID := kda.CreateNewAssetIdentifier(args.Hasher, block.GetRandSeed(), testOwnerAddress, ownerAcc.GetNonce(), createContract.GetTicker(), 0)
+
+			_, err = run(&transaction.AssetTriggerContract{
+				TriggerType: transaction.AssetTriggerContract_StopRoyaltiesChange,
+				AssetID:     assetID,
+			}, transaction.TXContract_AssetTriggerContractType)
+			require.NoError(t, err)
+
+			tx, err := run(&transaction.AssetTriggerContract{
+				TriggerType: transaction.AssetTriggerContract_ChangeRoyaltiesReceiver,
+				AssetID:     assetID,
+				ToAddress:   testToAddress,
+			}, transaction.TXContract_AssetTriggerContractType)
+			assert.Equal(t, tc.expectedErr, err)
+			assert.Equal(t, tc.expectedResultCode, tx.GetResultCode())
+			assert.Equal(t, tc.expectedErr != nil, hasErrorReceiptField(tx, common.ErrFieldRoyaltiesChangeStopped))
+
+			expectedReceiver := testToAddress
+			if tc.expectedErr != nil {
+				expectedReceiver = testReferralAddress
+			}
+			_, asset, err := args.KAppController.GetKDAKApp().GetKDA(assetID)
+			require.NoError(t, err)
+			assert.Equal(t, expectedReceiver, asset.GetRoyalties().GetAddress())
+		})
+	}
+}
+
+func hasErrorReceiptField(tx *transaction.Transaction, field string) bool {
+	for _, receipt := range tx.GetReceipts() {
+		data := receipt.GetData()
+		if len(data) > 1 && len(data[0]) > 0 && data[0][0] == byte(kapp.ReceiptTypeError) && string(data[1]) == field {
+			return true
+		}
+	}
+
+	return false
+}
+
 func TestTxProcessor_ProcessAssetTriggerOkValsShouldWork(t *testing.T) {
 	t.Parallel()
 
