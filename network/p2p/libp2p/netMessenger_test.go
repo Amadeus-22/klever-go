@@ -640,7 +640,7 @@ func TestLibp2pMessenger_UnregisterAllTopicValidatorShouldWork(t *testing.T) {
 }
 
 func TestLibp2pMessenger_BroadcastDataLargeMessageShouldNotCallSend(t *testing.T) {
-	msg := make([]byte, libp2p.MaxSendBuffSize+1)
+	msg := make([]byte, p2p.MaxSendBuffSize+1)
 	mes, _ := libp2p.NewNetworkMessenger(createMockNetworkArgs())
 	mes.SetLoadBalancer(&mock.ChannelLoadBalancerStub{
 		GetChannelOrDefaultCalled: func(pipe string) chan *p2p.SendableData {
@@ -815,7 +815,7 @@ func TestLibp2pMessenger_BroadcastOnChannelBlockingReleasesSlotOnPanic(t *testin
 }
 
 func TestLibp2pMessenger_BroadcastDataBetween2PeersWithLargeMsgShouldWork(t *testing.T) {
-	msg := make([]byte, libp2p.MaxSendBuffSize)
+	msg := make([]byte, p2p.MaxSendBuffSize)
 
 	_, mes1, mes2 := createMockNetworkOf2()
 
@@ -1291,6 +1291,45 @@ func TestLibp2pMessenger_SendDirectWithMockNetToConnectedPeerShouldWork(t *testi
 	assert.Nil(t, err)
 
 	waitDoneWithTimeout(t, chanDone, timeoutWaitResponses)
+
+	_ = mes1.Close()
+	_ = mes2.Close()
+}
+
+func TestLibp2pMessenger_SendDirectWithMockNetLargestPayloadShouldWork(t *testing.T) {
+	framed, err := (&commonMock.ProtoMarshalizerMock{}).Marshal(&data.TopicMessage{
+		Version:   libp2p.CurrentTopicMessageVersion,
+		Payload:   make([]byte, p2p.MaxSendBuffSize),
+		Timestamp: time.Now().Unix(),
+	})
+	require.Nil(t, err)
+	frameSize := len(framed) - p2p.MaxSendBuffSize
+
+	largestPayload := bytes.Repeat([]byte{65}, p2p.MaxSendBuffSize-frameSize)
+
+	_, mes1, mes2 := createMockNetworkOf2()
+	_ = mes1.ConnectToPeer(mes2.Addresses()[0])
+
+	wg := &sync.WaitGroup{}
+	chanDone := make(chan bool)
+	wg.Add(1)
+
+	go func() {
+		wg.Wait()
+		chanDone <- true
+	}()
+
+	prepareMessengerForMatchDataReceive(mes2, largestPayload, wg)
+
+	time.Sleep(time.Second)
+
+	err = mes1.SendToConnectedPeer("test", largestPayload, mes2.ID())
+	assert.Nil(t, err)
+
+	waitDoneWithTimeout(t, chanDone, timeoutWaitResponses)
+
+	err = mes1.SendToConnectedPeer("test", append(largestPayload, 65), mes2.ID())
+	assert.True(t, errors.Is(err, p2p.ErrMessageTooLarge))
 
 	_ = mes1.Close()
 	_ = mes2.Close()

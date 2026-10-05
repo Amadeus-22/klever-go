@@ -19,7 +19,6 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-var MaxSendBuffSize = maxSendBuffSize
 var SeenMessagesPerPeer = seenMessagesPerPeer
 var BroadcastGoRoutines = broadcastGoRoutines
 var PubsubTimeCacheDuration = pubsubTimeCacheDuration

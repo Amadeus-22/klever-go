@@ -191,7 +191,7 @@ func (ds *directSender) directStreamHandler(s network.Stream) {
 		return
 	}
 
-	reader := ggio.NewDelimitedReader(s, 1<<20)
+	reader := ggio.NewDelimitedReader(s, p2p.MaxFramedMessageSize)
 
 	go ds.readInboundStream(s, reader, remotePeer)
 }
@@ -381,8 +381,8 @@ func (ds *directSender) NextSeqno() []byte {
 
 // Send will send a direct message to the connected peer
 func (ds *directSender) Send(topic string, buff []byte, peer core.PeerID) error {
-	if len(buff) >= maxSendBuffSize {
-		return fmt.Errorf("%w, to be sent: %d, maximum: %d", p2p.ErrMessageTooLarge, len(buff), maxSendBuffSize)
+	if len(buff) > p2p.MaxSendBuffSize {
+		return fmt.Errorf("%w, to be sent: %d, maximum: %d", p2p.ErrMessageTooLarge, len(buff), p2p.MaxSendBuffSize)
 	}
 
 	mut := ds.mutexForPeer.Get(string(peer))

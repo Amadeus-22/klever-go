@@ -254,6 +254,9 @@ var ErrNilForkController = errors.New("nil fork controller")
 
 var ErrStoreProtectedKey = errors.New("cannot persist storage update to protected key")
 
+// ErrStorageKeyTooLong signals a storage update whose key exceeds common.MaxStorageKeyLength
+var ErrStorageKeyTooLong = errors.New("cannot persist storage update with a key longer than the maximum storage key length")
+
 // ErrNilAddressContainer signals that an operation has been attempted to or with a nil AddressContainer implementation
 var ErrNilAddressContainer = errors.New("nil AddressContainer")
 

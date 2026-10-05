@@ -16,13 +16,16 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/crypto/hashing"
 	"github.com/klever-io/klever-go/crypto/hashing/keccak"
 	"github.com/klever-io/klever-go/data"
+	"github.com/klever-io/klever-go/data/batch"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/trie"
+	"github.com/klever-io/klever-go/network/p2p"
 	"github.com/klever-io/klever-go/storage"
 	"github.com/klever-io/klever-go/storage/storageUnit"
 	"github.com/klever-io/klever-go/tools/marshal"
@@ -513,6 +516,30 @@ func TestPatriciaMerkleTrie_GetSerializedNodesLeafBiggerThanBufferShouldStillBeS
 	require.Equal(t, 1, len(serializedNodes))
 	require.Greater(t, uint64(len(serializedNodes[0])), maxBuffToSend)
 	require.Equal(t, uint64(0), remainingSpace)
+}
+
+func TestPatriciaMerkleTrie_GetSerializedNodesMaxStorageKeyLeafShouldFitSendLimit(t *testing.T) {
+	t.Parallel()
+
+	minSendHeadroom := 64 * 1024
+	marshalizer := &mock.ProtobufMarshalizerMock{}
+
+	tr := emptyTrie()
+	tracker := state.NewTrackableDataTrie(make([]byte, 32), tr)
+	key := bytes.Repeat([]byte{0xff}, common.MaxStorageKeyLength)
+	require.Nil(t, tracker.SaveKeyValue(key, bytes.Repeat([]byte{0xff}, int(state.MaxLeafSize))))
+	require.Nil(t, tr.Update(key, tracker.DirtyData()[string(key)]))
+	require.Nil(t, tr.Commit())
+	rootHash, _ := tr.RootHash()
+
+	serializedNodes, _, err := tr.GetSerializedNodes(rootHash, uint64(1<<18))
+	require.Nil(t, err)
+	require.Equal(t, 1, len(serializedNodes))
+
+	response, err := marshalizer.Marshal(&batch.Batch{Data: serializedNodes})
+	require.Nil(t, err)
+
+	require.LessOrEqual(t, len(response)+minSendHeadroom, p2p.MaxSendBuffSize)
 }
 
 func TestPatriciaMerkleTrie_GetSerializedNodesOversizedFirstNodeShouldNotWrapRemainingSpace(t *testing.T) {

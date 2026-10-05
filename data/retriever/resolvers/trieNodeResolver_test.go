@@ -20,11 +20,6 @@ import (
 
 var fromConnectedPeer = core.PeerID("from connected peer")
 
-// maxP2PSendBuffSize mirrors maxSendBuffSize of network/p2p/libp2p/netMessenger.go: a response
-// larger than this is rejected with ErrMessageTooLarge and the requester gets nothing, so it is
-// the real bound the aggregate budget has to keep the response under.
-const maxP2PSendBuffSize = (1 << 20) - 64*1024
-
 func createMockArgTrieNodeResolver() resolvers.ArgTrieNodeResolver {
 	return resolvers.ArgTrieNodeResolver{
 		SenderResolver:   &mock.TopicResolverSenderStub{},
@@ -655,7 +650,7 @@ func TestTrieNodeResolver_ProcessReceivedMessageServesOversizedLeafAtAnyPosition
 		require.Nil(t, tnRes.ProcessReceivedMessage(&mock.P2PMessageMock{DataField: data}, fromConnectedPeer))
 		// served alone: appended to the other nodes the batch would be rejected as too large
 		assert.Equal(t, [][]byte{oversizedLeaf}, sentNodes)
-		assert.Less(t, sentBuffLen, maxP2PSendBuffSize)
+		assert.LessOrEqual(t, sentBuffLen, p2p.MaxSendBuffSize)
 	}
 }
 

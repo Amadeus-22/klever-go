@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/data/state"
@@ -476,6 +477,93 @@ func TestStorageContext_StorageProtection(t *testing.T) {
 	require.Equal(t, vmhost.StorageUnchanged, storageStatus)
 	require.True(t, errors.Is(err, vmhost.ErrCannotWriteProtectedKey))
 	require.Len(t, storageCtx.GetStorageUpdates(address), 1)
+}
+
+func TestStorageContext_SetStorage_KeyLengthLimit(t *testing.T) {
+	t.Parallel()
+
+	address := []byte("account")
+	mockOutput := &contextmock.OutputContextMock{}
+	account := mockOutput.NewVMOutputAccount(address)
+	mockOutput.OutputAccountMock = account
+	mockOutput.OutputAccountIsNew = false
+
+	mockRuntime := &contextmock.RuntimeContextMock{}
+	mockMetering := &contextmock.MeteringContextMock{}
+	mockMetering.SetGasSchedule(config.MakeGasMapForTests())
+	mockMetering.BlockGasLimitMock = uint64(10_000_000)
+	mockMetering.GasLeftMock = 10_000_000
+
+	forkController := &mock.ForkControllerStub{}
+	host := &contextmock.VMHostMock{
+		OutputContext:         mockOutput,
+		MeteringContext:       mockMetering,
+		RuntimeContext:        mockRuntime,
+		ForkControllerContext: forkController,
+	}
+	bcHook := &contextmock.BlockchainHookStub{}
+
+	storageCtx, _ := NewStorageContext(host, bcHook, reservedTestPrefix)
+	storageCtx.SetAddress(address)
+
+	value := []byte("data")
+	keyAtLimit := bytes.Repeat([]byte("a"), common.MaxStorageKeyLength)
+	keyOverLimit := bytes.Repeat([]byte("b"), common.MaxStorageKeyLength+1)
+
+	storageStatus, err := storageCtx.SetStorage(keyOverLimit, value)
+	require.Nil(t, err)
+	require.Equal(t, vmhost.StorageAdded, storageStatus)
+	require.Len(t, storageCtx.GetStorageUpdates(address), 1)
+
+	forkController.FixAuditChangesV6Value = true
+
+	storageStatus, err = storageCtx.SetStorage(keyAtLimit, value)
+	require.Nil(t, err)
+	require.Equal(t, vmhost.StorageAdded, storageStatus)
+	require.Len(t, storageCtx.GetStorageUpdates(address), 2)
+
+	otherKeyOverLimit := bytes.Repeat([]byte("c"), common.MaxStorageKeyLength+1)
+	storageStatus, err = storageCtx.SetStorage(otherKeyOverLimit, value)
+	require.Equal(t, vmhost.StorageUnchanged, storageStatus)
+	require.True(t, errors.Is(err, vmhost.ErrStorageKeyTooLong))
+	rejectedUpdate, cached := storageCtx.GetStorageUpdates(address)[string(otherKeyOverLimit)]
+	require.False(t, cached && rejectedUpdate.Written)
+
+	storageStatus, err = storageCtx.SetStorage(keyOverLimit, value)
+	require.Nil(t, err)
+	require.Equal(t, vmhost.StorageUnchanged, storageStatus)
+
+	storageStatus, err = storageCtx.SetStorage(keyOverLimit, []byte("other"))
+	require.Equal(t, vmhost.StorageUnchanged, storageStatus)
+	require.True(t, errors.Is(err, vmhost.ErrStorageKeyTooLong))
+
+	storageStatus, err = storageCtx.SetStorage(keyOverLimit, []byte("d"))
+	require.Equal(t, vmhost.StorageUnchanged, storageStatus)
+	require.True(t, errors.Is(err, vmhost.ErrStorageKeyTooLong))
+	require.Equal(t, value, storageCtx.GetStorageUpdates(address)[string(keyOverLimit)].Data)
+
+	storageStatus, err = storageCtx.SetStorage(keyOverLimit, nil)
+	require.Nil(t, err)
+	require.Equal(t, vmhost.StorageDeleted, storageStatus)
+
+	timeLockKeyPrefix := string(storageCtx.GetVmProtectedPrefix(vmhost.TimeLockKeyPrefix))
+	userKeyAtLimit := common.MaxStorageKeyLength - len(timeLockKeyPrefix)
+	timeLockKeyAtLimit := vmhost.CustomStorageKey(timeLockKeyPrefix, bytes.Repeat([]byte("a"), userKeyAtLimit))
+	timeLockKeyBelowLimit := vmhost.CustomStorageKey(timeLockKeyPrefix, bytes.Repeat([]byte("b"), userKeyAtLimit-1))
+	timeLockKeyOverLimit := vmhost.CustomStorageKey(timeLockKeyPrefix, bytes.Repeat([]byte("c"), userKeyAtLimit+1))
+	require.Len(t, timeLockKeyAtLimit, common.MaxStorageKeyLength)
+
+	storageStatus, err = storageCtx.SetProtectedStorage(timeLockKeyBelowLimit, value)
+	require.Nil(t, err)
+	require.Equal(t, vmhost.StorageAdded, storageStatus)
+
+	storageStatus, err = storageCtx.SetProtectedStorage(timeLockKeyAtLimit, value)
+	require.Nil(t, err)
+	require.Equal(t, vmhost.StorageAdded, storageStatus)
+
+	storageStatus, err = storageCtx.SetProtectedStorage(timeLockKeyOverLimit, value)
+	require.Equal(t, vmhost.StorageUnchanged, storageStatus)
+	require.True(t, errors.Is(err, vmhost.ErrStorageKeyTooLong))
 }
 
 func TestStorageContext_GetStorageFromAddress(t *testing.T) {

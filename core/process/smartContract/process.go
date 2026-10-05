@@ -832,6 +832,13 @@ func (sc *scProcessor) saveStorageUpdates(acc state.UserAccountHandler, outAcc *
 			log.Warn("saveKeyValue", "error", process.ErrStoreProtectedKey, "key", storeUpdate.Offset)
 			return process.ErrStoreProtectedKey
 		}
+		if !storeUpdate.Written && sc.forkController.FixAuditChangesV6() {
+			continue
+		}
+		if len(storeUpdate.Data) > 0 && len(storeUpdate.Offset) > common.MaxStorageKeyLength && sc.forkController.FixAuditChangesV6() {
+			log.Warn("saveKeyValue", "error", process.ErrStorageKeyTooLong, "keyLength", len(storeUpdate.Offset))
+			return process.ErrStorageKeyTooLong
+		}
 		err := acc.SaveKeyValue(storeUpdate.Offset, storeUpdate.Data)
 		if err != nil {
 			log.Warn("saveKeyValue", "error", err)

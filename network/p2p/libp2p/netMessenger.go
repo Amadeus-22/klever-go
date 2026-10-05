@@ -69,11 +69,6 @@ const timeBetweenExternalLoggersCheck = time.Second * 20
 const minRangePortValue = 1025
 const noSignPolicy = pubsub.MessageSignaturePolicy(0) //should be used only in tests
 
-// TODO remove the header size of the message when commit d3c5ecd3a3e884206129d9f2a9a4ddfd5e7c8951 from
-// https://github.com/libp2p/go-libp2p-pubsub/pull/189/commits will be part of a new release
-var messageHeader = 64 * 1024 //64kB
-var maxSendBuffSize = (1 << 20) - messageHeader
-
 var log = logger.GetOrCreate("p2p/libp2p")
 
 var _ p2p.Messenger = (*networkMessenger)(nil)
@@ -795,8 +790,8 @@ func (netMes *networkMessenger) BroadcastOnChannelBlocking(channel string, topic
 }
 
 func (netMes *networkMessenger) checkSendableData(buff []byte) error {
-	if len(buff) > maxSendBuffSize {
-		return fmt.Errorf("%w, to be sent: %d, maximum: %d", p2p.ErrMessageTooLarge, len(buff), maxSendBuffSize)
+	if len(buff) > p2p.MaxSendBuffSize {
+		return fmt.Errorf("%w, to be sent: %d, maximum: %d", p2p.ErrMessageTooLarge, len(buff), p2p.MaxSendBuffSize)
 	}
 	if len(buff) == 0 {
 		return p2p.ErrEmptyBufferToSend

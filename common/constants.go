@@ -22,6 +22,16 @@ const MaxPerTransaction = "MaxPerTransaction"
 
 const EmptyJSonMarshalData = "{}"
 
+// MaxStorageKeyLength is the longest storage key a contract may write once FixAuditChangesV6 is active.
+// It is a policy limit with a wide margin, not a value derived to the byte from the transport. A data-trie
+// leaf holds its key three times over: the nibble path (2 bytes per key byte) plus the key embedded in the
+// stored value (value + key + 32-byte owner address). For the worst-case leaf, a 4,096-byte key holding a
+// data/state.MaxLeafSize value (786,432), the trie-node response is 3*4,096 + 786,432 + 32 (owner)
+// + 13 (nibble terminator and protobuf framing) = 798,765 bytes. The p2p TopicMessage frame adds about
+// 12 bytes on top, covered by the at least 64 KiB of headroom under p2p.MaxSendBuffSize (983,040) that
+// the trie tests assert.
+const MaxStorageKeyLength = 4 * 1024
+
 // Error receipt field constants for consistent error tracking in transaction receipts.
 // These are used as the first parameter in ctx.Receipts().AddError(contractID, field, reason)
 // to identify which field/aspect of a transaction caused the error.

@@ -2554,3 +2554,90 @@ func TestScProcessor_ProcessSCOutputAccountsRejectsProtectedKeyWrite(t *testing.
 		require.NoError(t, err)
 	})
 }
+
+func TestScProcessor_ProcessSCOutputAccountsRejectsOverLimitStorageKeyWrite(t *testing.T) {
+	t.Parallel()
+
+	arguments := createMockSmartContractProcessorArguments()
+	sc, err := NewSmartContractProcessor(arguments)
+	require.Nil(t, err)
+
+	preForkArguments := createMockSmartContractProcessorArguments()
+	preForkArguments.ForkController, err = fork.NewForkController(config.EnableEpochs{FixAuditChangesV6: 100}, &commommock.EpochNotifierStub{})
+	require.Nil(t, err)
+	preForkSc, err := NewSmartContractProcessor(preForkArguments)
+	require.Nil(t, err)
+
+	contract := transaction.SmartContract{
+		Type:      transaction.SmartContract_SCDeploy,
+		CallValue: map[string]*transaction.CallValue{"KLV": {Amount: 0}},
+	}
+	tx, _ := createTransactionMock(&contract, transaction.TXContract_SmartContractType, []byte("SRC"), 0, [][]byte{[]byte("data")})
+	ctx := createDefaultContext(tx)
+
+	address := []byte("output-account-address")
+	buildAccounts := func(offset []byte, data []byte, written bool) []*vmcommon.OutputAccount {
+		return []*vmcommon.OutputAccount{
+			{
+				Address: address,
+				StorageUpdates: map[string]*vmcommon.StorageUpdate{
+					string(offset): {Offset: offset, Data: data, Written: written},
+				},
+			},
+		}
+	}
+
+	isPersisted := func(processor *scProcessor, key []byte) bool {
+		acc, errLoad := processor.getAccountFromAddress(address)
+		require.Nil(t, errLoad)
+		_, found := acc.DataTrieTracker().DirtyData()[string(key)]
+		return found
+	}
+
+	keyAtLimit := bytes.Repeat([]byte("a"), common.MaxStorageKeyLength)
+	keyOverLimit := bytes.Repeat([]byte("b"), common.MaxStorageKeyLength+1)
+	readOnlyKeyOverLimit := bytes.Repeat([]byte("c"), common.MaxStorageKeyLength+1)
+	readOnlyKey := []byte("regular")
+
+	t.Run("written over-limit key is rejected", func(t *testing.T) {
+		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(keyOverLimit, []byte("data"), true))
+		require.Equal(t, process.ErrStorageKeyTooLong, err)
+		require.False(t, isPersisted(sc, keyOverLimit))
+	})
+
+	t.Run("read-only over-limit key is not persisted", func(t *testing.T) {
+		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(readOnlyKeyOverLimit, []byte("data"), false))
+		require.NoError(t, err)
+		require.False(t, isPersisted(sc, readOnlyKeyOverLimit))
+	})
+
+	t.Run("read-only regular key is not re-saved", func(t *testing.T) {
+		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(readOnlyKey, []byte("data"), false))
+		require.NoError(t, err)
+		require.False(t, isPersisted(sc, readOnlyKey))
+	})
+
+	t.Run("deleted over-limit key is not rejected", func(t *testing.T) {
+		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(keyOverLimit, nil, true))
+		require.NoError(t, err)
+		require.True(t, isPersisted(sc, keyOverLimit))
+	})
+
+	t.Run("key at the limit is persisted", func(t *testing.T) {
+		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(keyAtLimit, []byte("data"), true))
+		require.NoError(t, err)
+		require.True(t, isPersisted(sc, keyAtLimit))
+	})
+
+	t.Run("over-limit key is persisted before FixAuditChangesV6", func(t *testing.T) {
+		err := preForkSc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(keyOverLimit, []byte("data"), true))
+		require.NoError(t, err)
+		require.True(t, isPersisted(preForkSc, keyOverLimit))
+	})
+
+	t.Run("read-only key is re-saved before FixAuditChangesV6", func(t *testing.T) {
+		err := preForkSc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(readOnlyKeyOverLimit, []byte("data"), false))
+		require.NoError(t, err)
+		require.True(t, isPersisted(preForkSc, readOnlyKeyOverLimit))
+	})
+}

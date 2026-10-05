@@ -323,11 +323,17 @@ func TestDirectSender_SendDirectToConnectedPeerBufferToLargeShouldErr(t *testing
 		libp2p.WithTopicProcessorChecker(allTopicsRegistered),
 	)
 
-	messageTooLarge := bytes.Repeat([]byte{65}, libp2p.MaxSendBuffSize)
+	messageTooLarge := bytes.Repeat([]byte{65}, p2p.MaxSendBuffSize+1)
 
 	err = ds.Send("topic", messageTooLarge, core.PeerID(cs.RemotePeer()))
 
 	assert.True(t, errors.Is(err, p2p.ErrMessageTooLarge))
+
+	messageAtLimit := bytes.Repeat([]byte{65}, p2p.MaxSendBuffSize)
+
+	err = ds.Send("topic", messageAtLimit, core.PeerID(cs.RemotePeer()))
+
+	assert.NoError(t, err)
 }
 
 func TestDirectSender_SendDirectToConnectedPeerNotConnectedPeerShouldErr(t *testing.T) {
