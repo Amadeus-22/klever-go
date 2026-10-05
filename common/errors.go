@@ -855,6 +855,9 @@ var ErrGenesisNodeWithoutOwner = errors.New("initial nodes must refer to a valid
 // ErrMaxSupplyExceeded signals that KDA max supply has been exceeded
 var ErrMaxSupplyExceeded = errors.New("max supply exceeded")
 
+// ErrAPRAboveMaximum signals that the staking APR is above core.MaxStakingAPR
+var ErrAPRAboveMaximum = errors.New("apr above maximum")
+
 // ErrMaxBucketsExceeded max buckets exceeded for the asset
 var ErrMaxBucketsExceeded = errors.New("max bucket exceeded")
 

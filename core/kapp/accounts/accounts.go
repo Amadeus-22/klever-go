@@ -636,6 +636,12 @@ func (a *accountsKapp) processFungibleTransfer(tc *transaction.TransferContract,
 	return transaction.Transaction_Ok, nil
 }
 
+type claimRecords struct {
+	staking *kapps.StakingData
+	kda     *kapps.KDAData
+	userKDA *kapps.UserKDA
+}
+
 func (a *accountsKapp) ClaimBalance(
 	claimType transaction.ClaimContract_EnumClaimType,
 	assetID []byte,
@@ -644,6 +650,17 @@ func (a *accountsKapp) ClaimBalance(
 	staking *kapps.StakingData,
 	kda *kapps.KDAData,
 	userKDA *kapps.UserKDA,
+) (map[string]int64, error) {
+	return a.claimBalance(claimType, assetID, block, acc, claimRecords{staking: staking, kda: kda, userKDA: userKDA}, true)
+}
+
+func (a *accountsKapp) claimBalance(
+	claimType transaction.ClaimContract_EnumClaimType,
+	assetID []byte,
+	block *block.Block,
+	acc state.UserAccountHandler,
+	rec claimRecords,
+	dropUncreditedAPRGain bool,
 ) (map[string]int64, error) {
 	// Market claim does not update balance based on staking process, return here
 	if claimType == transaction.ClaimContract_MarketClaim {
@@ -658,11 +675,12 @@ func (a *accountsKapp) ClaimBalance(
 		assetID,
 		epoch,
 		blockTime,
-		staking,
-		kda,
-		userKDA,
+		rec.staking,
+		rec.kda,
+		rec.userKDA,
 		a.forkController,
 	)
+	gains, err = a.recordDroppedAPRGain(gains, err, assetID, dropUncreditedAPRGain)
 	if err != nil {
 		return nil, err
 	}
@@ -670,8 +688,8 @@ func (a *accountsKapp) ClaimBalance(
 	if claimType == transaction.ClaimContract_StakingClaim {
 		if a.forkController.ClaimKFI() ||
 			gains[string(assetID)] > 0 {
-			userKDA.LastClaim.Timestamp = blockTime
-			userKDA.LastClaim.Epoch = epoch
+			rec.userKDA.LastClaim.Timestamp = blockTime
+			rec.userKDA.LastClaim.Epoch = epoch
 		}
 	}
 
@@ -679,7 +697,7 @@ func (a *accountsKapp) ClaimBalance(
 		if value > 0 {
 			var userKDAToUpdate *kapps.UserKDA
 			if bytes.Equal([]byte(key), assetID) {
-				userKDAToUpdate = userKDA
+				userKDAToUpdate = rec.userKDA
 			}
 
 			err = acc.AddToBalance(value, []byte(key), a.forkController.EnableSmartContracts(), userKDAToUpdate)
@@ -690,6 +708,17 @@ func (a *accountsKapp) ClaimBalance(
 	}
 
 	return gains, nil
+}
+
+func (a *accountsKapp) recordDroppedAPRGain(gains map[string]int64, err error, assetID []byte, drop bool) (map[string]int64, error) {
+	if !drop || !errors.Is(err, state.ErrAPRGainDropped) {
+		return gains, err
+	}
+
+	ctx := a.KAppController.GetCurrentKAppContext()
+	ctx.Receipts().Add(txProcess.NewReceipt(txProcess.Warning, ctx.ContractID(), []byte(common.ErrFieldAPRGainDropped), assetID))
+
+	return nil, nil
 }
 
 func (a *accountsKapp) updateFPRTotalStake(
@@ -1800,7 +1829,7 @@ func (a *accountsKapp) ClaimStaking(sender []byte, tc *transaction.ClaimContract
 		return transaction.Transaction_AccountError, err
 	}
 
-	gains, err := a.ClaimBalance(transaction.ClaimContract_StakingClaim, assetID, ctx.Block(), ownerAcc, staking, kda, userKDA)
+	gains, err := a.claimBalance(transaction.ClaimContract_StakingClaim, assetID, ctx.Block(), ownerAcc, claimRecords{staking: staking, kda: kda, userKDA: userKDA}, false)
 	if err != nil {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldClaimNotAvailable, err.Error())
 		return claimErrorResultCode(err, transaction.Transaction_ClaimError), err

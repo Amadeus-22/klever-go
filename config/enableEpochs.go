@@ -67,6 +67,12 @@ func (e EnableEpochs) Validate() error {
 			e.FixAuditChangesV5, e.FixAuditChangesV4)
 	}
 
+	if e.FixAuditChangesV6 < e.BigBucketsCompute {
+		return fmt.Errorf("fixAuditChangesV6 (%d) must not be before bigBucketsCompute (%d), "+
+			"otherwise V6 claims would use the legacy APR arithmetic",
+			e.FixAuditChangesV6, e.BigBucketsCompute)
+	}
+
 	return nil
 }
 

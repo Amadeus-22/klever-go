@@ -1818,6 +1818,7 @@ func TestKDATrigger_UpdateStaking(t *testing.T) {
 		asset         *kapps.KDAData
 		staking       *transaction.StakingInfo
 		stakingData   *kapps.StakingData
+		fixV6         bool
 		expectedCode  transaction.Transaction_TXResultCode
 		expectedError error
 	}{
@@ -1968,6 +1969,45 @@ func TestKDATrigger_UpdateStaking(t *testing.T) {
 			expectedCode:  transaction.Transaction_AssetTypeInvalid,
 			expectedError: common.ErrAssetTypeInvalid,
 		},
+		{
+			name:          "Update staking APR at the limit with fix",
+			sender:        owner,
+			asset:         &kapps.KDAData{OwnerAddress: owner, AssetType: kapps.KDAData_Fungible, ID: assetID[0]},
+			staking:       &transaction.StakingInfo{Type: transaction.StakingInfo_APRI, APR: core.MaxStakingAPR},
+			stakingData:   &kapps.StakingData{},
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
+		{
+			name:          "Update staking APR above the limit with fix",
+			sender:        owner,
+			asset:         &kapps.KDAData{OwnerAddress: owner, AssetType: kapps.KDAData_Fungible, ID: assetID[0]},
+			staking:       &transaction.StakingInfo{Type: transaction.StakingInfo_APRI, APR: core.MaxStakingAPR + 1},
+			stakingData:   &kapps.StakingData{},
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_ParameterInvalid,
+			expectedError: common.ErrAPRAboveMaximum,
+		},
+		{
+			name:          "Update staking APR above the limit before fix",
+			sender:        owner,
+			asset:         &kapps.KDAData{OwnerAddress: owner, AssetType: kapps.KDAData_Fungible, ID: assetID[0]},
+			staking:       &transaction.StakingInfo{Type: transaction.StakingInfo_APRI, APR: core.MaxStakingAPR + 1},
+			stakingData:   &kapps.StakingData{},
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
+		{
+			name:          "Update staking FPRI ignores the APR limit with fix",
+			sender:        owner,
+			asset:         &kapps.KDAData{OwnerAddress: owner, AssetType: kapps.KDAData_Fungible, ID: assetID[0]},
+			staking:       &transaction.StakingInfo{Type: transaction.StakingInfo_FPRI, APR: core.MaxStakingAPR + 1},
+			stakingData:   &kapps.StakingData{InterestType: kapps.StakingData_FPRI},
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
 	}
 
 	kdaAccHandler := &mock.KAppAccountHandlerStub{
@@ -1982,7 +2022,10 @@ func TestKDATrigger_UpdateStaking(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			kdaKApp.SetForkController(mock.NewForkControllerStub().SetFork("FixAuditChangesV6", tt.fixV6))
+
 			// update staking data
+			var savedStaking []byte
 			kdaKApp.GetAccountsCacher().GetExistingKappCalled = func(assetID []byte) (state.KAppAccountHandler, error) {
 				return &mock.KAppAccountHandlerStub{
 					DataTrieTrackerCalled: func() state.DataTrieTracker {
@@ -1991,6 +2034,7 @@ func TestKDATrigger_UpdateStaking(t *testing.T) {
 								return json.Marshal(tt.stakingData)
 							},
 							SaveKeyValueCalled: func(key []byte, value []byte) error {
+								savedStaking = value
 								return nil
 							},
 						}
@@ -2004,6 +2048,9 @@ func TestKDATrigger_UpdateStaking(t *testing.T) {
 			code, err := kdaKApp.UpdateStaking(tt.sender, tc, kdaAccHandler, assetID, tt.asset)
 			assert.Equal(t, tt.expectedCode, code)
 			assert.Equal(t, tt.expectedError, err)
+			if tt.expectedError != nil {
+				assert.Nil(t, savedStaking)
+			}
 		})
 	}
 }

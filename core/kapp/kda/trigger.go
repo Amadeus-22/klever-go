@@ -531,6 +531,11 @@ func (k *kdaKapp) updateStaking(sender []byte, tc *transaction.AssetTriggerContr
 		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
 	}
 
+	err = k.validateStakingAPR(tc.GetStaking())
+	if err != nil {
+		return transaction.Transaction_ParameterInvalid, err
+	}
+
 	staking.MinEpochsToClaim = tc.GetStaking().GetMinEpochsToClaim()
 	staking.MinEpochsToUnstake = tc.GetStaking().GetMinEpochsToUnstake()
 	staking.MinEpochsToWithdraw = tc.GetStaking().GetMinEpochsToWithdraw()

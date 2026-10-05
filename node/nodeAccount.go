@@ -260,7 +260,7 @@ func (n *Node) computeAvailableClaim(ctx context.Context, claimState *availableC
 		return nil, err
 	}
 
-	_, err = n.readKDAData(claimState.kdaKapp, assetId)
+	kda, err := n.readKDAData(claimState.kdaKapp, assetId)
 	if err != nil {
 		return nil, err
 	}
@@ -287,6 +287,9 @@ func (n *Node) computeAvailableClaim(ctx context.Context, claimState *availableC
 			kdaStaking,
 			n.forkController,
 		)
+		if state.APRGainDropReason(kdaStaking, kda, rewards, []byte(assetId), err, n.forkController) != nil {
+			rewards, err = nil, nil
+		}
 		if err != nil && !errors.Is(err, state.ErrClaimNotAvailable) {
 			return nil, err
 		}

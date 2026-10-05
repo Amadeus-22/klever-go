@@ -72,3 +72,16 @@ func TestEnableEpochs_Validate_SmartContractsNotBeforeProcessorFlowITOPrice(t *t
 	assert.Error(t, config.EnableEpochs{ProcessorFlowITOPrice: 100}.Validate(),
 		"smart contracts left at the placeholder activate from genesis, before the cache")
 }
+
+func TestEnableEpochs_Validate_AuditChangesV6NotBeforeBigBucketsCompute(t *testing.T) {
+	t.Parallel()
+
+	assert.NoError(t, config.EnableEpochs{BigBucketsCompute: 1196, FixAuditChangesV6: 6200}.Validate(), "mainnet schedule")
+	assert.NoError(t, config.EnableEpochs{BigBucketsCompute: 100, FixAuditChangesV6: 100}.Validate(),
+		"V6 claims use the checked arithmetic from the first block of a shared epoch")
+
+	assert.Error(t, config.EnableEpochs{BigBucketsCompute: 101, FixAuditChangesV6: 100}.Validate(),
+		"V6 before bigBucketsCompute runs V6 claims on the legacy APR arithmetic")
+	assert.Error(t, config.EnableEpochs{BigBucketsCompute: 1196}.Validate(),
+		"V6 left at the placeholder activates from genesis, before bigBucketsCompute")
+}

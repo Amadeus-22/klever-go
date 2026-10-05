@@ -411,6 +411,18 @@ func (k *kdaKapp) isValidCirculatingSupply(kda *kapps.KDAData) bool {
 	return kda.CirculatingSupply > 0
 }
 
+func (k *kdaKapp) validateStakingAPR(staking *transaction.StakingInfo) error {
+	if !k.forkController.FixAuditChangesV6() || staking.GetType() != transaction.StakingInfo_APRI {
+		return nil
+	}
+
+	if staking.GetAPR() > core.MaxStakingAPR {
+		return common.ErrAPRAboveMaximum
+	}
+
+	return nil
+}
+
 func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 

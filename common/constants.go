@@ -64,6 +64,7 @@ const (
 	ErrFieldWithdrawNotAvailable  = "WithdrawNotAvailable"
 	ErrFieldClaimNotAvailable     = "ClaimNotAvailable"
 	ErrFieldNoValidClaims         = "NoValidClaims"
+	ErrFieldAPRGainDropped        = "APRGainDropped"
 	ErrFieldInvalidName           = "InvalidName"
 	ErrFieldInvalidPermission     = "InvalidPermission"
 	ErrFieldInvalidPermissionSigs = "InvalidPermissionSigners"

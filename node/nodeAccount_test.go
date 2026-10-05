@@ -529,6 +529,47 @@ func TestGetAvailableClaim(t *testing.T) {
 			require.Equal(t, tt.wantAllowance, allowance)
 		})
 	}
+
+	aprSupplyTests := []struct {
+		name            string
+		computed        map[string]int64
+		computeErr      error
+		kda             *kapps.KDAData
+		expectedRewards int64
+	}{
+		{"gain overflowing int64 reports nothing", nil, common.ErrInt64Overflow, &kapps.KDAData{Name: []byte("MYTOKEN")}, 0},
+		{"negative supply reports nothing", map[string]int64{"MYTOKEN": 200}, nil, &kapps.KDAData{CirculatingSupply: -1}, 0},
+		{"uncapped supply overflow reports nothing", map[string]int64{"MYTOKEN": 200}, nil, &kapps.KDAData{CirculatingSupply: 1<<63 - 100}, 0},
+		{"gain above the cap reports nothing", map[string]int64{"MYTOKEN": 200}, nil, &kapps.KDAData{MaxSupply: 1000, CirculatingSupply: 1000}, 0},
+		{"gain within the cap is reported", map[string]int64{"MYTOKEN": 200}, nil, &kapps.KDAData{MaxSupply: 1000, CirculatingSupply: 800}, 200},
+	}
+
+	for _, tt := range aprSupplyTests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			computed, computeErr := tt.computed, tt.computeErr
+			userAcc := &mock.UserAccountHandlerStub{
+				AddressBytesCalled: func() []byte { return []byte{0xAA, 0xBB} },
+				GetUserKDACalled:   func([]byte, []byte, bool) (*kapps.UserKDA, error) { return &kapps.UserKDA{}, nil },
+				ComputeAvailableClaimCalled: func([]byte, uint32, int64, *kapps.UserKDA, *kapps.StakingData, core.ForkController) (map[string]int64, error) {
+					return computed, computeErr
+				},
+			}
+
+			kdaBytes, _ := marshalizer.Marshal(tt.kda)
+			n, err := createNodeWithOptions(t, nodeTestOptions{
+				accAdapter:   createAccDBWithUser(userAcc),
+				kappsAdapter: createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes),
+				blockchain:   createBlockchainWithHeader(10, 1234567890),
+			})
+			require.NoError(t, err)
+
+			rewards, _, _, err := n.GetAvailableClaim("AABB", "MYTOKEN")
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedRewards, rewards)
+		})
+	}
 }
 
 func TestGetAvailableClaimList(t *testing.T) {

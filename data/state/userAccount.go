@@ -4,6 +4,9 @@ package state
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"strconv"
@@ -598,6 +601,10 @@ func (a *userAccount) Claim(claimType transaction.ClaimContract_EnumClaimType,
 ) (map[string]int64, error) {
 	switch claimType {
 	case transaction.ClaimContract_StakingClaim:
+		if isAPRStakingWithV6(staking, forkController) {
+			return a.claimAPRStaking(assetID, epoch, blockTime, userKDA, staking, kda, forkController)
+		}
+
 		amountToAdd, err := a.claimStaking(assetID, epoch, blockTime, userKDA, staking, forkController)
 		if err != nil {
 			return nil, err
@@ -683,7 +690,7 @@ func (a *userAccount) computeClaimAPR(assetID []byte, epoch uint32, blockTime in
 	// }
 
 	currAPR := int64(0)
-	gains := make(map[string]int64)
+	gains := &aprGains{values: make(map[string]int64), key: string(assetID), forkController: forkController}
 	lastClaim := userKDA.LastClaim.Timestamp
 
 	for _, apr := range staking.APR {
@@ -692,7 +699,7 @@ func (a *userAccount) computeClaimAPR(assetID []byte, epoch uint32, blockTime in
 		}
 
 		if apr.Timestamp > lastClaim {
-			gains[string(assetID)] += computeAPR(lastClaim, apr.Timestamp, amount, currAPR, forkController)
+			gains.add(lastClaim, apr.Timestamp, amount, currAPR)
 			lastClaim = apr.Timestamp
 		}
 
@@ -700,15 +707,112 @@ func (a *userAccount) computeClaimAPR(assetID []byte, epoch uint32, blockTime in
 	}
 
 	if currAPR > 0 {
-		gains[string(assetID)] += computeAPR(lastClaim, blockTime, amount, currAPR, forkController)
+		gains.add(lastClaim, blockTime, amount, currAPR)
 	}
+
+	return gains.result()
+}
+
+type aprGains struct {
+	values         map[string]int64
+	key            string
+	forkController core.ForkController
+	err            error
+}
+
+func (g *aprGains) add(initTime, endTime, amount, currAPR int64) {
+	if g.err != nil {
+		return
+	}
+
+	gain, err := computeAPR(initTime, endTime, amount, currAPR, g.forkController)
+	if err != nil {
+		g.err = err
+		return
+	}
+
+	if !g.forkController.FixAuditChangesV6() {
+		g.values[g.key] += gain
+		return
+	}
+
+	if gain < 0 {
+		g.err = common.ErrNegativeValue
+		return
+	}
+
+	g.values[g.key], g.err = tools.SafeAddI64(g.values[g.key], gain)
+}
+
+func (g *aprGains) result() (map[string]int64, error) {
+	if g.err != nil {
+		return nil, g.err
+	}
+
+	return g.values, nil
+}
+
+func isAPRStakingWithV6(staking *kapps.StakingData, forkController core.ForkController) bool {
+	return forkController.FixAuditChangesV6() && staking != nil && staking.InterestType == kapps.StakingData_APRI
+}
+
+func (a *userAccount) claimAPRStaking(assetID []byte, epoch uint32, blockTime int64, userKDA *kapps.UserKDA, staking *kapps.StakingData, kda *kapps.KDAData, forkController core.ForkController) (map[string]int64, error) {
+	gains, err := a.computeClaimAPR(assetID, epoch, blockTime, userKDA, staking, forkController)
+	reason := APRGainDropReason(staking, kda, gains, assetID, err, forkController)
+	if reason != nil {
+		return nil, fmt.Errorf("%w: %w", ErrAPRGainDropped, reason)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	addAPRGainToSupply(kda, gains[string(assetID)])
 
 	return gains, nil
 }
 
-func computeAPR(initTime, endTime, amount, currAPR int64, forkController core.ForkController) int64 {
+// APRGainDropReason returns why, once FixAuditChangesV6 is active, an APR claim cannot credit the accrued gain, or nil when it can
+func APRGainDropReason(staking *kapps.StakingData, kda *kapps.KDAData, gains map[string]int64, assetID []byte, computeErr error, forkController core.ForkController) error {
+	if !isAPRStakingWithV6(staking, forkController) {
+		return nil
+	}
+
+	if errors.Is(computeErr, common.ErrInt64Overflow) {
+		return common.ErrInt64Overflow
+	}
+
+	gain := gains[string(assetID)]
+	if computeErr != nil || gain <= 0 {
+		return nil
+	}
+
+	if kda.GetCirculatingSupply() < 0 {
+		return ErrNegativeCirculatingSupply
+	}
+
+	if kda.GetMaxSupply() > 0 && gain > kda.GetMaxSupply()-kda.GetCirculatingSupply() {
+		return common.ErrMaxSupplyExceeded
+	}
+
+	_, err := tools.SafeAddI64(kda.GetCirculatingSupply(), gain)
+
+	return err
+}
+
+func addAPRGainToSupply(kda *kapps.KDAData, gain int64) {
+	kda.CirculatingSupply += gain
+
+	if kda.MintedValue > math.MaxInt64-gain {
+		kda.MintedValue = math.MaxInt64
+		return
+	}
+
+	kda.MintedValue += gain
+}
+
+func computeAPR(initTime, endTime, amount, currAPR int64, forkController core.ForkController) (int64, error) {
 	if !forkController.BigBucketsCompute() {
-		return int64(float64((endTime-initTime)*amount*currAPR)/float64(core.OneYearTimestamp)) / int64(core.HundredPercent)
+		return int64(float64((endTime-initTime)*amount*currAPR)/float64(core.OneYearTimestamp)) / int64(core.HundredPercent), nil
 	}
 
 	v := big.NewFloat(float64(endTime - initTime))
@@ -716,9 +820,14 @@ func computeAPR(initTime, endTime, amount, currAPR int64, forkController core.Fo
 	v = v.Mul(v, big.NewFloat(float64(currAPR)))
 	v = v.Quo(v, big.NewFloat(float64(core.HundredPercent)))
 	v = v.Quo(v, big.NewFloat(float64(core.OneYearTimestamp)))
+
+	if forkController.FixAuditChangesV6() && v.Cmp(big.NewFloat(math.MaxInt64)) >= 0 {
+		return 0, common.ErrInt64Overflow
+	}
+
 	intV, _ := v.Int64()
 
-	return intV
+	return intV, nil
 }
 
 // bucketStakeAt reports the value the bucket had staked when fprEpoch was

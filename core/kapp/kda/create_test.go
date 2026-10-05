@@ -380,6 +380,47 @@ func Test_CreateKDA(t *testing.T) {
 			AccCacher: validAccCacher,
 			Status:    transaction.Transaction_Ok,
 		},
+		{
+			Description: "APR at the staking limit",
+			TransactionContract: &transaction.CreateAssetContract{
+				OwnerAddress: makeAddress("valid"),
+				Name:         []byte("KDA"),
+				Ticker:       []byte("KDA"),
+				Type:         transaction.CreateAssetContract_Fungible,
+				Properties:   &transaction.PropertiesInfo{CanMint: true, CanFreeze: true},
+				Staking:      &transaction.StakingInfo{Type: transaction.StakingInfo_APRI, APR: core.MaxStakingAPR},
+			},
+			AccCacher: validAccCacher,
+			Status:    transaction.Transaction_Ok,
+		},
+		{
+			Description: "APR above the staking limit",
+			TransactionContract: &transaction.CreateAssetContract{
+				OwnerAddress: makeAddress("valid"),
+				Name:         []byte("KDA"),
+				Ticker:       []byte("KDA"),
+				Type:         transaction.CreateAssetContract_Fungible,
+				Properties:   &transaction.PropertiesInfo{CanMint: true, CanFreeze: true},
+				Staking:      &transaction.StakingInfo{Type: transaction.StakingInfo_APRI, APR: core.MaxStakingAPR + 1},
+			},
+			AccCacher: validAccCacher,
+			Error:     common.ErrAPRAboveMaximum,
+			Status:    transaction.Transaction_ParameterInvalid,
+		},
+		{
+			Description: "APR above the staking limit before FixAuditChangesV6",
+			TransactionContract: &transaction.CreateAssetContract{
+				OwnerAddress: makeAddress("valid"),
+				Name:         []byte("KDA"),
+				Ticker:       []byte("KDA"),
+				Type:         transaction.CreateAssetContract_Fungible,
+				Properties:   &transaction.PropertiesInfo{CanMint: true, CanFreeze: true},
+				Staking:      &transaction.StakingInfo{Type: transaction.StakingInfo_APRI, APR: core.MaxStakingAPR + 1},
+			},
+			AccCacher: validAccCacher,
+			Fork:      &config.EnableEpochs{FixAuditChangesV6: 1},
+			Status:    transaction.Transaction_Ok,
+		},
 	}
 
 	for _, tt := range tests {
