@@ -1,6 +1,7 @@
 package mock
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 
@@ -31,7 +32,7 @@ type Facade struct {
 	BalanceHandler                     func(string, string) (*models.BalanceResponse, error)
 	GetUserKDAHandler                  func(string, string) (*kapps.UserKDA, error)
 	RewardsAvailableToClaimHandler     func(address string, assetId string) (*models.AvailableClaimResponse, error)
-	RewardsAvailableToClaimListHandler func(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error)
+	RewardsAvailableToClaimListHandler func(ctx context.Context, address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error)
 	GetEconomicsHandler                func() (*models.EconomicsResponse, error)
 	GetAccountTotalsHandler            func() (*models.AccountTotalsResponse, error)
 	StatusMetricsHandler               func() core.StatusMetricsHandler
@@ -179,8 +180,8 @@ func (f *Facade) GetAvailableClaim(address string, assetId string) (*models.Avai
 }
 
 // GetAvailableClaimList is the mock implementation of a handler's GetAvailableClaimList method
-func (f *Facade) GetAvailableClaimList(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
-	return f.RewardsAvailableToClaimListHandler(address, assetIds)
+func (f *Facade) GetAvailableClaimList(ctx context.Context, address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+	return f.RewardsAvailableToClaimListHandler(ctx, address, assetIds)
 }
 
 // GetBalance is the mock implementation of a handler's GetBalance method

@@ -1,6 +1,7 @@
 package node_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -586,7 +587,7 @@ func TestGetAvailableClaimList(t *testing.T) {
 		require.NoError(t, err)
 
 		assetIds := []string{"KLV", "KFI", "AAA-1234", "BBB-1234", "CCC-1234", "DDD-1234"}
-		claims, claimErrors, err := n.GetAvailableClaimList("AABB", assetIds)
+		claims, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", assetIds)
 		require.NoError(t, err)
 		require.Empty(t, claimErrors)
 		require.Len(t, claims, len(assetIds))
@@ -626,7 +627,7 @@ func TestGetAvailableClaimList(t *testing.T) {
 		require.NoError(t, err)
 
 		assetIds := []string{"AAA-1234", "BBB-1234", "CCC-1234"}
-		_, claimErrors, err := n.GetAvailableClaimList("AABB", assetIds)
+		_, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", assetIds)
 		require.NoError(t, err)
 		require.Empty(t, claimErrors)
 		require.Equal(t, len(assetIds), headerReads)
@@ -664,7 +665,7 @@ func TestGetAvailableClaimList(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			claims, claimErrors, err := n.GetAvailableClaimList("AABB", []string{"KLV"})
+			claims, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", []string{"KLV"})
 			require.NoError(t, err)
 			require.Empty(t, claimErrors)
 			require.Equal(t, int64(1000), claims["KLV"].Allowance, "allowance does not depend on the claim maths")
@@ -715,7 +716,7 @@ func TestGetAvailableClaimList(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		claims, claimErrors, err := n.GetAvailableClaimList("AABB", []string{"KLV", "MISSING-1234"})
+		claims, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", []string{"KLV", "MISSING-1234"})
 		require.NoError(t, err)
 		require.Len(t, claimErrors, 1)
 		require.ErrorIs(t, claimErrors["MISSING-1234"], common.ErrStakingNotFound)
@@ -733,7 +734,7 @@ func TestGetAvailableClaimList(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		claims, claimErrors, err := n.GetAvailableClaimList("AABB", []string{"KLV", "KFI"})
+		claims, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", []string{"KLV", "KFI"})
 		require.ErrorIs(t, err, common.ErrAccountNotFound)
 		require.Nil(t, claims)
 		require.Nil(t, claimErrors)
@@ -749,11 +750,178 @@ func TestGetAvailableClaimList(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		claims, claimErrors, err := n.GetAvailableClaimList("AABB", []string{"KLV", "KFI"})
+		claims, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", []string{"KLV", "KFI"})
 		require.NoError(t, err)
 		require.Empty(t, claimErrors)
 		require.Len(t, claims, 2)
 		require.Equal(t, &models.AvailableClaimResponse{}, claims["KLV"])
 		require.Equal(t, &models.AvailableClaimResponse{}, claims["KFI"])
+	})
+
+	t.Run("does not touch the state when the context is already done", func(t *testing.T) {
+		t.Parallel()
+
+		var userLoads, kappLoads int
+		accDB := createAccDBWithUser(claimingUserAcc())
+		accDB.GetExistingAccountCalled = func([]byte) (state.AccountHandler, error) {
+			userLoads++
+			return nil, errors.New("must not be called")
+		}
+		kappsDB := createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes)
+		kappsDB.LoadAccountCalled = func([]byte) (state.AccountHandler, error) {
+			kappLoads++
+			return nil, errors.New("must not be called")
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   accDB,
+			kappsAdapter: kappsDB,
+			blockchain:   createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		claims, claimErrors, err := n.GetAvailableClaimList(ctx, "AABB", []string{"KLV", "KFI"})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, claims)
+		require.Nil(t, claimErrors)
+		require.Zero(t, userLoads, "a cancelled request must not load the user account")
+		require.Zero(t, kappLoads, "a cancelled request must not load the kapps")
+	})
+
+	t.Run("stops at the next asset once the context is done", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		const assetsBeforeCancel = 2
+		userKDAReads := 0
+		userAcc := claimingUserAcc()
+		userAcc.GetUserKDACalled = func([]byte, []byte, bool) (*kapps.UserKDA, error) {
+			userKDAReads++
+			if userKDAReads == assetsBeforeCancel {
+				cancel()
+			}
+			return &kapps.UserKDA{}, nil
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   createAccDBWithUser(userAcc),
+			kappsAdapter: createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes),
+			blockchain:   createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		assetIds := []string{"AAA-1234", "BBB-1234", "CCC-1234", "DDD-1234"}
+		claims, claimErrors, err := n.GetAvailableClaimList(ctx, "AABB", assetIds)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, claims, "a request that did not finish must not return partial results")
+		require.Nil(t, claimErrors)
+		require.Equal(t, assetsBeforeCancel, userKDAReads, "no asset may be read after the context is done")
+	})
+
+	t.Run("stops loading the state once the context is done", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		accDB := createAccDBWithUser(claimingUserAcc())
+		getExisting := accDB.GetExistingAccountCalled
+		accDB.GetExistingAccountCalled = func(address []byte) (state.AccountHandler, error) {
+			cancel()
+			return getExisting(address)
+		}
+		kappLoads := 0
+		kappsDB := createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes)
+		loadKapp := kappsDB.LoadAccountCalled
+		kappsDB.LoadAccountCalled = func(address []byte) (state.AccountHandler, error) {
+			kappLoads++
+			return loadKapp(address)
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   accDB,
+			kappsAdapter: kappsDB,
+			blockchain:   createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		claims, claimErrors, err := n.GetAvailableClaimList(ctx, "AABB", []string{"KLV", "KFI"})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, claims)
+		require.Nil(t, claimErrors)
+		require.Zero(t, kappLoads, "no kapp may be loaded after the context is done")
+	})
+
+	t.Run("does not load the KDA kapp once the context is done", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		kappLoads := 0
+		kappsDB := createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes)
+		loadKapp := kappsDB.LoadAccountCalled
+		kappsDB.LoadAccountCalled = func(address []byte) (state.AccountHandler, error) {
+			kappLoads++
+			cancel()
+			return loadKapp(address)
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   createAccDBWithUser(claimingUserAcc()),
+			kappsAdapter: kappsDB,
+			blockchain:   createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		claims, claimErrors, err := n.GetAvailableClaimList(ctx, "AABB", []string{"KLV", "KFI"})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, claims)
+		require.Nil(t, claimErrors)
+		require.Equal(t, 1, kappLoads, "the KDA kapp must not be loaded after the context is done")
+	})
+
+	t.Run("does not read the KLV pending rewards once the context is done", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		userAcc := claimingUserAcc()
+		userAcc.GetUserKDACalled = func([]byte, []byte, bool) (*kapps.UserKDA, error) {
+			cancel()
+			return &kapps.UserKDA{}, nil
+		}
+		pendingRewardsReads := 0
+		kappCtrl := &stub.KAppControllerStub{
+			GetValidatorsKAppCalled: func() kapp.ValidatorsKapp {
+				return &mock.ValidatorsKAppStub{
+					GetPendingRewardsCalled: func([]byte) (int64, error) {
+						pendingRewardsReads++
+						return 500, nil
+					},
+				}
+			},
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:     createAccDBWithUser(userAcc),
+			kappsAdapter:   createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes),
+			kappController: kappCtrl,
+			blockchain:     createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		// KLV is the last asset, so no later per-asset check can end the request
+		claims, claimErrors, err := n.GetAvailableClaimList(ctx, "AABB", []string{"KLV"})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, claims, "a request that did not finish must not return partial results")
+		require.Nil(t, claimErrors)
+		require.Zero(t, pendingRewardsReads, "the Validators kapp must not be loaded after the context is done")
 	})
 }

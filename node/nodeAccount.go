@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -208,8 +209,13 @@ type availableClaimState struct {
 }
 
 // loadAvailableClaimState loads the user account and the staking and KDA kapps. A nil state
-// with a nil error means the address does not hold a user account.
-func (n *Node) loadAvailableClaimState(address string) (*availableClaimState, error) {
+// with a nil error means the address does not hold a user account. Each of the three loads takes
+// an accounts-adapter lock, so ctx is checked before each one.
+func (n *Node) loadAvailableClaimState(ctx context.Context, address string) (*availableClaimState, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	account, err := n.getAccountHandler(address)
 	if err != nil {
 		return nil, err
@@ -220,8 +226,16 @@ func (n *Node) loadAvailableClaimState(address string) (*availableClaimState, er
 		return nil, nil
 	}
 
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	stakingKapp, err := n.loadKAppAccount(kapps.StakingKAppAddress)
 	if err != nil {
+		return nil, err
+	}
+
+	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -238,7 +252,9 @@ func (n *Node) loadAvailableClaimState(address string) (*availableClaimState, er
 }
 
 // computeAvailableClaim computes the available claim for one asset from the preloaded state.
-func (n *Node) computeAvailableClaim(claimState *availableClaimState, assetId string) (*models.AvailableClaimResponse, error) {
+// KLV also reads the pending rewards, which loads the Validators kapp from the kapps adapter: a
+// fourth adapter lock on top of the three the state load takes, so ctx is checked before it.
+func (n *Node) computeAvailableClaim(ctx context.Context, claimState *availableClaimState, assetId string) (*models.AvailableClaimResponse, error) {
 	kdaStaking, err := n.readStakingData(claimState.stakingKapp, assetId)
 	if err != nil {
 		return nil, err
@@ -278,6 +294,9 @@ func (n *Node) computeAvailableClaim(claimState *availableClaimState, assetId st
 
 	allowance := int64(0)
 	if assetId == "KLV" {
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
 		allowance = n.getKLVAllowanceWithPending(userAccount)
 	}
 
@@ -304,7 +323,7 @@ func isClaimInFlight(userKDA *kapps.UserKDA, header data.HeaderHandler) bool {
 
 // GetAvailableClaim returns the rewards available for a specific asset in an account
 func (n *Node) GetAvailableClaim(address string, assetId string) (int64, map[string]int64, int64, error) {
-	claimState, err := n.loadAvailableClaimState(address)
+	claimState, err := n.loadAvailableClaimState(context.Background(), address)
 	if err != nil {
 		return 0, nil, 0, err
 	}
@@ -312,7 +331,7 @@ func (n *Node) GetAvailableClaim(address string, assetId string) (int64, map[str
 		return 0, nil, 0, nil
 	}
 
-	claim, err := n.computeAvailableClaim(claimState, assetId)
+	claim, err := n.computeAvailableClaim(context.Background(), claimState, assetId)
 	if err != nil {
 		return 0, nil, 0, err
 	}
@@ -324,8 +343,12 @@ func (n *Node) GetAvailableClaim(address string, assetId string) (int64, map[str
 // The account and kapp state is loaded once and shared by every asset, and the assets are
 // computed sequentially so the shared account handlers are never read from more than one goroutine.
 // A request-level failure is returned as err; per-asset failures are returned keyed by asset.
-func (n *Node) GetAvailableClaimList(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
-	claimState, err := n.loadAvailableClaimState(address)
+// ctx is checked before each state load, before each asset and before the pending-rewards load
+// of KLV, so a request that was cancelled or ran past its deadline stops taking accounts-adapter
+// locks and fails as a whole with ctx's error. A lookup already blocked on a lock is not
+// interrupted; it is the next check that ends the request.
+func (n *Node) GetAvailableClaimList(ctx context.Context, address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+	claimState, err := n.loadAvailableClaimState(ctx, address)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -340,8 +363,16 @@ func (n *Node) GetAvailableClaimList(address string, assetIds []string) (map[str
 	}
 
 	for _, assetId := range assetIds {
-		claim, errClaim := n.computeAvailableClaim(claimState, assetId)
+		if err = ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+
+		claim, errClaim := n.computeAvailableClaim(ctx, claimState, assetId)
 		if errClaim != nil {
+			// a context that ended inside the asset fails the request, not just this asset
+			if err = ctx.Err(); err != nil {
+				return nil, nil, err
+			}
 			claimErrors[assetId] = errClaim
 			continue
 		}

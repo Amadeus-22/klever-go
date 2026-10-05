@@ -50,6 +50,9 @@ var ErrEmptyAssetId = errors.New("assetId is empty")
 // ErrTooManyAssets signals that more assets were requested than the endpoint allows
 var ErrTooManyAssets = errors.New("too many assets requested")
 
+// ErrRequestTimedOut signals that a request ran past its deadline before it could be answered
+var ErrRequestTimedOut = errors.New("request timed out")
+
 // ErrValidation signals an error in validation
 var ErrValidation = errors.New("validation error")
 

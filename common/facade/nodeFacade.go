@@ -567,8 +567,8 @@ func (nf *nodeFacade) GetAvailableClaim(address string, assetId string) (*models
 }
 
 // GetAvailableClaimList returns the rewards available for each of the given assets in an account
-func (nf *nodeFacade) GetAvailableClaimList(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
-	return nf.node.GetAvailableClaimList(address, assetIds)
+func (nf *nodeFacade) GetAvailableClaimList(ctx context.Context, address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+	return nf.node.GetAvailableClaimList(ctx, address, assetIds)
 }
 
 // GetAsset returns an assetResponse containing information

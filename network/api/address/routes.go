@@ -1,9 +1,12 @@
 package address
 
 import (
+	"context"
+	stdErrors "errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	logger "github.com/klever-io/klever-go-logger"
@@ -36,6 +39,12 @@ const (
 	// exclusive lock; the Staking and KDA data tries are shared with block processing through
 	// the AccountsDB data-trie cache, so this cap is what bounds that remaining contention.
 	maxAssetsPerClaimList = 25
+
+	// availableClaimListTimeout is the deadline after which a claim-list request stops taking
+	// new state locks and is answered as timed out. The node checks it before each state load,
+	// before each asset and before the KLV pending-rewards load: a lookup already blocked on a
+	// state lock is not interrupted, and keeps the request's global throttler slot until it returns.
+	availableClaimListTimeout = 10 * time.Second
 )
 
 // FacadeHandler interface defines methods that can be used by the gin webserver
@@ -45,7 +54,7 @@ type FacadeHandler interface {
 	GetBalance(address string, kda string) (*models.BalanceResponse, error)
 	GetUserKDA(address string, kda string) (*kapps.UserKDA, error)
 	GetAvailableClaim(address string, assetId string) (*models.AvailableClaimResponse, error)
-	GetAvailableClaimList(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error)
+	GetAvailableClaimList(ctx context.Context, address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error)
 	IsInterfaceNil() bool
 }
 
@@ -386,6 +395,7 @@ func parseRequestedAssets(assets string) []string {
 // @Success 200 object shared.GenericAPIResponse{data=models.AvailableClaimListResponse} "ok"
 // @Failure 400 object shared.GenericAPIResponse "some error"
 // @Failure 500 object shared.GenericAPIResponse "internal error"
+// @Failure 503 object shared.GenericAPIResponse "request timed out"
 // @Router /address/{address}/allowance/list [get]
 // GetAvailableClaimList returns the rewards available for a specific list of asset in an account
 func GetAvailableClaimList(c *gin.Context) {
@@ -441,7 +451,31 @@ func GetAvailableClaimList(c *gin.Context) {
 
 	// One facade call per request: the account and kapp state is loaded once and shared by every
 	// requested asset, so a request costs a constant number of accounts-adapter lock acquisitions.
-	assetData, allowanceError, err := facade.GetAvailableClaimList(addr, assetList)
+	//
+	// The lookup runs under availableClaimListTimeout, so a request that outlives it stops
+	// instead of running every asset. The deadline is the only thing that ends it early: the
+	// request context's cancellation is deliberately dropped. net/http cancels that context when
+	// the read side of the connection reaches EOF, which also happens for a client that only
+	// closed its write side and is still waiting for the answer it has always received. It is not
+	// a bound either, since a client keeps the context alive by declaring a request body, which
+	// this route ignores, or by sending one more byte after the headers.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), availableClaimListTimeout)
+	defer cancel()
+
+	assetData, allowanceError, err := facade.GetAvailableClaimList(ctx, addr, assetList)
+	// The node checks the deadline before each asset but not after the last one, so a lookup can
+	// return a result after the deadline passed. That is a timeout too: the context is checked
+	// here so every request that outlives the deadline gets the same answer.
+	if stdErrors.Is(err, context.DeadlineExceeded) || stdErrors.Is(ctx.Err(), context.DeadlineExceeded) {
+		shared.RespondWith(
+			c,
+			http.StatusServiceUnavailable,
+			nil,
+			errors.APIErrorString(errors.ErrGetAvailableClaimList, errors.ErrRequestTimedOut),
+			shared.ReturnCodeSystemBusy,
+		)
+		return
+	}
 	if err != nil {
 		// keep the per-asset error shape clients already receive for request-level failures
 		allowanceError = make(map[string]error, len(assetList))

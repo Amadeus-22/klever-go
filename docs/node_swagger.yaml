@@ -297,6 +297,8 @@ definitions:
         type: integer
       fixAuditChangesV5:
         type: integer
+      fixAuditChangesV6:
+        type: integer
       fixDelegationSameEpoch:
         type: integer
       fixMarketBuyOverflow:
@@ -1758,6 +1760,10 @@ paths:
             $ref: '#/definitions/shared.GenericAPIResponse'
         "500":
           description: internal error
+          schema:
+            $ref: '#/definitions/shared.GenericAPIResponse'
+        "503":
+          description: request timed out
           schema:
             $ref: '#/definitions/shared.GenericAPIResponse'
       summary: returns the rewards available for a specific list of asset in an account

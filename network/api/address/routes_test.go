@@ -1,14 +1,19 @@
 package address_test
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -730,7 +735,7 @@ func TestGetAvailableClaimListMakesSingleFacadeCall(t *testing.T) {
 	var receivedAssets []string
 
 	facade := mock.Facade{
-		RewardsAvailableToClaimListHandler: func(addr string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+		RewardsAvailableToClaimListHandler: func(_ context.Context, addr string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
 			calls.Add(1)
 			receivedAssets = assetIds
 
@@ -764,7 +769,7 @@ func TestGetAvailableClaimListReportsRequestErrorPerAsset(t *testing.T) {
 	t.Parallel()
 
 	facade := mock.Facade{
-		RewardsAvailableToClaimListHandler: func(string, []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+		RewardsAvailableToClaimListHandler: func(context.Context, string, []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
 			return nil, nil, fmt.Errorf("account not found")
 		},
 	}
@@ -789,12 +794,184 @@ func TestGetAvailableClaimListReportsRequestErrorPerAsset(t *testing.T) {
 	assert.Nil(t, response.Data)
 }
 
+// The lookup runs under a deadline and is not tied to the connection: net/http cancels the request
+// context for a client that only closed its write side, and that client still gets its answer.
+func TestGetAvailableClaimListRunsUnderDeadlineOnly(t *testing.T) {
+	t.Parallel()
+
+	reqCtx, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+
+	var calls atomic.Int64
+	facade := mock.Facade{
+		RewardsAvailableToClaimListHandler: func(ctx context.Context, _ string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+			calls.Add(1)
+
+			deadline, hasDeadline := ctx.Deadline()
+			assert.True(t, hasDeadline, "the lookup must run under a request deadline")
+			assert.LessOrEqual(t, time.Until(deadline), address.AvailableClaimListTimeout)
+
+			cancelRequest()
+			assert.NoError(t, ctx.Err(), "the request context's cancellation must not end the lookup")
+
+			claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+			for _, assetId := range assetIds {
+				claims[assetId] = &models.AvailableClaimResponse{StakingRewards: 100}
+			}
+			return claims, nil, nil
+		},
+	}
+
+	ws := startNodeServer(&facade)
+	url := fmt.Sprintf("/address/%s/allowance/list?asset=KLV,BTC", validAddress)
+
+	req, _ := http.NewRequestWithContext(reqCtx, "GET", url, nil)
+	resp := httptest.NewRecorder()
+	ws.ServeHTTP(resp, req)
+
+	assert.Equal(t, int64(1), calls.Load())
+	assert.Equal(t, http.StatusOK, resp.Code)
+
+	var response shared.GenericAPIResponse
+	err := json.Unmarshal(resp.Body.Bytes(), &response)
+	assert.NoError(t, err)
+	assert.Len(t, extractClaimListAssets(t, response), 2)
+}
+
+func TestGetAvailableClaimListReportsTimeout(t *testing.T) {
+	t.Parallel()
+
+	facade := mock.Facade{
+		RewardsAvailableToClaimListHandler: func(context.Context, string, []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+			return nil, nil, context.DeadlineExceeded
+		},
+	}
+
+	ws := startNodeServer(&facade)
+	url := fmt.Sprintf("/address/%s/allowance/list?asset=KLV,BTC", validAddress)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := httptest.NewRecorder()
+	ws.ServeHTTP(resp, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, resp.Code)
+
+	var response shared.GenericAPIResponse
+	err := json.Unmarshal(resp.Body.Bytes(), &response)
+	assert.NoError(t, err)
+	assert.Equal(t, shared.ReturnCodeSystemBusy, response.Code)
+	assert.Equal(t, "could not get rewards for requested account asset list: request timed out", response.Error)
+	assert.Nil(t, response.Data)
+}
+
+// A lookup that returns a result after the deadline passed is a timeout too, not a late 200.
+// It runs in a synctest bubble, so the real 10s deadline expires on a fake clock.
+func TestGetAvailableClaimListReportsTimeoutWhenLookupFinishesLate(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		facade := mock.Facade{
+			RewardsAvailableToClaimListHandler: func(ctx context.Context, _ string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+				// the last asset runs past the deadline and the lookup still succeeds
+				<-ctx.Done()
+
+				claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+				for _, assetId := range assetIds {
+					claims[assetId] = &models.AvailableClaimResponse{StakingRewards: 100}
+				}
+				return claims, nil, nil
+			},
+		}
+
+		ws := startNodeServer(&facade)
+		url := fmt.Sprintf("/address/%s/allowance/list?asset=KLV,BTC", validAddress)
+
+		start := time.Now()
+		req, _ := http.NewRequest("GET", url, nil)
+		resp := httptest.NewRecorder()
+		ws.ServeHTTP(resp, req)
+
+		// The literal is deliberate: it pins the intended deadline, so shortening the production
+		// constant fails here instead of moving both sides of the comparison.
+		assert.Equal(t, 10*time.Second, time.Since(start), "the lookup must end exactly at the intended deadline")
+		assert.Equal(t, http.StatusServiceUnavailable, resp.Code)
+
+		var response shared.GenericAPIResponse
+		err := json.Unmarshal(resp.Body.Bytes(), &response)
+		assert.NoError(t, err)
+		assert.Equal(t, shared.ReturnCodeSystemBusy, response.Code)
+		assert.Equal(t, "could not get rewards for requested account asset list: request timed out", response.Error)
+		assert.Nil(t, response.Data)
+	})
+}
+
+// A client that half-closes its connection after sending the request is still waiting for the
+// answer. net/http cancels the request context when it reads EOF on such a connection, so this
+// runs through a real server: the lookup waits until that cancellation has happened, and must
+// not see it, and the client must still get its 200.
+func TestGetAvailableClaimListAnswersHalfClosedClient(t *testing.T) {
+	t.Parallel()
+
+	requestCtx := make(chan context.Context, 1)
+	facade := mock.Facade{
+		RewardsAvailableToClaimListHandler: func(ctx context.Context, _ string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+			// wait for net/http to cancel the request context on the client's EOF
+			select {
+			case <-(<-requestCtx).Done():
+			case <-time.After(3 * time.Second):
+				t.Error("net/http never cancelled the request context of the half-closed client")
+				return nil, nil, fmt.Errorf("request context was not cancelled")
+			}
+
+			if !assert.NoError(t, ctx.Err(), "the request context's cancellation must not reach the lookup") {
+				return nil, nil, ctx.Err()
+			}
+
+			claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+			for _, assetId := range assetIds {
+				claims[assetId] = &models.AvailableClaimResponse{StakingRewards: 100}
+			}
+			return claims, nil, nil
+		},
+	}
+
+	ws := startNodeServer(&facade)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCtx <- r.Context()
+		ws.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	_, err = fmt.Fprintf(conn, "GET /address/%s/allowance/list?asset=KLV,BTC HTTP/1.1\r\nHost: node\r\nConnection: close\r\n\r\n", validAddress)
+	assert.NoError(t, err)
+	assert.NoError(t, conn.(*net.TCPConn).CloseWrite())
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var response shared.GenericAPIResponse
+	assert.NoError(t, json.NewDecoder(resp.Body).Decode(&response))
+	assert.Len(t, extractClaimListAssets(t, response), 2)
+}
+
 // perAssetClaimList adapts a per-asset claim mock into the list facade call, collecting
 // per-asset errors the way the node does.
 func perAssetClaimList(
 	handler func(address, assetId string) (*models.AvailableClaimResponse, error),
-) func(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
-	return func(address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+) func(_ context.Context, address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+	return func(_ context.Context, address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
 		claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
 		claimErrors := make(map[string]error)
 		for _, assetId := range assetIds {
