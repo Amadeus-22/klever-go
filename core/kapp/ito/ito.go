@@ -219,6 +219,12 @@ func (i *itoKapp) Buy(sender []byte, tc *transaction.BuyContract) (transaction.T
 		return status, err
 	}
 
+	// the payment currency's pause and transfer restriction apply as in a direct transfer
+	paymentCurrency, status, err := i.loadPaymentCurrency(ctx, currencyID)
+	if err != nil {
+		return status, err
+	}
+
 	if asset.Royalties == nil {
 		asset.Royalties = &kapps.RoyaltiesData{}
 	}
@@ -241,7 +247,12 @@ func (i *itoKapp) Buy(sender []byte, tc *transaction.BuyContract) (transaction.T
 	itoOwnerAmount := valueInt - royaltiesPercentAmount
 
 	//Compute ITO Percent Royalties
-	status, err = i.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, valueInt, royaltiesPercentAmount)
+	status, err = i.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, valueInt, royaltiesPercentAmount, paymentCurrency)
+	if err != nil {
+		return status, err
+	}
+
+	status, err = checkPaymentDestination(ctx, paymentCurrency, sender, ito.GetReceiverAddress(), itoOwnerAmount)
 	if err != nil {
 		return status, err
 	}
@@ -412,7 +423,7 @@ func (i *itoKapp) ComputeBuyITOWhitelist(ctx kapp.KappContext, sender []byte, it
 	return transaction.Transaction_Ok, nil
 }
 
-func (i *itoKapp) ComputeITOPercentBuyRoyalties(ctx kapp.KappContext, asset *kapps.KDAData, ownerAcc state.UserAccountHandler, currencyID []byte, valueInt int64, royaltiesPercentAmount int64) (transaction.Transaction_TXResultCode, error) {
+func (i *itoKapp) ComputeITOPercentBuyRoyalties(ctx kapp.KappContext, asset *kapps.KDAData, ownerAcc state.UserAccountHandler, currencyID []byte, valueInt int64, royaltiesPercentAmount int64, paymentCurrency *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	if royaltiesPercentAmount <= 0 {
 		return transaction.Transaction_Ok, nil
 	}
@@ -420,7 +431,7 @@ func (i *itoKapp) ComputeITOPercentBuyRoyalties(ctx kapp.KappContext, asset *kap
 	royaltiesITOPercentageToPay := royaltiesPercentAmount
 	for key, value := range asset.Royalties.SplitRoyalties {
 		status, err := i.computeSplitRoyalties(ctx, key, currencyID, ownerAcc,
-			royaltiesPercentAmount, int64(value.PercentITOPercentage), &royaltiesITOPercentageToPay)
+			royaltiesPercentAmount, int64(value.PercentITOPercentage), &royaltiesITOPercentageToPay, paymentCurrency)
 		if err != nil {
 			return status, err
 		}
@@ -441,6 +452,11 @@ func (i *itoKapp) ComputeITOPercentBuyRoyalties(ctx kapp.KappContext, asset *kap
 	}
 	if err != nil {
 		return transaction.Transaction_LoadAccountError, err
+	}
+
+	status, err := checkPaymentDestination(ctx, paymentCurrency, ownerAcc.AddressBytes(), kdaOwner.AddressBytes(), royaltiesITOPercentageToPay)
+	if err != nil {
+		return status, err
 	}
 
 	err = kdaOwner.AddToBalance(royaltiesITOPercentageToPay, currencyID, i.forkController.EnableSmartContracts())
@@ -490,7 +506,7 @@ func (i *itoKapp) ComputeITOFixedBuyRoyalties(ctx kapp.KappContext, asset *kapps
 	royaltiesITOFixedToPay := asset.Royalties.ITOFixed
 	for key, value := range asset.Royalties.SplitRoyalties {
 		status, err := i.computeSplitRoyalties(ctx, key, kdautils.KLVIdentifier, ownerAcc,
-			asset.Royalties.ITOFixed, int64(value.PercentITOFixed), &royaltiesITOFixedToPay)
+			asset.Royalties.ITOFixed, int64(value.PercentITOFixed), &royaltiesITOFixedToPay, nil)
 		if err != nil {
 			return status, err
 		}
@@ -530,7 +546,7 @@ func (i *itoKapp) ComputeITOFixedBuyRoyalties(ctx kapp.KappContext, asset *kapps
 	return transaction.Transaction_Ok, nil
 }
 
-func (i *itoKapp) computeSplitRoyalties(ctx kapp.KappContext, address string, assetID []byte, acntSrc state.UserAccountHandler, value int64, percentage int64, royaltiesToPay *int64) (transaction.Transaction_TXResultCode, error) {
+func (i *itoKapp) computeSplitRoyalties(ctx kapp.KappContext, address string, assetID []byte, acntSrc state.UserAccountHandler, value int64, percentage int64, royaltiesToPay *int64, paymentCurrency *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	decodedAddress, err := hex.DecodeString(address)
 	if err != nil {
 		return transaction.Transaction_LoadAccountError, err
@@ -559,6 +575,11 @@ func (i *itoKapp) computeSplitRoyalties(ctx kapp.KappContext, address string, as
 	}
 	*royaltiesToPay -= splitToPay
 
+	status, err := checkPaymentDestination(ctx, paymentCurrency, acntSrc.AddressBytes(), decodedAddress, splitToPay)
+	if err != nil {
+		return status, err
+	}
+
 	err = splitRoyalty.AddToBalance(splitToPay, assetID, i.forkController.EnableSmartContracts())
 	if err != nil {
 		return transaction.Transaction_BalanceError, err
@@ -582,6 +603,39 @@ func (i *itoKapp) computeSplitRoyalties(ctx kapp.KappContext, address string, as
 	))
 
 	return transaction.Transaction_Ok, nil
+}
+
+// loadPaymentCurrency returns the payment currency under FixAuditChangesV6, refusing the buy while it is
+// paused, and nil before the fork.
+func (i *itoKapp) loadPaymentCurrency(ctx kapp.KappContext, currencyID []byte) (*kapps.KDAData, transaction.Transaction_TXResultCode, error) {
+	if !i.forkController.FixAuditChangesV6() {
+		return nil, transaction.Transaction_Ok, nil
+	}
+
+	_, currency, err := i.KAppController.GetKDAKApp().GetKDA(currencyID)
+	if err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetNotFound, err.Error())
+		return nil, transaction.Transaction_KAPPError, err
+	}
+
+	if currency.GetAttributes().GetIsPaused() {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetPaused, process.ErrAssetIsPaused.Error())
+		return nil, transaction.Transaction_AssetPaused, process.ErrAssetIsPaused
+	}
+
+	return currency, transaction.Transaction_Ok, nil
+}
+
+// checkPaymentDestination refuses paying amount to destination when a direct transfer from the buyer would be
+// refused. A nil currency (before FixAuditChangesV6) or an amount of zero is never refused. A refusal fails
+// the transaction, which undoes any destination already paid.
+func checkPaymentDestination(ctx kapp.KappContext, currency *kapps.KDAData, buyer []byte, destination []byte, amount int64) (transaction.Transaction_TXResultCode, error) {
+	if currency == nil || amount <= 0 || currency.IsTransferAllowed(buyer, destination) {
+		return transaction.Transaction_Ok, nil
+	}
+
+	ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldTransferNotAllowed, process.ErrKDATransferNotAllowed.Error())
+	return transaction.Transaction_KDATransferNotAllowed, process.ErrKDATransferNotAllowed
 }
 
 func (i *itoKapp) BuyITOMint(ctx kapp.KappContext, itoKapp state.KAppAccountHandler, ito *kapps.ITOData, assetID []byte, sender []byte, tc *transaction.BuyContract) (transaction.Transaction_TXResultCode, error) {

@@ -22,7 +22,7 @@ var expectedPattern = []byte{
 }
 
 func (kda *KDAData) IsTransferAllowed(sender []byte, destination []byte) bool {
-	if !kda.Properties.LimitTransfer {
+	if !kda.GetProperties().GetLimitTransfer() {
 		return true
 	}
 

@@ -810,7 +810,8 @@ func Test_Trigger_RemoveFromWhitelist_AfterSmartContractFork_CantRemoveWhitelist
 
 func Test_BuyIto_BeforeSmartContractFork_ShouldWork(t *testing.T) {
 	itoKapp := setupITOKapp(t, config.EnableEpochs{
-		SmartContracts: 100_00,
+		SmartContracts:    100_00,
+		FixAuditChangesV6: 100_00,
 	})
 
 	// Acc Cacher Mock
@@ -2133,7 +2134,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_HaveNoRoyalties(t *testing.T) {
 	}
 	ownerAcc := &mock.UserAccountHandlerStub{}
 
-	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount)
+	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount, nil)
 	require.NoError(t, err)
 	assert.Equal(t, transaction.Transaction_Ok, status)
 }
@@ -2177,7 +2178,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_InvalidSplitRoyaltiesError(t *tes
 	currencyID := kdautils.KLVIdentifier
 	royaltiesPercentAmount := int64(20)
 
-	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount)
+	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount, nil)
 	require.Error(t, err)
 	assert.Equal(t, transaction.Transaction_LoadAccountError, status)
 }
@@ -2232,7 +2233,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_SplitRoyaltiesBalanceError(t *tes
 	currencyID := kdautils.KLVIdentifier
 	royaltiesPercentAmount := int64(20)
 
-	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount)
+	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount, nil)
 	require.Error(t, err)
 	assert.Equal(t, transaction.Transaction_BalanceError, status)
 }
@@ -2292,7 +2293,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_SplitRoyaltiesUpdateUserError(t *
 	currencyID := kdautils.KLVIdentifier
 	royaltiesPercentAmount := int64(20)
 
-	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount)
+	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount, nil)
 	require.Error(t, err)
 	assert.Equal(t, transaction.Transaction_SaveAccountError, status)
 }
@@ -2330,7 +2331,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_KDAOwnerLoadUserError(t *testing.
 	currencyID := kdautils.KLVIdentifier
 	royaltiesPercentAmount := int64(20)
 
-	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount)
+	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount, nil)
 	require.Error(t, err)
 	assert.Equal(t, transaction.Transaction_LoadAccountError, status)
 }
@@ -2375,7 +2376,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_KDAOwnerAddToBalanceError(t *test
 	currencyID := kdautils.KLVIdentifier
 	royaltiesPercentAmount := int64(20)
 
-	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount)
+	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount, nil)
 	require.Error(t, err)
 	assert.Equal(t, transaction.Transaction_BalanceError, status)
 }
@@ -2425,7 +2426,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_KDAOwnerUpdateUserError(t *testin
 	currencyID := kdautils.KLVIdentifier
 	royaltiesPercentAmount := int64(20)
 
-	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount)
+	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount, nil)
 	require.Error(t, err)
 	assert.Equal(t, transaction.Transaction_SaveAccountError, status)
 }
@@ -2488,7 +2489,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_ShouldWork(t *testing.T) {
 	currencyID := kdautils.KLVIdentifier
 	royaltiesPercentAmount := int64(20)
 
-	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount)
+	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount, nil)
 	require.NoError(t, err)
 	assert.Equal(t, transaction.Transaction_Ok, status)
 }
@@ -2592,6 +2593,7 @@ func Test_BuyITO_Retrieve_Account_To_Send_Percent_And_Fixed_Royalties(t *testing
 				10000,
 				5,
 				&royaltiesToPay,
+				nil,
 			)
 
 			assert.Equal(t, tt.expectedTxResultCode, resCode)
@@ -3682,7 +3684,7 @@ func Test_computeSplitRoyalties_OverflowGuard(t *testing.T) {
 			fmt.Sprintf("%x", "TestAddress"),
 			[]byte("AST-HJK7"),
 			&mock.AccountWrapMock{},
-			pool, overflowPct, &royaltiesToPay,
+			pool, overflowPct, &royaltiesToPay, nil,
 		)
 		return status, err, credited, royaltiesToPay
 	}
