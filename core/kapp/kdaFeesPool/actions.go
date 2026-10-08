@@ -618,11 +618,8 @@ func checkFeeTransferControls(senderAddress []byte, kda *kapps.KDAData) error {
 		return process.ErrAssetIsPaused
 	}
 
-	if kda.GetProperties().GetLimitTransfer() {
-		senderRoles, errRole := kda.GetRoleByAddress(senderAddress)
-		if errRole != nil || !senderRoles.HasRoleTransfer {
-			return process.ErrKDATransferNotAllowed
-		}
+	if !kda.CanSenderTransfer(senderAddress) {
+		return process.ErrKDATransferNotAllowed
 	}
 
 	return nil

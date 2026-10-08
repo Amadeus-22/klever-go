@@ -267,3 +267,70 @@ func TestKDAData_GetRoleByAddress(t *testing.T) {
 		})
 	}
 }
+
+func TestKDAData_CanSenderTransfer(t *testing.T) {
+	t.Parallel()
+
+	owner := []byte("owner")
+	admin := []byte("admin")
+	holder := []byte("holder")
+	depositor := []byte("depositor")
+	stranger := []byte("stranger")
+
+	limited := func(limitTransfer bool) *kapps.KDAData {
+		return &kapps.KDAData{
+			OwnerAddress: owner,
+			AdminAddress: admin,
+			Properties:   &kapps.PropertiesData{LimitTransfer: limitTransfer},
+			Roles: []*kapps.RolesData{
+				{Address: holder, HasRoleTransfer: true},
+				{Address: depositor, HasRoleDeposit: true},
+			},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		kda      *kapps.KDAData
+		sender   []byte
+		expected bool
+	}{
+		{"an unrestricted asset lets anyone send", limited(false), stranger, true},
+		{"an asset with no properties lets anyone send", &kapps.KDAData{}, stranger, true},
+		{"the owner sends a limit-transfer asset", limited(true), owner, true},
+		{"the admin sends a limit-transfer asset", limited(true), admin, true},
+		{"the transfer role sends a limit-transfer asset", limited(true), holder, true},
+		{"the deposit role alone does not send a limit-transfer asset", limited(true), depositor, false},
+		{"an address with no role does not send a limit-transfer asset", limited(true), stranger, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, tt.kda.CanSenderTransfer(tt.sender))
+		})
+	}
+}
+
+func TestKDAData_IsTransferAllowed(t *testing.T) {
+	t.Parallel()
+
+	holder := []byte("holder")
+	depositor := []byte("depositor")
+	stranger := []byte("stranger")
+	other := []byte("other")
+
+	kda := &kapps.KDAData{
+		OwnerAddress: []byte("owner"),
+		Properties:   &kapps.PropertiesData{LimitTransfer: true},
+		Roles: []*kapps.RolesData{
+			{Address: holder, HasRoleTransfer: true},
+			{Address: depositor, HasRoleDeposit: true},
+		},
+	}
+
+	assert.True(t, kda.IsTransferAllowed(holder, other), "a sender with the transfer role reaches any destination")
+	assert.True(t, kda.IsTransferAllowed(stranger, depositor), "a destination with the deposit role takes from any sender")
+	assert.False(t, kda.IsTransferAllowed(stranger, other), "neither side holding a role is refused")
+	assert.True(t, (&kapps.KDAData{Properties: &kapps.PropertiesData{}}).IsTransferAllowed(stranger, other))
+	assert.True(t, (&kapps.KDAData{}).IsTransferAllowed(stranger, other), "an asset with no properties does not limit transfers")
+}

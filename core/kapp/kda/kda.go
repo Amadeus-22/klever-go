@@ -423,6 +423,30 @@ func (k *kdaKapp) validateStakingAPR(staking *transaction.StakingInfo) error {
 	return nil
 }
 
+// checkDepositPauseAndTransferControls refuses, once FixAuditChangesV6 is active, an FPR deposit
+// into the pool of a paused asset, and one of a currency that is paused or that the depositor could
+// not send to any account. The pool is not an account, so only the sender side of the transfer
+// restriction applies.
+func (k *kdaKapp) checkDepositPauseAndTransferControls(sender []byte, asset, currency *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
+	if !k.forkController.FixAuditChangesV6() {
+		return transaction.Transaction_Ok, nil
+	}
+
+	ctx := k.KAppController.GetCurrentKAppContext()
+
+	if asset.GetAttributes().GetIsPaused() || currency.GetAttributes().GetIsPaused() {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetPaused, process.ErrAssetIsPaused.Error())
+		return transaction.Transaction_AssetPaused, process.ErrAssetIsPaused
+	}
+
+	if !currency.CanSenderTransfer(sender) {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldTransferNotAllowed, process.ErrKDATransferNotAllowed.Error())
+		return transaction.Transaction_KDATransferNotAllowed, process.ErrKDATransferNotAllowed
+	}
+
+	return transaction.Transaction_Ok, nil
+}
+
 func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
@@ -460,9 +484,13 @@ func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (trans
 	}
 
 	// test if currency actually exists
-	_, _, err = k.GetKDA(currencyID)
+	_, currency, err := k.GetKDA(currencyID)
 	if err != nil {
 		return transaction.Transaction_KAPPError, err
+	}
+
+	if resultCode, errControls := k.checkDepositPauseAndTransferControls(sender, kda, currency); errControls != nil {
+		return resultCode, errControls
 	}
 
 	stakingKapp, staking, err := k.GetStaking(assetID)

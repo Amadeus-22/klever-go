@@ -22,12 +22,7 @@ var expectedPattern = []byte{
 }
 
 func (kda *KDAData) IsTransferAllowed(sender []byte, destination []byte) bool {
-	if !kda.GetProperties().GetLimitTransfer() {
-		return true
-	}
-
-	senderRoles, err := kda.GetRoleByAddress(sender)
-	if err == nil && senderRoles.HasRoleTransfer {
+	if kda.CanSenderTransfer(sender) {
 		return true
 	}
 
@@ -37,6 +32,18 @@ func (kda *KDAData) IsTransferAllowed(sender []byte, destination []byte) bool {
 	}
 
 	return false
+}
+
+// CanSenderTransfer reports whether sender may move the asset to any destination: always when the
+// asset does not limit transfers, otherwise only with the transfer role (the owner and admin hold it).
+func (kda *KDAData) CanSenderTransfer(sender []byte) bool {
+	if !kda.GetProperties().GetLimitTransfer() {
+		return true
+	}
+
+	senderRoles, err := kda.GetRoleByAddress(sender)
+
+	return err == nil && senderRoles.HasRoleTransfer
 }
 
 func MatchesAddress(expected []byte, address []byte) bool {
