@@ -280,7 +280,7 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				hooksRuntime.SetVMInput(&vmcommon.ContractCallInput{
 					VMInput: vmcommon.VMInput{
 						KDATransfers: tt.kdaTransfers,
-						GasProvided:  1,
+						GasProvided:  10_000,
 					},
 				})
 				hooksMetering.InitStateFromContractCallInput(&hooksRuntime.GetVMInput().VMInput)
@@ -295,7 +295,10 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				// Calculate gas used
 				loopGas := hooksMetering.GasSchedule().WASMOpcodeCost.Loop
 				callValueGas := hooksMetering.GasSchedule().BaseOpsAPICost.GetCallValue
-				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas
+				dataCopyPerByte := hooksMetering.GasSchedule().BaseOperationCost.DataCopyPerByte
+				// from FixAuditChangesV6 the token id is paid for before it is copied out of the buffer
+				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas +
+					dataCopyPerByte*uint64(len(testKDAId))
 
 				assert.Equal(t, hooksRuntime.GetPointsUsed(), totalGas)
 			})
@@ -340,7 +343,7 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				hooksRuntime.SetVMInput(&vmcommon.ContractCallInput{
 					VMInput: vmcommon.VMInput{
 						KDATransfers: tt.kdaTransfers,
-						GasProvided:  1,
+						GasProvided:  10_000,
 					},
 				})
 				hooksMetering.InitStateFromContractCallInput(&hooksRuntime.GetVMInput().VMInput)
@@ -355,7 +358,10 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				// Calculate gas used
 				loopGas := hooksMetering.GasSchedule().WASMOpcodeCost.Loop
 				callValueGas := hooksMetering.GasSchedule().BaseOpsAPICost.GetCallValue
-				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas
+				dataCopyPerByte := hooksMetering.GasSchedule().BaseOperationCost.DataCopyPerByte
+				// from FixAuditChangesV6 the token name is paid for before it is copied out of the buffer
+				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas +
+					dataCopyPerByte*uint64(len(targetTransfer.KDATokenName))
 
 				assert.Equal(t, hooksRuntime.GetPointsUsed(), totalGas)
 			})
@@ -393,7 +399,7 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				hooksRuntime.SetVMInput(&vmcommon.ContractCallInput{
 					VMInput: vmcommon.VMInput{
 						KDATransfers: tt.kdaTransfers,
-						GasProvided:  1,
+						GasProvided:  10_000,
 					},
 				})
 				hooksMetering.InitStateFromContractCallInput(&hooksRuntime.GetVMInput().VMInput)
@@ -407,11 +413,9 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				assert.Equal(t, result, big.NewInt(0))
 
 				// Calculate gas used
-				loopGas := hooksMetering.GasSchedule().WASMOpcodeCost.Loop
-				callValueGas := hooksMetering.GasSchedule().BaseOpsAPICost.GetCallValue
-				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas
-
-				assert.Equal(t, hooksRuntime.GetPointsUsed(), totalGas)
+				// the handle is missing, so nothing is copied: the hook charges its fixed cost and
+				// then fails, and failing consumes everything that was left
+				assert.Equal(t, hooksRuntime.GetVMInput().GasProvided, hooksRuntime.GetPointsUsed())
 
 				vmOutput := vmHost.Output().GetVMOutput()
 				assert.Equal(
@@ -459,7 +463,7 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				hooksRuntime.SetVMInput(&vmcommon.ContractCallInput{
 					VMInput: vmcommon.VMInput{
 						KDATransfers: tt.kdaTransfers,
-						GasProvided:  1,
+						GasProvided:  10_000,
 					},
 				})
 				hooksMetering.InitStateFromContractCallInput(&hooksRuntime.GetVMInput().VMInput)
@@ -473,11 +477,9 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				assert.Equal(t, result, big.NewInt(0))
 
 				// Calculate gas used
-				loopGas := hooksMetering.GasSchedule().WASMOpcodeCost.Loop
-				callValueGas := hooksMetering.GasSchedule().BaseOpsAPICost.GetCallValue
-				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas
-
-				assert.Equal(t, hooksRuntime.GetPointsUsed(), totalGas)
+				// the handle is missing, so nothing is copied: the hook charges its fixed cost and
+				// then fails, and failing consumes everything that was left
+				assert.Equal(t, hooksRuntime.GetVMInput().GasProvided, hooksRuntime.GetPointsUsed())
 
 				vmOutput := vmHost.Output().GetVMOutput()
 				assert.Equal(
@@ -505,9 +507,10 @@ func TestManagedGetKDACallValue(t *testing.T) {
 		hooksMgdType := hooks.GetManagedTypesContext()
 
 		kdaHandle, kdaCallValueHandle := int32(1), int32(1)
+		testKDAId := []byte("TEST-H7K7")
 
 		// Sets KDA ID into bytes on memory using kdaHandle
-		hooksMgdType.SetBytes(kdaHandle, []byte("TEST-H7K7"))
+		hooksMgdType.SetBytes(kdaHandle, testKDAId)
 
 		// As it does not exist, it will be created
 		initialKDAValue := hooksMgdType.GetBigIntOrCreate(kdaCallValueHandle)
@@ -516,7 +519,7 @@ func TestManagedGetKDACallValue(t *testing.T) {
 		hooksRuntime.SetVMInput(&vmcommon.ContractCallInput{
 			VMInput: vmcommon.VMInput{
 				KDATransfers: []*vmcommon.KDATransfer{},
-				GasProvided:  1,
+				GasProvided:  10_000,
 			},
 		})
 		hooksMetering.InitStateFromContractCallInput(&hooksRuntime.GetVMInput().VMInput)
@@ -530,10 +533,12 @@ func TestManagedGetKDACallValue(t *testing.T) {
 
 		// Calculate gas used
 		loopGas := hooksMetering.GasSchedule().WASMOpcodeCost.Loop
+		// from FixAuditChangesV6 the token id is paid for before it is copied out of the buffer
+		dataCopyPerByte := hooksMetering.GasSchedule().BaseOperationCost.DataCopyPerByte
 		callValueGas := hooksMetering.GasSchedule().BaseOpsAPICost.GetCallValue
 		totalGas := (uint64(loopGas))*uint64(
 			len(hooksRuntime.GetVMInput().KDATransfers),
-		) + callValueGas
+		) + callValueGas + dataCopyPerByte*uint64(len(testKDAId))
 
 		assert.Equal(t, hooksRuntime.GetPointsUsed(), totalGas)
 
@@ -738,6 +743,8 @@ func TestManagedGetKDARolesWithHost_GasCost(t *testing.T) {
 
 	host := &contextmock.VMHostMock{
 		ManagedTypesContext: managedTypes,
+		// pinned pre-FixAuditChangesV6, as in TestManagedGetKDATokenDataWithHost_GasCost
+		ForkControllerContext: &commonMock.ForkControllerStub{},
 		MeteringContext: &contextmock.MeteringContextMock{
 			GasCost: &config.GasCost{
 				BaseOpsAPICost: config.BaseOpsAPICost{
@@ -866,6 +873,8 @@ func TestManagedGetSftMetadataWithHost_GasCost(t *testing.T) {
 
 	host := &contextmock.VMHostMock{
 		ManagedTypesContext: managedTypes,
+		// pinned pre-FixAuditChangesV6, as in TestManagedGetKDATokenDataWithHost_GasCost
+		ForkControllerContext: &commonMock.ForkControllerStub{},
 		MeteringContext: &contextmock.MeteringContextMock{
 			GasCost: &config.GasCost{
 				BaseOpsAPICost: config.BaseOpsAPICost{
@@ -930,6 +939,16 @@ func TestManagedGetSftMetadataWithHost_GasCost(t *testing.T) {
 			expectedGas:   160,
 		},
 		{
+			purpose: "Should return error because GetSFTMeta returns error and consume only the base gas",
+			mock: func() {
+				blockchain.GetSFTMetaCalled = func(asset []byte, nonce uint64) (*kapps.MetaV2, error) {
+					return nil, mockErr
+				}
+			},
+			expectedError: vmhost.ErrArgOutOfRange,
+			expectedGas:   10,
+		},
+		{
 			purpose: "Should return error because GetBytes returns error and consume only the base gas",
 			mock: func() {
 				managedTypes.GetBytesCalled = func(handle int32) ([]byte, error) {
@@ -979,6 +998,8 @@ func TestManagedGetUserKDAWithHost_GasCost(t *testing.T) {
 
 	host := &contextmock.VMHostMock{
 		ManagedTypesContext: managedTypes,
+		// pinned pre-FixAuditChangesV6, as in TestManagedGetKDATokenDataWithHost_GasCost
+		ForkControllerContext: &commonMock.ForkControllerStub{},
 		MeteringContext: &contextmock.MeteringContextMock{
 			GasCost: &config.GasCost{
 				BaseOpsAPICost: config.BaseOpsAPICost{
@@ -1181,6 +1202,10 @@ func TestManagedGetKDATokenDataWithHost_GasCost(t *testing.T) {
 
 	host := &contextmock.VMHostMock{
 		ManagedTypesContext: managedTypes,
+		// pinned pre-FixAuditChangesV6: this case counts gas through UseAndTraceGasCalled, which the
+		// post-fork bounded charge does not go through. The fork's copy charge is covered two-sided
+		// by TestVMHooksImpl_CopyGas_SameBeforeAndFromV6 instead
+		ForkControllerContext: &commonMock.ForkControllerStub{},
 		MeteringContext: &contextmock.MeteringContextMock{
 			GasCost: &config.GasCost{
 				BaseOpsAPICost: config.BaseOpsAPICost{

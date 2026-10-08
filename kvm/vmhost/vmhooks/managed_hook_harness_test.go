@@ -22,6 +22,11 @@ const mainnetDataCopyPerByte = 50
 // testMBufferNewFromBytes is MBufferNewFromBytes in the test gas schedule the harness runs on
 const testMBufferNewFromBytes = 1
 
+// managedDeployMetadataCopy is what ManagedCreateContract and ManagedDeployFromSourceContract pay
+// post-fork for the code-metadata buffer they clone, on the two-byte upgradeableMetadata both
+// tables pass them. The upgrade hooks still clone theirs for free and are a declared follow-up
+const managedDeployMetadataCopy = 2 * mainnetDataCopyPerByte
+
 // managedHookChildFunction is the endpoint of the child contract the calling hooks target.
 const managedHookChildFunction = "deposit"
 

@@ -738,9 +738,14 @@ func (host *vmHost) CreateNewContract(input *vmcommon.ContractCreateInput, creat
 		CodeDeployerAddress:  input.CallerAddr,
 	}
 
-	err = metering.UseGasForIndirectDeployment(codeDeployInput)
-	if err != nil {
-		return
+	// from FixAuditChangesV6 each deploy hook charges this itself, before the BoundGasLimit that
+	// fixes input.GasProvided; charging it here, after, let the caller commit its whole remaining
+	// gas to the new contract and then be charged the code cost on top of it
+	if !host.ForkController().FixAuditChangesV6() {
+		err = metering.UseGasForIndirectDeployment(codeDeployInput)
+		if err != nil {
+			return
+		}
 	}
 
 	if runtime.ReadOnly() {

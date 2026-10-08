@@ -41,7 +41,10 @@ type returnItemsHook struct {
 	// failureReturn is what the hook returns when the conversion fails: -1 for the execute hooks, 1
 	// for create and deploy, 0 for the upgrade hooks, which return nothing
 	failureReturn int32
-	call          func(host vmhost.VMHost, argumentsHandle int32, resultHandle int32) func() int32
+	// metadataCopyPostFork is the code-metadata buffer the hook pays for post-fork and cloned for
+	// free pre-fork; only the deploy hooks were converted
+	metadataCopyPostFork uint64
+	call                 func(host vmhost.VMHost, argumentsHandle int32, resultHandle int32) func() int32
 }
 
 // returnItemsNumItems is how many empty items the pinned calls return.
@@ -79,13 +82,13 @@ func returnItemsHooksCalling(function string) []returnItemsHook {
 			dst, fn := buffer(host, test.ChildAddress), buffer(host, emitEmptyItems)
 			return func() int32 { return hooks(host).ManagedExecuteReadOnly(childGas, dst, fn, args, result) }
 		}},
-		{name: "managedCreateContract", preForkGas: 2096, failureReturn: 1, call: func(host vmhost.VMHost, args, result int32) func() int32 {
+		{name: "managedCreateContract", preForkGas: 2096, failureReturn: 1, metadataCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args, result int32) func() int32 {
 			value, code, meta, address := zero(host), buffer(host, childCode), buffer(host, upgradeableMetadata), buffer(host, nil)
 			return func() int32 {
 				return hooks(host).ManagedCreateContract(childGas, value, code, meta, args, address, result)
 			}
 		}},
-		{name: "managedDeployFromSourceContract", preForkGas: 2096, failureReturn: 1, call: func(host vmhost.VMHost, args, result int32) func() int32 {
+		{name: "managedDeployFromSourceContract", preForkGas: 2096, failureReturn: 1, metadataCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args, result int32) func() int32 {
 			value, source, meta, address := zero(host), buffer(host, test.ChildAddress), buffer(host, upgradeableMetadata), buffer(host, nil)
 			return func() int32 {
 				return hooks(host).ManagedDeployFromSourceContract(childGas, value, source, meta, args, address, result)
@@ -181,9 +184,11 @@ func TestManagedReturnItems_PostForkChargesEachItem(t *testing.T) {
 		require.Equal(t, int32(0), postCall.returnValue, hook.name)
 		require.Equal(t, int32(returnItemsNumItems*managedVecHandleLen), postCall.resultLen, hook.name)
 		// every hook here billed its decoded arguments twice pre-fork and once post-fork (GHSA-qqr9);
-		// on top of that, every empty item now costs MBufferNewFromBytes where it cost nothing
+		// on top of that, every empty item now costs MBufferNewFromBytes where it cost nothing, and
+		// the deploy hooks pay for the code-metadata buffer they clone
 		saving := postCall.argumentBytes * mainnetDataCopyPerByte
-		require.Equal(t, pre.gasUsed-saving+returnItemsNumItems*mainnetMBufferNewFromBytes, post.gasUsed, hook.name)
+		expected := pre.gasUsed - saving + returnItemsNumItems*mainnetMBufferNewFromBytes + hook.metadataCopyPostFork
+		require.Equal(t, expected, post.gasUsed, hook.name)
 	}
 }
 

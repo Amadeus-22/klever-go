@@ -67,6 +67,42 @@ func newForkStub(fixAuditV3 bool) *commonMock.ForkControllerStub {
 	return fc
 }
 
+// BigFloatSetBigInt charged the copy before it checked the handle, and GetBigInt returns a nil value
+// with its error, so ConsumeGasForBigIntCopy dereferenced that nil in val.BitLen(). The panic is
+// recovered at the top of RunSmartContractCall as ErrExecutionPanicked, which is deterministic and so
+// is consensus history - hence the gate, and hence the pre-fork case here: it fails if the gate goes.
+func TestBigFloatSetBigInt_MissingHandle(t *testing.T) {
+	t.Parallel()
+
+	for _, fixAuditChangesV6 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("FixAuditChangesV6=%v", fixAuditChangesV6), func(t *testing.T) {
+			t.Parallel()
+
+			forkController := commonMock.NewForkControllerStub()
+			forkController.FixAuditChangesV6Value = fixAuditChangesV6
+
+			vmHost, err := hostCore.NewVMHost(worldmock.NewMockWorld(), makeHostParametersWithFork(forkController))
+			require.NoError(t, err)
+			hooks := vmhooks.NewVMHooksImpl(vmHost)
+			provideGas(hooks, 1000)
+
+			const (
+				destinationHandle = int32(1)
+				missingHandle     = int32(42)
+			)
+			setBigInt := func() { hooks.BigFloatSetBigInt(destinationHandle, missingHandle) }
+
+			if !fixAuditChangesV6 {
+				require.Panics(t, setBigInt)
+				return
+			}
+
+			require.NotPanics(t, setBigInt)
+			require.ErrorIs(t, vmHost.Runtime().GetAllErrors(), vmhost.ErrNoBigIntUnderThisHandle)
+		})
+	}
+}
+
 func TestBigFloatPow(t *testing.T) {
 	t.Run("Positive base, positive exponent", func(t *testing.T) {
 		mockWorld := worldmock.NewMockWorld()

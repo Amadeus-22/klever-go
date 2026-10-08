@@ -17,8 +17,8 @@ import (
 )
 
 func TestExecution_ExecuteOnDestContext_MockBuiltinFunctions_Claim(t *testing.T) {
-	forEachFixAuditChangesV6(t, 12, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
-		parentGasUsed := uint64(1973) + nameCopyGas
+	forEachFixAuditChangesV6(t, 12, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+		parentGasUsed := uint64(1973) + copyGas
 		transferGas := uint64(2005)
 		parentGasUsed += transferGas
 		test.BuildInstanceCallTest(t).
@@ -46,8 +46,8 @@ func TestExecution_ExecuteOnDestContext_MockBuiltinFunctions_Claim(t *testing.T)
 }
 
 func TestExecution_ExecuteOnDestContext_MockBuiltinFunctions_DoSomething(t *testing.T) {
-	forEachFixAuditChangesV6(t, 18, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
-		parentGasUsed := uint64(1977) + nameCopyGas
+	forEachFixAuditChangesV6(t, 18, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+		parentGasUsed := uint64(1977) + copyGas
 		transferGas := uint64(2005)
 		parentGasUsed += transferGas
 		test.BuildInstanceCallTest(t).

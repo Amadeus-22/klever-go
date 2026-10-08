@@ -1150,25 +1150,33 @@ func callCustomSCAndGetGasUsed(t *testing.T, locals uint64) (uint64, *config.Gas
 	return gasUsed, gasSchedule
 }
 
+// fromFixAuditChangesV6 reports whether the scenario forEachFixAuditChangesV6 is running has the fork
+// active. A scenario whose post-fork copy gas lands on more than one account needs it: the single
+// copyGas it is handed covers one account, and the others compute their own share
+func fromFixAuditChangesV6(epochs blockchainConfig.EnableEpochs) bool {
+	return epochs.FixAuditChangesV6 == 0
+}
+
 // forEachFixAuditChangesV6 runs a gas scenario with FixAuditChangesV6 off and on. Off, it must use exactly
-// its historical gas, so blocks from before the fork replay unchanged; on, the caller also pays nameCopyGas
-// for the function names it copies into its indirect calls, which were free before the fork
+// its historical gas, so blocks from before the fork replay unchanged; on, the account the scenario names
+// also pays copyGas for the contract memory it copies and the fork now charges for before the copy: the
+// function names of its indirect calls, and the storage keys and values its legacy storage hooks read
 func forEachFixAuditChangesV6(
 	t *testing.T,
-	nameCopyGas uint64,
-	run func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64),
+	copyGas uint64,
+	run func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64),
 ) {
 	t.Run("before FixAuditChangesV6", func(t *testing.T) {
 		run(t, blockchainConfig.EnableEpochs{FixAuditChangesV6: 1_000_000}, 0)
 	})
 	t.Run("from FixAuditChangesV6", func(t *testing.T) {
-		run(t, blockchainConfig.EnableEpochs{}, nameCopyGas)
+		run(t, blockchainConfig.EnableEpochs{}, copyGas)
 	})
 }
 
 func TestExecution_ExecuteOnSameContext_Simple(t *testing.T) {
-	forEachFixAuditChangesV6(t, 26, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
-		parentGasUsed := uint64(521) + nameCopyGas
+	forEachFixAuditChangesV6(t, 26, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+		parentGasUsed := uint64(521) + copyGas
 		childGasUsed := uint64(6870)
 		executionCost := parentGasUsed + childGasUsed
 
@@ -1464,8 +1472,8 @@ func TestExecution_ExecuteOnSameContext_OutOfGas(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnSameContext_Successful(t *testing.T) {
-	forEachFixAuditChangesV6(t, 13, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
-		executeAPICost := uint64(894313) + nameCopyGas
+	forEachFixAuditChangesV6(t, 54, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+		executeAPICost := uint64(894313) + copyGas
 		childExecutionCost := uint64(437 - 22)
 		parentGasBeforeExecuteAPI := uint64(172 - 9)
 		finalCost := uint64(134)
@@ -1509,7 +1517,7 @@ func TestExecution_ExecuteOnSameContext_Successful(t *testing.T) {
 				verify.WithTrace().Ok().
 					// test.ParentAddress
 					Balance(host, test.ParentAddress, parentAccountBalanceAfter).
-					GasUsed(test.ParentAddress, 906609+nameCopyGas).
+					GasUsed(test.ParentAddress, 906609+copyGas).
 					GasUsed(test.ChildAddress, 0).
 					// others
 					GasRemaining(test.GasProvided-
@@ -1538,14 +1546,14 @@ func TestExecution_ExecuteOnSameContext_Successful(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnSameContext_Successful_BigInts(t *testing.T) {
-	forEachFixAuditChangesV6(t, 21, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+	forEachFixAuditChangesV6(t, 21, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Call parentFunctionChildCall_BigInts() of the parent SC, which will call a
 		// method of the child SC that takes some big Int references as arguments and
 		// produce a new big Int out of the arguments.
 
 		childExecutionCost := uint64(102)
 		parentGasBeforeExecuteAPI := uint64(114)
-		executeAPICost := uint64(25) + nameCopyGas
+		executeAPICost := uint64(25) + copyGas
 		finalCost := uint64(63)
 
 		test.BuildInstanceCallTest(t).
@@ -1570,7 +1578,7 @@ func TestExecution_ExecuteOnSameContext_Successful_BigInts(t *testing.T) {
 				verify.Ok().
 					// test.ParentAddress
 					Balance(host, test.ParentAddress, 1000).
-					GasUsed(test.ParentAddress, 6050+nameCopyGas+test.ChildCompilationCostSameCtx+childExecutionCost).
+					GasUsed(test.ParentAddress, 6050+copyGas+test.ChildCompilationCostSameCtx+childExecutionCost).
 					// test.ChildAddress
 					GasUsed(test.ChildAddress, 0).
 					// others
@@ -1587,7 +1595,7 @@ func TestExecution_ExecuteOnSameContext_Successful_BigInts(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Direct(t *testing.T) {
-	forEachFixAuditChangesV6(t, 65, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+	forEachFixAuditChangesV6(t, 541, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Scenario:
 		// SC has a method "callRecursive" which takes a byte as argument (number of recursive calls)
 		// callRecursive() saves to storage "keyNNN" → "valueNNN", where NNN is the argument
@@ -1638,7 +1646,7 @@ func TestExecution_ExecuteOnSameContext_Recursive_Direct(t *testing.T) {
 			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
 				verify.Ok().
 					Balance(host, test.ParentAddress, 1000).
-					GasUsed(test.ParentAddress, 52513+nameCopyGas).
+					GasUsed(test.ParentAddress, 52513+copyGas).
 					ReturnData(returnData...).
 					Storage(storeEntries...)
 
@@ -1669,7 +1677,7 @@ func TestExecution_ExecuteOnSameContext_Recursive_Direct_ErrMaxInstances(t *test
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Mutual_Methods(t *testing.T) {
-	forEachFixAuditChangesV6(t, 96, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+	forEachFixAuditChangesV6(t, 572, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Scenario:
 		// SC has a method "callRecursiveMutualMethods" which takes a byte as
 		//		argument (number of recursive calls)
@@ -1739,7 +1747,7 @@ func TestExecution_ExecuteOnSameContext_Recursive_Mutual_Methods(t *testing.T) {
 			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
 				verify.Ok().
 					Balance(host, test.ParentAddress, 1000).
-					GasUsed(test.ParentAddress, 58642+nameCopyGas).
+					GasUsed(test.ParentAddress, 58642+copyGas).
 					ReturnData(returnData...).
 					Storage(storeEntries...)
 
@@ -1749,7 +1757,7 @@ func TestExecution_ExecuteOnSameContext_Recursive_Mutual_Methods(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Mutual_SCs(t *testing.T) {
-	forEachFixAuditChangesV6(t, 64, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+	forEachFixAuditChangesV6(t, 466, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Scenario:
 		// Parent has method parentCallChild()
 		// Child has method childCallParent()
@@ -1814,7 +1822,7 @@ func TestExecution_ExecuteOnSameContext_Recursive_Mutual_SCs(t *testing.T) {
 				verify.Ok().
 					// test.ParentAddress
 					Balance(host, test.ParentAddress, 1000).
-					GasUsed(test.ParentAddress, 34097+nameCopyGas).
+					GasUsed(test.ParentAddress, 34097+copyGas).
 					// test.ChildAddress
 					GasUsed(test.ChildAddress, 0).
 					// other
@@ -1962,14 +1970,19 @@ func TestExecution_ExecuteOnDestContext_OutOfGas(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnDestContext_Successful(t *testing.T) {
-	forEachFixAuditChangesV6(t, 13, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+	forEachFixAuditChangesV6(t, 13, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Call parentFunctionChildCall() of the parent SC, which will call the child
 		// SC and pass some arguments using executeOnDestContext().
 
 		parentGasBeforeExecuteAPI := uint64(168)
-		executeAPICost := uint64(54) + nameCopyGas
+		executeAPICost := uint64(54) + copyGas
 		childExecutionCost := uint64(272)
 		finalCost := uint64(808596)
+		// the child's own storage write, charged to the child account rather than to the caller
+		childCopyGas := uint64(0)
+		if fromFixAuditChangesV6(epochs) {
+			childCopyGas = 41
+		}
 		// childTransferValue := int64(12)
 
 		test.BuildInstanceCallTest(t).
@@ -1995,15 +2008,16 @@ func TestExecution_ExecuteOnDestContext_Successful(t *testing.T) {
 				verify.Ok().
 					// test.ParentAddress
 					Balance(host, test.ParentAddress, 9703).
-					GasUsed(test.ParentAddress, 815458+nameCopyGas).
+					GasUsed(test.ParentAddress, 815458+copyGas).
 					Balance(host, test.ChildAddress, 8790).
-					GasUsed(test.ChildAddress, test.ChildCompilationCostDestCtx+childExecutionCost).
+					GasUsed(test.ChildAddress, test.ChildCompilationCostDestCtx+childExecutionCost+childCopyGas).
 					GasRemaining(test.GasProvided-
 						test.ParentCompilationCostDestCtx-
 						parentGasBeforeExecuteAPI-
 						executeAPICost-
 						test.ChildCompilationCostDestCtx-
 						childExecutionCost-
+						childCopyGas-
 						finalCost).
 					ReturnData(test.ParentFinishA, test.ParentFinishB, []byte("succ"), test.ChildFinish, []byte("succ"), []byte("succ")).
 					Storage(
@@ -2024,14 +2038,19 @@ func TestExecution_ExecuteOnDestContext_Successful(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnDestContext_Successful_ChildReturns(t *testing.T) {
-	forEachFixAuditChangesV6(t, 13, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+	forEachFixAuditChangesV6(t, 13, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Call parentFunctionChildCall() of the parent SC, which will call the child
 		// SC and pass some arguments using executeOnDestContext().
 
 		parentGasBeforeExecuteAPI := uint64(168)
-		executeAPICost := uint64(54) + nameCopyGas
+		executeAPICost := uint64(54) + copyGas
 		childExecutionCost := uint64(272)
 		parentGasAfterExecuteAPI := uint64(793519)
+		// the child's own storage write, charged to the child account rather than to the caller
+		childCopyGas := uint64(0)
+		if fromFixAuditChangesV6(epochs) {
+			childCopyGas = 41
+		}
 		// childTransferValue := int64(12)
 
 		test.BuildInstanceCallTest(t).
@@ -2057,15 +2076,16 @@ func TestExecution_ExecuteOnDestContext_Successful_ChildReturns(t *testing.T) {
 				verify.Ok().
 					// test.ParentAddress
 					Balance(host, test.ParentAddress, 9703).
-					GasUsed(test.ParentAddress, 800381+nameCopyGas).
+					GasUsed(test.ParentAddress, 800381+copyGas).
 					Balance(host, test.ChildAddress, 8790).
-					GasUsed(test.ChildAddress, test.ChildCompilationCostDestCtx+childExecutionCost).
+					GasUsed(test.ChildAddress, test.ChildCompilationCostDestCtx+childExecutionCost+childCopyGas).
 					GasRemaining(test.GasProvided-
 						test.ParentCompilationCostDestCtx-
 						parentGasBeforeExecuteAPI-
 						executeAPICost-
 						test.ChildCompilationCostDestCtx-
 						childExecutionCost-
+						childCopyGas-
 						parentGasAfterExecuteAPI).
 					ReturnData(test.ParentFinishA, test.ParentFinishB, []byte("succ"), test.ChildFinish, []byte("succ")).
 					Storage(
@@ -2155,13 +2175,13 @@ func TestExecution_ExecuteOnDestContext_Successful_ChildReturns(t *testing.T) {
 // }
 
 func TestExecution_ExecuteOnDestContext_Successful_BigInts(t *testing.T) {
-	forEachFixAuditChangesV6(t, 21, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+	forEachFixAuditChangesV6(t, 21, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Call parentFunctionChildCall_BigInts() of the parent SC, which will call a
 		// method of the child SC that takes some big Int references as arguments and
 		// produce a new big Int out of the arguments.
 
 		parentGasBeforeExecuteAPI := uint64(115)
-		executeAPICost := uint64(25) + nameCopyGas
+		executeAPICost := uint64(25) + copyGas
 		childExecutionCost := uint64(101)
 		finalCost := uint64(64)
 
@@ -2183,7 +2203,7 @@ func TestExecution_ExecuteOnDestContext_Successful_BigInts(t *testing.T) {
 			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
 				verify.Ok().
 					Balance(host, test.ParentAddress, 9802).
-					GasUsed(test.ParentAddress, 6842+nameCopyGas).
+					GasUsed(test.ParentAddress, 6842+copyGas).
 					GasUsed(test.ChildAddress, 4693).
 					GasRemaining(test.GasProvided-
 						test.ParentCompilationCostDestCtx-
@@ -2198,7 +2218,7 @@ func TestExecution_ExecuteOnDestContext_Successful_BigInts(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnDestContext_Recursive_Direct(t *testing.T) {
-	forEachFixAuditChangesV6(t, 78, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+	forEachFixAuditChangesV6(t, 628, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		recursiveCalls := 6
 
 		var returnData [][]byte
@@ -2239,7 +2259,7 @@ func TestExecution_ExecuteOnDestContext_Recursive_Direct(t *testing.T) {
 			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
 				verify.Ok().
 					Balance(host, test.ParentAddress, 1000).
-					GasUsed(test.ParentAddress, 58726+nameCopyGas).
+					GasUsed(test.ParentAddress, 58726+copyGas).
 					ReturnData(returnData...).
 					Storage(storeEntries...)
 
@@ -2249,7 +2269,7 @@ func TestExecution_ExecuteOnDestContext_Recursive_Direct(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnDestContext_Recursive_Mutual_Methods(t *testing.T) {
-	forEachFixAuditChangesV6(t, 128, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+	forEachFixAuditChangesV6(t, 752, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		recursiveCalls := 7
 
 		var returnData [][]byte
@@ -2300,7 +2320,7 @@ func TestExecution_ExecuteOnDestContext_Recursive_Mutual_Methods(t *testing.T) {
 			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
 				verify.Ok().
 					Balance(host, test.ParentAddress, 1000).
-					GasUsed(test.ParentAddress, 71066+nameCopyGas).
+					GasUsed(test.ParentAddress, 71066+copyGas).
 					ReturnData(returnData...).
 					Storage(storeEntries...)
 
@@ -2310,7 +2330,14 @@ func TestExecution_ExecuteOnDestContext_Recursive_Mutual_Methods(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnDestContext_Recursive_Mutual_SCs(t *testing.T) {
-	forEachFixAuditChangesV6(t, 48, func(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+	forEachFixAuditChangesV6(t, 48, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+		// each account pays for the storage keys and values its own legacy hook calls copy, on top
+		// of the function-name copy gas both of them pay
+		parentStorageCopyGas, childStorageCopyGas := uint64(0), uint64(0)
+		if fromFixAuditChangesV6(epochs) {
+			parentStorageCopyGas, childStorageCopyGas = 328, 222
+		}
+
 		// Call parentFunctionChildCall() of the parent SC, which will call the child
 		// SC and pass some arguments using executeOnDestContext().
 
@@ -2379,10 +2406,10 @@ func TestExecution_ExecuteOnDestContext_Recursive_Mutual_SCs(t *testing.T) {
 				verify.Ok().
 					// test.ParentAddress
 					Balance(host, test.ParentAddress, 988).
-					GasUsed(test.ParentAddress, 30323+nameCopyGas).
+					GasUsed(test.ParentAddress, 30323+copyGas+parentStorageCopyGas).
 					// test.ChildAddress
 					Balance(host, test.ChildAddress, 1012).
-					GasUsed(test.ChildAddress, 26591+nameCopyGas).
+					GasUsed(test.ChildAddress, 26591+copyGas+childStorageCopyGas).
 					// others
 					ReturnData(returnData...).
 					Storage(storeEntries...)

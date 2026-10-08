@@ -107,9 +107,7 @@ func (context *VMHooksImpl) SmallIntStorageStoreUnsigned(keyOffset executor.MemP
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.Int64StorageStore
-	metering.UseGasAndAddTracedGas(smallIntStorageStoreSignedName, gasToUse)
-
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, err := context.chargeAndLoadKey(context.GetVMHost(), smallIntStorageStoreUnsignedName, gasToUse, keyOffset, keyLength)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
@@ -131,9 +129,7 @@ func (context *VMHooksImpl) SmallIntStorageStoreSigned(keyOffset executor.MemPtr
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.Int64StorageStore
-	metering.UseGasAndAddTracedGas(smallIntStorageStoreSignedName, gasToUse)
-
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, err := context.chargeAndLoadKey(context.GetVMHost(), smallIntStorageStoreSignedName, gasToUse, keyOffset, keyLength)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}

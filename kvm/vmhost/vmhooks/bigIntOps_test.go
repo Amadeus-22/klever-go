@@ -311,6 +311,8 @@ func TestBigIntSetUnsignedBytes(t *testing.T) {
 	mockWorld := worldmock.NewMockWorld()
 	vmHost, _ := hostCore.NewVMHost(mockWorld, makeHostParameters())
 	hooks := vmhooks.NewVMHooksImpl(vmHost)
+	// the hook's fixed cost is bounded from FixAuditChangesV6, so it needs a budget to charge against
+	vmHost.Metering().InitStateFromContractCallInput(&vmcommon.VMInput{GasProvided: 10_000})
 
 	// set new instance
 	it, ok := vmHost.Runtime().GetInstanceTracker().(InstanceTracker)

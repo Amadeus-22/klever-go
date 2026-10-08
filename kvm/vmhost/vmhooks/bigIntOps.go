@@ -105,9 +105,7 @@ func (context *VMHooksImpl) BigIntStorageStoreUnsigned(keyOffset executor.MemPtr
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().BigIntAPICost.BigIntStorageStoreUnsigned
-	metering.UseGasAndAddTracedGas(bigIntStorageStoreUnsignedName, gasToUse)
-
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, err := context.chargeAndLoadKey(context.GetVMHost(), bigIntStorageStoreUnsignedName, gasToUse, keyOffset, keyLength)
 	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
 		return -1
 	}
@@ -232,10 +230,13 @@ func (context *VMHooksImpl) BigIntGetKDAExternalBalance(
 	managedType := context.GetManagedTypesContext()
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
-	metering.StartGasTracing(bigIntGetKDAExternalBalanceName)
 
+	// opens this hook's trace, which the shared KDA read below then charges into
 	gasToUse := metering.GasSchedule().BigIntAPICost.BigIntGetExternalBalance
-	metering.UseAndTraceGas(gasToUse)
+	err := startTracingAndUseGas(context.GetVMHost(), bigIntGetKDAExternalBalanceName, gasToUse)
+	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
+		return
+	}
 
 	kdaData, userKDA, err := getKDADataFromBlockchainHook(context, addressOffset, tokenIDOffset, tokenIDLen, nonce)
 	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
@@ -361,17 +362,11 @@ func (context *VMHooksImpl) BigIntSetUnsignedBytes(destinationHandle int32, byte
 	managedType := context.GetManagedTypesContext()
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
-	metering.StartGasTracing(bigIntSetUnsignedBytesName)
-
 	gasToUse := metering.GasSchedule().BigIntAPICost.BigIntSetUnsignedBytes
-	metering.UseAndTraceGas(gasToUse)
-
-	bytes, err := context.MemLoad(byteOffset, byteLength)
+	bytes, err := context.chargeAndLoadBytes(context.GetVMHost(), bigIntSetUnsignedBytesName, gasToUse, byteOffset, byteLength)
 	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
 		return
 	}
-	gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(len(bytes)))
-	metering.UseGas(gasToUse)
 
 	value := managedType.GetBigIntOrCreate(destinationHandle)
 	value.SetBytes(bytes)
@@ -383,17 +378,11 @@ func (context *VMHooksImpl) BigIntSetSignedBytes(destinationHandle int32, byteOf
 	managedType := context.GetManagedTypesContext()
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
-	metering.StartGasTracing(bigIntSetSignedBytesName)
-
 	gasToUse := metering.GasSchedule().BigIntAPICost.BigIntSetSignedBytes
-	metering.UseAndTraceGas(gasToUse)
-
-	bytes, err := context.MemLoad(byteOffset, byteLength)
+	bytes, err := context.chargeAndLoadBytes(context.GetVMHost(), bigIntSetSignedBytesName, gasToUse, byteOffset, byteLength)
 	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
 		return
 	}
-	gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, uint64(len(bytes)))
-	metering.UseGas(gasToUse)
 
 	value := managedType.GetBigIntOrCreate(destinationHandle)
 	twos.SetBytes(value, bytes)

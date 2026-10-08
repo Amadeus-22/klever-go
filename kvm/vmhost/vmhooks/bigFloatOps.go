@@ -638,6 +638,12 @@ func (context *VMHooksImpl) BigFloatSetBigInt(destinationHandle, bigIntHandle in
 	metering.UseAndTraceGas(gasToUse)
 
 	bigIntValue, err := managedType.GetBigInt(bigIntHandle)
+	// from FixAuditChangesV6 the handle is checked before the copy is charged: pre-fork a missing
+	// handle reached ConsumeGasForBigIntCopy with a nil value and panicked on it
+	if err != nil && context.GetVMHost().ForkController().FixAuditChangesV6() {
+		context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution())
+		return
+	}
 	managedType.ConsumeGasForBigIntCopy(bigIntValue)
 	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
 		return

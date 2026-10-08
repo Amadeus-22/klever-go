@@ -3,6 +3,7 @@ package vmhooks
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"math/big"
 	"slices"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/klever-io/klever-go/tools/check"
 
 	"github.com/klever-io/klever-go/data/state"
+	"github.com/klever-io/klever-go/kapps"
 	"github.com/klever-io/klever-go/kvm/math"
 	"github.com/klever-io/klever-go/kvm/vmhost"
 )
@@ -276,12 +278,17 @@ func (context *VMHooksImpl) ManagedGetKDACallValue(kdaCallValueHandle int32, kda
 	metering := context.GetMeteringContext()
 	managedType := context.GetManagedTypesContext()
 
+	host := context.GetVMHost()
 	gasToUse := context.ComputeGetCallValueGas()
-	metering.UseGasAndAddTracedGas(managedGetKDACallValueName, gasToUse)
-
-	tokenID, err := managedType.GetBytes(kdaHandle)
+	err := startTracingAndUseGas(host, managedGetKDACallValueName, gasToUse)
 	if err != nil {
-		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
+		return
+	}
+
+	tokenID, err := loadMBufferBytes(host, kdaHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
+	if err != nil {
+		faultKDAArg(host, err)
 		return
 	}
 
@@ -360,31 +367,59 @@ func (context *VMHooksImpl) ManagedGetBackTransfers(kdaTransfersValueHandle int3
 	managedType.GetBigIntOrCreate(callValueHandle).Set(transferValue)
 }
 
+// faultKDAArg keeps the KDA getters' historical ErrArgOutOfRange for a bad handle or a missing
+// token, while reporting a shortfall on the pre-charged buffer copy as itself: a contract that
+// cannot pay for the copy must not be told its argument is out of range
+func faultKDAArg(host vmhost.VMHost, err error) {
+	if !errors.Is(err, vmhost.ErrNotEnoughGas) {
+		err = vmhost.ErrArgOutOfRange
+	}
+	_ = WithFaultAndHost(host, err, host.Runtime().BaseOpsErrorShouldFailExecution())
+}
+
+// loadKDAToken is everything the two-handle KDA getters do before they start writing handles: the
+// fixed cost first and bounded from FixAuditChangesV6, then the address and ticker buffers paid for
+// before they are cloned, then the token read. The error is returned for the caller to pass to
+// faultKDAArg, which keeps the historical ErrArgOutOfRange for everything but a shortfall
+func loadKDAToken(
+	host vmhost.VMHost,
+	hookName string,
+	gasToUse uint64,
+	addressHandle int32,
+	tickerHandle int32,
+	nonce int64,
+) (*kapps.KDAData, *kapps.UserKDA, error) {
+	dataCopyPerByte := host.Metering().GasSchedule().BaseOperationCost.DataCopyPerByte
+
+	err := startTracingAndUseGas(host, hookName, gasToUse)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	address, err := loadMBufferBytes(host, addressHandle, 0, dataCopyPerByte)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ticker, err := loadMBufferBytes(host, tickerHandle, 0, dataCopyPerByte)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return host.Blockchain().GetKDAToken(address, ticker, uint64(nonce)) // #nosec G115
+}
+
 // ManagedGetKDABalance VMHooks implementation.
 // @autogenerate(VMHooks)
 func (context *VMHooksImpl) ManagedGetKDABalance(addressHandle int32, tokenIDHandle int32, nonce int64, valueHandle int32) {
-	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
-	blockchain := context.GetBlockchainContext()
 	managedType := context.GetManagedTypesContext()
+	host := context.GetVMHost()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetExternalBalance
-	metering.UseGasAndAddTracedGas(managedGetKDABalanceName, gasToUse)
-
-	address, err := managedType.GetBytes(addressHandle)
+	_, kdaToken, err := loadKDAToken(host, managedGetKDABalanceName, gasToUse, addressHandle, tokenIDHandle, nonce)
 	if err != nil {
-		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
-	}
-	tokenID, err := managedType.GetBytes(tokenIDHandle)
-	if err != nil {
-		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
-	}
-
-	_, kdaToken, err := blockchain.GetKDAToken(address, tokenID, uint64(nonce)) // #nosec G115
-	if err != nil {
-		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
 		return
 	}
 
@@ -443,24 +478,25 @@ func ManagedGetKDARolesWithHost(
 	host vmhost.VMHost,
 	tickerHandle int32,
 	rolesHandle int32) {
-	runtime := host.Runtime()
 	metering := host.Metering()
 	blockchain := host.Blockchain()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedGetKDARolesName)
-
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetKDARoles
-	metering.UseAndTraceGas(gasToUse)
-
-	ticker, err := managedType.GetBytes(tickerHandle)
+	err := startTracingAndUseGas(host, managedGetKDARolesName, gasToUse)
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
+		return
+	}
+
+	ticker, err := loadMBufferBytes(host, tickerHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
+	if err != nil {
+		faultKDAArg(host, err)
 		return
 	}
 
 	kda, _, err := blockchain.GetKDAToken(nil, ticker, 0)
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
 		return
 	}
 
@@ -476,29 +512,13 @@ func ManagedGetUserKDAWithHost(
 	nonce int64,
 	balanceHandle, frozenHandle, lastClaimHandle, bucketsHandle, mimeHandle, metadataHandle int32) {
 
-	runtime := host.Runtime()
 	metering := host.Metering()
-	blockchain := host.Blockchain()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedGetUserKDAName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetUserKDA
-	metering.UseAndTraceGas(gasToUse)
-
-	address, err := managedType.GetBytes(addressHandle)
+	_, userKDA, err := loadKDAToken(host, managedGetUserKDAName, gasToUse, addressHandle, tickerHandle, nonce)
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
-	}
-	ticker, err := managedType.GetBytes(tickerHandle)
-	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
-	}
-
-	_, userKDA, err := blockchain.GetKDAToken(address, ticker, uint64(nonce)) // #nosec G115
-	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
 		return
 	}
 
@@ -524,29 +544,13 @@ func ManagedGetKDATokenDataWithHost(
 	tickerHandle int32,
 	nonce int64,
 	precisionHandle, idHandle, nameHandle, creatorHandle, adminHandle, logoHandle, urisHandle, initialSupplyHandle, circulatingSupplyHandle, maxSupplyHandle, mintedHandle, burnedHandle, royaltiesHandle, propertiesHandle, attributesHandle, rolesHandle, issueDateHandle int32) {
-	runtime := host.Runtime()
 	metering := host.Metering()
-	blockchain := host.Blockchain()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedGetKDATokenDataName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetKDATokenData
-	metering.UseAndTraceGas(gasToUse)
-
-	address, err := managedType.GetBytes(addressHandle)
+	kda, _, err := loadKDAToken(host, managedGetKDATokenDataName, gasToUse, addressHandle, tickerHandle, nonce)
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
-	}
-	ticker, err := managedType.GetBytes(tickerHandle)
-	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
-	}
-
-	kda, _, err := blockchain.GetKDAToken(address, ticker, uint64(nonce)) // #nosec G115
-	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
 		return
 	}
 
@@ -756,17 +760,21 @@ func (context *VMHooksImpl) ManagedDeployFromSourceContract(
 	runtime := host.Runtime()
 	metering := host.Metering()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedDeployFromSourceContractName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.CreateContract
-	metering.UseAndTraceGas(gasToUse)
+	err := startTracingAndUseGas(host, managedDeployFromSourceContractName, gasToUse)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return 1
+	}
 
 	vmInput, err := readDestinationValueArguments(host, addressHandle, valueHandle, argumentsHandle)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 1
 	}
 
-	codeMetadata, err := managedType.GetBytes(codeMetadataHandle)
+	// paid for before it is cloned from FixAuditChangesV6, like the code buffer: the managed hooks
+	// take whatever buffer the contract passes, where the legacy ones read a fixed CodeMetadataLen
+	codeMetadata, err := loadMBufferBytes(host, codeMetadataHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 1
 	}
@@ -809,10 +817,12 @@ func (context *VMHooksImpl) ManagedCreateContract(
 	runtime := host.Runtime()
 	metering := host.Metering()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedCreateContractName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.CreateContract
-	metering.UseAndTraceGas(gasToUse)
+	err := startTracingAndUseGas(host, managedCreateContractName, gasToUse)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return 1
+	}
 
 	sender := runtime.GetContextAddress()
 	value, err := managedType.GetBigInt(valueHandle)
@@ -832,12 +842,16 @@ func (context *VMHooksImpl) ManagedCreateContract(
 		metering.UseAndTraceGas(gasToUse)
 	}
 
-	codeMetadata, err := managedType.GetBytes(codeMetadataHandle)
+	// paid for before it is cloned from FixAuditChangesV6, like the code buffer: the managed hooks
+	// take whatever buffer the contract passes, where the legacy ones read a fixed CodeMetadataLen
+	codeMetadata, err := loadMBufferBytes(host, codeMetadataHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 1
 	}
 
-	code, err := managedType.GetBytes(codeHandle)
+	// from FixAuditChangesV6 the deployment's per-byte cost is charged here, before the buffer is
+	// cloned and before the BoundGasLimit inside createContract, instead of inside CreateNewContract
+	code, err := loadMBufferBytes(host, codeHandle, 0, metering.GasSchedule().BaseOperationCost.CompilePerByte)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 1
 	}
@@ -1218,24 +1232,26 @@ func ManagedGetSftMetadataWithHost(
 	nonce int64,
 	dataHandle int32,
 ) {
-	runtime := host.Runtime()
 	metering := host.Metering()
 	blockchain := host.Blockchain()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedGetSftMetadataName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetSFTMetadata
-	metering.UseAndTraceGas(gasToUse)
-
-	ticker, err := managedType.GetBytes(tickerHandle)
+	err := startTracingAndUseGas(host, managedGetSftMetadataName, gasToUse)
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
+		return
+	}
+
+	ticker, err := loadMBufferBytes(host, tickerHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
+	if err != nil {
+		faultKDAArg(host, err)
 		return
 	}
 
 	meta, err := blockchain.GetSFTMeta(ticker, uint64(nonce)) // #nosec G115
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
 		return
 	}
 

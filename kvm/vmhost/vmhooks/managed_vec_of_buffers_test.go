@@ -207,7 +207,10 @@ type callingHook struct {
 	// returnItems is how many return items the hook converts into the result vector, each charged
 	// MBufferNewFromBytes post-fork
 	returnItems uint64
-	call        func(host vmhost.VMHost, argumentsHandle int32) func()
+	// metadataCopyPostFork is the code-metadata buffer the hook pays for post-fork and cloned for
+	// free pre-fork; only the deploy hooks were converted
+	metadataCopyPostFork uint64
+	call                 func(host vmhost.VMHost, argumentsHandle int32) func()
 }
 
 func callingHooks() []callingHook {
@@ -236,12 +239,12 @@ func callingHooks() []callingHook {
 			dst, fn, result := buffer(host, test.ChildAddress), buffer(host, []byte(managedHookChildFunction)), buffer(host, nil)
 			return func() { _ = hooks(host).ManagedExecuteReadOnly(childGas, dst, fn, args, result) }
 		}},
-		{name: "managedCreateContract", preForkGas: 8096, chargedTwicePreFork: true, returnItems: 1, call: func(host vmhost.VMHost, args int32) func() {
+		{name: "managedCreateContract", preForkGas: 8096, chargedTwicePreFork: true, returnItems: 1, metadataCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args int32) func() {
 			value, code, meta := zero(host), buffer(host, childCode), buffer(host, upgradeableMetadata)
 			address, result := buffer(host, nil), buffer(host, nil)
 			return func() { _ = hooks(host).ManagedCreateContract(childGas, value, code, meta, args, address, result) }
 		}},
-		{name: "managedDeployFromSourceContract", preForkGas: 8096, chargedTwicePreFork: true, returnItems: 1, call: func(host vmhost.VMHost, args int32) func() {
+		{name: "managedDeployFromSourceContract", preForkGas: 8096, chargedTwicePreFork: true, returnItems: 1, metadataCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args int32) func() {
 			value, source, meta := zero(host), buffer(host, test.ChildAddress), buffer(host, upgradeableMetadata)
 			address, result := buffer(host, nil), buffer(host, nil)
 			return func() {
@@ -285,12 +288,14 @@ func TestManagedVecOfBuffers_CallArguments_PostForkPaysEachByteOnce(t *testing.T
 
 		// the hooks that billed the decoded arguments twice save exactly one DataCopyPerByte per
 		// argument byte post-fork; managedDeleteContract never did, so its gas does not move. Each
-		// return item converted into the result vector costs MBufferNewFromBytes post-fork
+		// return item converted into the result vector costs MBufferNewFromBytes post-fork, and the
+		// deploy hooks additionally pay for the code-metadata buffer they clone
 		saving := uint64(0)
 		if hook.chargedTwicePreFork {
 			saving = argumentBytes * mainnetDataCopyPerByte
 		}
-		require.Equal(t, pre.gasUsed-saving+hook.returnItems*testMBufferNewFromBytes, post.gasUsed, hook.name)
+		expected := pre.gasUsed - saving + hook.returnItems*testMBufferNewFromBytes + hook.metadataCopyPostFork
+		require.Equal(t, expected, post.gasUsed, hook.name)
 	}
 }
 
