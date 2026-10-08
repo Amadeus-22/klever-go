@@ -2,8 +2,22 @@ package types
 
 import (
 	"cmp"
+	"slices"
 	"sort"
 )
+
+// OrderedKeys returns the map's keys, sorted when sorted is true and in map order otherwise.
+// Callers pass the fork flag that made their iteration deterministic.
+func OrderedKeys[K cmp.Ordered, V any](m map[K]V, sorted bool) []K {
+	keys := make([]K, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	if sorted {
+		slices.Sort(keys)
+	}
+	return keys
+}
 
 // deterministicMap is a map that iterates over its keys in a deterministic order.
 // this map is not intended to be a fancy way of storing data or ordering it. It is

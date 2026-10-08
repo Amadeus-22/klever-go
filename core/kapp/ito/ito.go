@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/klever-io/klever-go/common"
+	"github.com/klever-io/klever-go/common/types"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
 	"github.com/klever-io/klever-go/core/process"
@@ -429,7 +430,9 @@ func (i *itoKapp) ComputeITOPercentBuyRoyalties(ctx kapp.KappContext, asset *kap
 	}
 
 	royaltiesITOPercentageToPay := royaltiesPercentAmount
-	for key, value := range asset.Royalties.SplitRoyalties {
+	// Split payouts become ordered back transfers visible to a calling contract.
+	for _, key := range types.OrderedKeys(asset.Royalties.SplitRoyalties, i.forkController.FixAuditChangesV6()) {
+		value := asset.Royalties.SplitRoyalties[key]
 		status, err := i.computeSplitRoyalties(ctx, key, currencyID, ownerAcc,
 			royaltiesPercentAmount, int64(value.PercentITOPercentage), &royaltiesITOPercentageToPay, paymentCurrency)
 		if err != nil {
