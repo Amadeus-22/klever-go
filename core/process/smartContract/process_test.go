@@ -352,11 +352,11 @@ func createMockSmartContractProcessorArguments() ArgsNewSmartContractProcessor {
 
 			},
 		},
-		GasSchedule:         notifierMock.NewGasScheduleNotifierMock(gasSchedule),
-		WasmVMChangeLocker:  &sync.RWMutex{},
-		VMOutputCacher:      txcache.NewDisabledCache(),
-		ForkController:      forkController,
-		IsGenesisProcessing: true,
+		GasSchedule:        notifierMock.NewGasScheduleNotifierMock(gasSchedule),
+		WasmVMChangeLocker: &sync.RWMutex{},
+		VMOutputCacher:     txcache.NewDisabledCache(),
+		ForkController:     forkController,
+		AllowDeploy:        true,
 	}
 }
 

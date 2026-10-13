@@ -60,33 +60,33 @@ type scProcessor struct {
 	txFeeHandler   process.TransactionFeeHandler
 	economicsFee   process.EconomicsDataHandler
 
-	builtInGasCosts     map[string]uint64
-	persistPerByte      uint64
-	storePerByte        uint64
-	mutGasLock          sync.RWMutex
-	txLogsProcessor     process.TransactionLogProcessor
-	vmOutputCacher      storage.Cacher
-	isGenesisProcessing bool
+	builtInGasCosts map[string]uint64
+	persistPerByte  uint64
+	storePerByte    uint64
+	mutGasLock      sync.RWMutex
+	txLogsProcessor process.TransactionLogProcessor
+	vmOutputCacher  storage.Cacher
+	allowDeploy     bool
 }
 
 // ArgsNewSmartContractProcessor defines the arguments needed for new smart contract processor
 type ArgsNewSmartContractProcessor struct {
-	VmContainer         process.VirtualMachinesContainer
-	ArgsParser          process.ArgumentsParser
-	Hasher              hashing.Hasher
-	Marshalizer         marshal.Marshalizer
-	BlockChainHook      process.BlockChainHookHandler
-	BuiltInFunctions    vmcommon.BuiltInFunctionContainer
-	PubkeyConv          core.PubkeyConverter
-	TxFeeHandler        process.TransactionFeeHandler
-	EconomicsFee        process.EconomicsDataHandler
-	GasSchedule         core.GasScheduleNotifier
-	TxLogsProcessor     process.TransactionLogProcessor
-	ForkController      core.ForkController
-	VMOutputCacher      storage.Cacher
-	WasmVMChangeLocker  common.Locker
-	AccountsCacher      state.AccountsCacher
-	IsGenesisProcessing bool
+	VmContainer        process.VirtualMachinesContainer
+	ArgsParser         process.ArgumentsParser
+	Hasher             hashing.Hasher
+	Marshalizer        marshal.Marshalizer
+	BlockChainHook     process.BlockChainHookHandler
+	BuiltInFunctions   vmcommon.BuiltInFunctionContainer
+	PubkeyConv         core.PubkeyConverter
+	TxFeeHandler       process.TransactionFeeHandler
+	EconomicsFee       process.EconomicsDataHandler
+	GasSchedule        core.GasScheduleNotifier
+	TxLogsProcessor    process.TransactionLogProcessor
+	ForkController     core.ForkController
+	VMOutputCacher     storage.Cacher
+	WasmVMChangeLocker common.Locker
+	AccountsCacher     state.AccountsCacher
+	AllowDeploy        bool
 }
 
 // NewSmartContractProcessor creates a smart contract processor that creates and interprets VM data
@@ -140,24 +140,24 @@ func NewSmartContractProcessor(args ArgsNewSmartContractProcessor) (*scProcessor
 	builtInFuncCost := args.GasSchedule.LatestGasSchedule()[common.BuiltInCost]
 	baseOperationCost := args.GasSchedule.LatestGasSchedule()[common.BaseOperationCost]
 	sc := &scProcessor{
-		vmContainer:         args.VmContainer,
-		argsParser:          args.ArgsParser,
-		hasher:              args.Hasher,
-		marshalizer:         args.Marshalizer,
-		blockChainHook:      args.BlockChainHook,
-		pubkeyConv:          args.PubkeyConv,
-		txFeeHandler:        args.TxFeeHandler,
-		economicsFee:        args.EconomicsFee,
-		builtInGasCosts:     builtInFuncCost,
-		txLogsProcessor:     args.TxLogsProcessor,
-		forkController:      args.ForkController,
-		builtInFunctions:    args.BuiltInFunctions,
-		isGenesisProcessing: args.IsGenesisProcessing,
-		wasmVMChangeLocker:  args.WasmVMChangeLocker,
-		vmOutputCacher:      args.VMOutputCacher,
-		accountsCacher:      args.AccountsCacher,
-		storePerByte:        baseOperationCost["StorePerByte"],
-		persistPerByte:      baseOperationCost["PersistPerByte"],
+		vmContainer:        args.VmContainer,
+		argsParser:         args.ArgsParser,
+		hasher:             args.Hasher,
+		marshalizer:        args.Marshalizer,
+		blockChainHook:     args.BlockChainHook,
+		pubkeyConv:         args.PubkeyConv,
+		txFeeHandler:       args.TxFeeHandler,
+		economicsFee:       args.EconomicsFee,
+		builtInGasCosts:    builtInFuncCost,
+		txLogsProcessor:    args.TxLogsProcessor,
+		forkController:     args.ForkController,
+		builtInFunctions:   args.BuiltInFunctions,
+		allowDeploy:        args.AllowDeploy,
+		wasmVMChangeLocker: args.WasmVMChangeLocker,
+		vmOutputCacher:     args.VMOutputCacher,
+		accountsCacher:     args.AccountsCacher,
+		storePerByte:       baseOperationCost["StorePerByte"],
+		persistPerByte:     baseOperationCost["PersistPerByte"],
 	}
 
 	var err error
@@ -608,8 +608,7 @@ func (sc *scProcessor) doDeploySmartContract(
 	txHash := ctx.TxHash()
 
 	var vmOutput *vmcommon.VMOutput
-	shouldAllowDeploy := sc.isGenesisProcessing
-	if !shouldAllowDeploy {
+	if !sc.allowDeploy {
 		log.Trace("deploy is disabled")
 		return vmcommon.VMUserError, sc.ProcessIfError(ctx, tc, process.ErrSmartContractDeploymentIsDisabled.Error(), []byte(""))
 	}

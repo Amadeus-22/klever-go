@@ -214,6 +214,27 @@ func TestExecution_DeployWASM_Popcnt(t *testing.T) {
 		})
 }
 
+// Every executor build, arm64 included, must terminate on popcnt edge values
+// and agree on the results.
+func TestExecution_DeployWASM_PopcntEdgeValues(t *testing.T) {
+	test.BuildInstanceCreatorTest(t).
+		WithInput(test.CreateTestContractCreateInputBuilder().
+			WithGasProvided(100_000_000).
+			WithKDATransfers([]*vmcommon.KDATransfer{
+				{
+					KDAValue: big.NewInt(88),
+				},
+			}).
+			WithArguments().
+			WithContractCode(test.GetTestSCCode("init-popcnt-edge", "../../")).
+			Build()).
+		WithAddress(newAddress).
+		AndAssertResults(func(blockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+			verify.Ok().
+				ReturnData([]byte{1}, []byte{1}, []byte{}, []byte{64}, []byte{32}, []byte{0x26, 0x88})
+		})
+}
+
 func TestExecution_DeployWASM_AtMaximumLocals(t *testing.T) {
 	test.BuildInstanceCreatorTest(t).
 		WithInput(test.CreateTestContractCreateInputBuilder().

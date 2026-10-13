@@ -914,22 +914,22 @@ func newBlockProcessor(
 
 	argsParser := smartContract.NewArgumentParser()
 	argsNewSCProcessor := smartContract.ArgsNewSmartContractProcessor{
-		VmContainer:         vmContainer,
-		ArgsParser:          argsParser,
-		Hasher:              processArgs.coreData.Hasher,
-		Marshalizer:         processArgs.coreData.InternalMarshalizer,
-		BlockChainHook:      virtualMachineFactory.BlockChainHookImpl(),
-		BuiltInFunctions:    builtInFuncFactory.BuiltInFunctionContainer(),
-		PubkeyConv:          processArgs.state.AddressPubkeyConverter,
-		TxFeeHandler:        txFeeHandler,
-		EconomicsFee:        processArgs.economicsData,
-		GasSchedule:         gasScheduleNotifier,
-		TxLogsProcessor:     processArgs.txLogsProcessor,
-		ForkController:      processArgs.forkController,
-		VMOutputCacher:      txcache.NewDisabledCache(),
-		AccountsCacher:      processArgs.accountsCacher,
-		WasmVMChangeLocker:  &sync.RWMutex{},
-		IsGenesisProcessing: true,
+		VmContainer:        vmContainer,
+		ArgsParser:         argsParser,
+		Hasher:             processArgs.coreData.Hasher,
+		Marshalizer:        processArgs.coreData.InternalMarshalizer,
+		BlockChainHook:     virtualMachineFactory.BlockChainHookImpl(),
+		BuiltInFunctions:   builtInFuncFactory.BuiltInFunctionContainer(),
+		PubkeyConv:         processArgs.state.AddressPubkeyConverter,
+		TxFeeHandler:       txFeeHandler,
+		EconomicsFee:       processArgs.economicsData,
+		GasSchedule:        gasScheduleNotifier,
+		TxLogsProcessor:    processArgs.txLogsProcessor,
+		ForkController:     processArgs.forkController,
+		VMOutputCacher:     txcache.NewDisabledCache(),
+		AccountsCacher:     processArgs.accountsCacher,
+		WasmVMChangeLocker: &sync.RWMutex{},
+		AllowDeploy:        true,
 	}
 	scProcessor, err := smartContract.NewSmartContractProcessor(argsNewSCProcessor)
 	if err != nil {
