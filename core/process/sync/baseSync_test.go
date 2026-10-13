@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"github.com/klever-io/klever-go/data/block"
 	"github.com/klever-io/klever-go/data/retriever"
 	"github.com/klever-io/klever-go/storage"
+	"github.com/klever-io/klever-go/tools"
 	"github.com/klever-io/klever-go/tools/typeConverters/uint64ByteSlice"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -41,11 +43,15 @@ type syncSim struct {
 
 	finalNonce         uint64
 	processBlockHook   func()
+	processBlockErr    func(header data.HeaderHandler) error
 	numProcessBlock    int
 	numReverts         int
 	numRemovedFromPool int
 	numRemovedFromFork int
 	numResetProbable   int
+	numResetRequests   int
+	removedRequests    []uint64
+	removedRequestHash []byte
 }
 
 func newHeader(nonce uint64, slot uint64, parentHash []byte) *block.Block {
@@ -149,6 +155,14 @@ func newSyncSim(t *testing.T) (*syncSim, *baseBootstrap) {
 			if !bytes.Equal(header.GetParentHash(), chain.GetCurrentBlockHeaderHash()) {
 				return process.ErrBlockHashDoesNotMatch
 			}
+			if err := process.CheckBlockBodyMatchesHeader(header, hasher, &mock.ForkControllerStub{}); err != nil {
+				return err
+			}
+			if sim.processBlockErr != nil {
+				if err := sim.processBlockErr(header); err != nil {
+					return err
+				}
+			}
 			if sim.processBlockHook != nil {
 				sim.processBlockHook()
 			}
@@ -189,10 +203,22 @@ func newSyncSim(t *testing.T) (*syncSim, *baseBootstrap) {
 			IndexCalled:        sim.index,
 			TimeDurationCalled: func() time.Duration { return time.Second },
 		},
-		hasher:         hasher,
-		marshalizer:    marshalizer,
-		forkDetector:   forkDetector,
-		requestHandler: &mock.RequestHandlerStub{},
+		hasher:       hasher,
+		marshalizer:  marshalizer,
+		forkDetector: forkDetector,
+		requestHandler: &mock.RequestHandlerStub{
+			ResetRequestsCalled: func() {
+				sim.mut.Lock()
+				sim.numResetRequests++
+				sim.mut.Unlock()
+			},
+			RemoveHeaderRequestsCalled: func(nonce uint64, hash []byte) {
+				sim.mut.Lock()
+				sim.removedRequests = append(sim.removedRequests, nonce)
+				sim.removedRequestHash = hash
+				sim.mut.Unlock()
+			},
+		},
 		networkWatcher: &mock.MessengerStub{},
 		bootStorer: &mock.BoostrapStorerMock{
 			GetCalled:            func(_ int64) (*bootstrapStorage.BootstrapData, error) { return nil, errSimStorage },
@@ -244,6 +270,25 @@ func (sbb *simBlockBootstrapper) getHeaderWithNonceRequestingIfMissing(nonce uin
 func (sbb *simBlockBootstrapper) haveHeaderInPoolWithNonce(_ uint64) bool { return true }
 func (sbb *simBlockBootstrapper) isForkTriggeredByMeta() bool             { return false }
 func (sbb *simBlockBootstrapper) requestHeaderByNonce(_ uint64)           {}
+
+func assertDroppedWithoutRollBack(t *testing.T, sim *syncSim, boot *baseBootstrap) {
+	t.Helper()
+
+	sim.mut.Lock()
+	defer sim.mut.Unlock()
+	assert.Equal(t, uint64(5), sim.current.GetNonce(), "the committed block must not be rolled back")
+	assert.Equal(t, 0, sim.numReverts, "state must not be reverted")
+	assert.False(t, sim.queuedInPool, "the rejected block must leave the pool")
+	assert.Equal(t, 1, sim.numRemovedFromPool)
+	assert.Equal(t, 0, sim.numRemovedFromFork, "the header must stay in the fork detector")
+	assert.Equal(t, 0, sim.numResetProbable)
+	assert.Equal(t, []uint64{6}, sim.removedRequests, "the dropped block must be requested again right away")
+	queuedHash, err := tools.CalculateHash(boot.marshalizer, boot.hasher, sim.queued.Header)
+	require.NoError(t, err)
+	assert.Equal(t, queuedHash, sim.removedRequestHash, "the dropped header must be requestable again by its hash")
+	assert.Equal(t, 0, sim.numResetRequests, "unrelated requests must stay in the time cache")
+	assert.Equal(t, uint32(0), boot.GetNumSyncedWithErrorsForNonce(6), "no sync failure must be counted")
+}
 
 func assertNothingDiscarded(t *testing.T, sim *syncSim, boot *baseBootstrap) {
 	t.Helper()
@@ -331,6 +376,113 @@ func TestSyncBlock_InvalidHeaderShouldStillRollBack(t *testing.T) {
 	assert.Equal(t, 1, sim.numReverts)
 	assert.False(t, sim.queuedInPool)
 	assert.Equal(t, uint32(1), boot.GetNumSyncedWithErrorsForNonce(6))
+}
+
+func TestSyncBlock_BodyNotMatchingHeaderShouldBeDroppedWithoutRollBack(t *testing.T) {
+	sim, boot := newSyncSim(t)
+
+	honest := sim.queued
+	mismatched := newHeader(6, 12, []byte("h5"))
+	mismatched.Header.TxCount = 1
+	sim.queued = mismatched
+
+	require.ErrorIs(t, boot.syncBlock(), process.ErrInvalidTXCount)
+	assertDroppedWithoutRollBack(t, sim, boot)
+
+	sim.mut.Lock()
+	sim.queued, sim.queuedInPool = honest, true
+	sim.mut.Unlock()
+
+	require.NoError(t, boot.syncBlock())
+	assert.Equal(t, uint64(6), sim.currentHeader().GetNonce())
+	assert.Equal(t, 0, sim.numReverts)
+}
+
+func TestSyncBlock_TxResultMismatchShouldBeDroppedWithoutRollBack(t *testing.T) {
+	sim, boot := newSyncSim(t)
+
+	var once atomic.Bool
+	sim.processBlockErr = func(_ data.HeaderHandler) error {
+		if once.CompareAndSwap(false, true) {
+			return process.ErrTransactionResultMismatch
+		}
+		return nil
+	}
+
+	require.ErrorIs(t, boot.syncBlock(), process.ErrTransactionResultMismatch)
+	assertDroppedWithoutRollBack(t, sim, boot)
+
+	sim.mut.Lock()
+	sim.queuedInPool = true
+	sim.mut.Unlock()
+
+	require.NoError(t, boot.syncBlock())
+	assert.Equal(t, uint64(6), sim.currentHeader().GetNonce())
+	assert.Equal(t, 0, sim.numReverts)
+}
+
+func TestDoJobOnSyncBlockFail_RejectedBodyAtErrorLimitShouldNotReset(t *testing.T) {
+	bodyErrors := []error{
+		fmt.Errorf("%w: %w", process.ErrBlockBodyNotMatchingHeader, process.ErrInvalidTxHashLength),
+		fmt.Errorf("%w: %w", process.ErrBlockBodyNotMatchingHeader, process.ErrInvalidTXCount),
+		fmt.Errorf("%w: %w", process.ErrBlockBodyNotMatchingHeader, process.ErrInvalidTXResultsCount),
+		fmt.Errorf("%w: %w", process.ErrBlockBodyNotMatchingHeader, process.ErrTxRootHashDoesNotMatch),
+		process.ErrTransactionResultMismatch,
+		process.WrapBlockExecutionNotMatchingHeader(process.ErrInvalidTXFees),
+		process.WrapBlockExecutionNotMatchingHeader(process.ErrInvalidKAppsFees),
+		process.WrapBlockExecutionNotMatchingHeader(process.ErrRootStateDoesNotMatch),
+	}
+
+	for _, bodyErr := range bodyErrors {
+		t.Run(bodyErr.Error(), func(t *testing.T) {
+			sim, boot := newSyncSim(t)
+
+			sim.setSlot(process.SlotModulusTrigger * 2)
+			boot.SetNumSyncedWithErrorsForNonce(6, process.MaxSyncWithErrorsAllowed)
+
+			boot.doJobOnSyncBlockFail(sim.queued, bodyErr, sim.index())
+
+			assert.Equal(t, uint32(process.MaxSyncWithErrorsAllowed), boot.GetNumSyncedWithErrorsForNonce(6))
+			sim.mut.Lock()
+			defer sim.mut.Unlock()
+			assert.Equal(t, uint64(5), sim.current.GetNonce())
+			assert.Equal(t, 0, sim.numResetProbable)
+			assert.Equal(t, 0, sim.numReverts)
+			assert.Equal(t, 0, sim.numRemovedFromFork)
+			assert.Equal(t, 1, sim.numRemovedFromPool)
+			assert.Equal(t, []uint64{6}, sim.removedRequests)
+			queuedHash, err := tools.CalculateHash(boot.marshalizer, boot.hasher, sim.queued.Header)
+			require.NoError(t, err)
+			assert.Equal(t, queuedHash, sim.removedRequestHash)
+			assert.Equal(t, 0, sim.numResetRequests)
+		})
+	}
+}
+
+func TestDoJobOnSyncBlockFail_HeaderLevelTxErrorsShouldStillRollBack(t *testing.T) {
+	headerErrors := []error{
+		fmt.Errorf("%w, metachain, computed: %s, received: %s, meta header nonce: %d",
+			process.ErrValidatorStatsRootHashDoesNotMatch, "computed root", "received root", 6),
+		process.ErrInvalidTXCount,
+		process.ErrTxRootHashDoesNotMatch,
+		process.ErrInvalidTXFees,
+		process.ErrRootStateDoesNotMatch,
+	}
+
+	for _, headerErr := range headerErrors {
+		t.Run(headerErr.Error(), func(t *testing.T) {
+			sim, boot := newSyncSim(t)
+
+			boot.doJobOnSyncBlockFail(sim.queued, headerErr, sim.index())
+
+			sim.mut.Lock()
+			defer sim.mut.Unlock()
+			assert.Equal(t, uint64(4), sim.current.GetNonce(), "nonce 5 is rolled back")
+			assert.Equal(t, 1, sim.numReverts)
+			assert.False(t, sim.queuedInPool)
+			assert.Equal(t, uint32(1), boot.GetNumSyncedWithErrorsForNonce(6))
+		})
+	}
 }
 
 func TestDoJobOnSyncBlockFail_SlotAheadOfChronologyAtErrorLimitShouldNotReset(t *testing.T) {

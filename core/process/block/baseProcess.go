@@ -232,35 +232,6 @@ func (bp *baseProcessor) validateBlockAndSlot(headerHandler data.HeaderHandler) 
 		return process.ErrInvalidBlockTimestamp
 	}
 
-	// #nosec G115
-	if headerHandler.GetTxCount() != uint32(len(headerHandler.GetTxHashes())) {
-		log.Error("checkBlockValidity tx count does not match",
-			"count", headerHandler.GetTxCount(),
-			"len", len(headerHandler.GetTxHashes()))
-
-		return process.ErrInvalidTXCount
-	}
-
-	// TxResults carries one consensus result code per transaction and is what the validator
-	// compares its own execution against (KLR-63). A proposer always fills it in lockstep with
-	// TxHashes, so any other length is malformed - and an omitted list would silently skip the
-	// comparison altogether. The field is not covered by the tx root hash yet, so this only bounds
-	// the shape of the list, not its contents.
-	//
-	// The gate is derived from the header's own epoch, not from the notifier's current one:
-	// ProcessBlock reaches here (block.go:127) before it advances the notifier (block.go:167),
-	// so the flag would still hold the previous epoch's value and skip this check on the very
-	// first block of the activation epoch - the one block commitBlock would then reject, after
-	// the whole block had already been executed with the per-tx comparison bypassed.
-	if bp.forkController.FixAuditChangesV5InEpoch(headerHandler.GetEpoch()) &&
-		len(headerHandler.GetTxResults()) != len(headerHandler.GetTxHashes()) {
-		log.Error("checkBlockValidity tx results count does not match",
-			"txResults", len(headerHandler.GetTxResults()),
-			"txHashes", len(headerHandler.GetTxHashes()))
-
-		return process.ErrInvalidTXResultsCount
-	}
-
 	burnnedTxFees := headerHandler.GetTxFees() - bp.validatorStatisticsProcessor.LeaderRewards(headerHandler.GetTxFees())
 	if headerHandler.GetTxBurnedFees() != burnnedTxFees {
 		return process.ErrInvalidTXFees
@@ -296,18 +267,21 @@ func (bp *baseProcessor) validateZeroTXRootHash(headerHandler data.HeaderHandler
 // Helper function to validate transaction root hash
 func (bp *baseProcessor) validateTxRootHash(headerHandler data.HeaderHandler) error {
 	if headerHandler.GetTxCount() == 0 {
-		return bp.validateZeroTXRootHash(headerHandler)
+		err := bp.validateZeroTXRootHash(headerHandler)
+		if err != nil {
+			return err
+		}
 	}
 
-	txRootHash, err := headerHandler.ComputeRootHash(bp.hasher)
+	err := process.CheckBlockBodyMatchesHeader(headerHandler, bp.hasher, bp.forkController)
 	if err != nil {
-		return err
-	}
-	if !bytes.Equal(headerHandler.GetTxRootHash(), txRootHash) {
-		log.Debug("tx root hash does not match",
+		log.Error("checkBlockValidity block body does not match its header",
+			"count", headerHandler.GetTxCount(),
+			"txHashes", len(headerHandler.GetTxHashes()),
+			"txResults", len(headerHandler.GetTxResults()),
 			LogHeaderTxRootHash, headerHandler.GetTxRootHash(),
-			LogComputedTxRootHash, txRootHash)
-		return process.ErrTxRootHashDoesNotMatch
+			"error", err.Error())
+		return err
 	}
 
 	return nil

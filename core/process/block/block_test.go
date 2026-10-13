@@ -826,6 +826,8 @@ func TestMetaProcessor_ProcessBlockEpochStartErrorShouldNotApplySideEffects(t *t
 	tests := []struct {
 		name        string
 		errContains string
+		errIs       []error
+		errIsNot    []error
 		prepare     func(hdr *block.Block, arguments *blproc.ArgMetaProcessor)
 	}{
 		{
@@ -881,6 +883,7 @@ func TestMetaProcessor_ProcessBlockEpochStartErrorShouldNotApplySideEffects(t *t
 		{
 			name:        "account trie root does not match",
 			errContains: process.ErrRootStateDoesNotMatch.Error(),
+			errIs:       []error{process.ErrRootStateDoesNotMatch, process.ErrBlockExecutionNotMatchingHeader},
 			prepare: func(hdr *block.Block, _ *blproc.ArgMetaProcessor) {
 				hdr.Header.TrieRoot = []byte("another root hash")
 			},
@@ -897,8 +900,22 @@ func TestMetaProcessor_ProcessBlockEpochStartErrorShouldNotApplySideEffects(t *t
 			},
 		},
 		{
+			name:        "validator statistics root hash does not match the header",
+			errContains: process.ErrValidatorStatsRootHashDoesNotMatch.Error(),
+			errIs:       []error{process.ErrValidatorStatsRootHashDoesNotMatch},
+			errIsNot:    []error{process.ErrBlockExecutionNotMatchingHeader},
+			prepare: func(_ *block.Block, arguments *blproc.ArgMetaProcessor) {
+				arguments.ValidatorStatisticsProcessor = &mock.ValidatorStatisticsProcessorStub{
+					UpdatePeerStateCalled: func(_ data.HeaderHandler, _ data.HeaderHandler) ([]byte, error) {
+						return []byte("another validators root hash"), nil
+					},
+				}
+			},
+		},
+		{
 			name:        "kapp trie root does not match",
 			errContains: process.ErrRootStateDoesNotMatch.Error(),
+			errIs:       []error{process.ErrRootStateDoesNotMatch, process.ErrBlockExecutionNotMatchingHeader},
 			prepare: func(hdr *block.Block, _ *blproc.ArgMetaProcessor) {
 				// verifyKAppRootHash is the last check before the side effects
 				hdr.Header.KAppsTrieRoot = []byte("another kapp root hash")
@@ -949,6 +966,12 @@ func TestMetaProcessor_ProcessBlockEpochStartErrorShouldNotApplySideEffects(t *t
 			err = mp.ProcessBlock(hdr, haveTime)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tt.errContains)
+			for _, expected := range tt.errIs {
+				require.ErrorIs(t, err, expected)
+			}
+			for _, unexpected := range tt.errIsNot {
+				assert.False(t, errors.Is(err, unexpected))
+			}
 
 			assert.Zero(t, setEpochValidatorsCalls, "rejected epoch start block must not update the nodes coordinator")
 			assert.Zero(t, indexerCalls, "rejected epoch start block must not notify the indexer")
@@ -1567,7 +1590,7 @@ func TestMetaProcessor_ProcessBlockWithMismatchedTxResultsCount(t *testing.T) {
 				Slot:    11,
 				TxCount: 1,
 			},
-			TxHashes:  [][]byte{[]byte("txHash")},
+			TxHashes:  [][]byte{(&sha256.Sha256{}).Compute("txHash")},
 			TxResults: txResults,
 		}
 	}
@@ -1598,13 +1621,13 @@ func TestMetaProcessor_ProcessBlockWithMismatchedTxResultsCount(t *testing.T) {
 	t.Run("missing tx results", func(t *testing.T) {
 		t.Parallel()
 
-		assert.Equal(t, process.ErrInvalidTXResultsCount, processBlock(t, nil, nil))
+		assert.ErrorIs(t, processBlock(t, nil, nil), process.ErrInvalidTXResultsCount)
 	})
 
 	t.Run("more tx results than tx hashes", func(t *testing.T) {
 		t.Parallel()
 
-		assert.Equal(t, process.ErrInvalidTXResultsCount, processBlock(t, []uint32{0, 0}, nil))
+		assert.ErrorIs(t, processBlock(t, []uint32{0, 0}, nil), process.ErrInvalidTXResultsCount)
 	})
 
 	t.Run("fork disabled: mismatch is not rejected here", func(t *testing.T) {
@@ -1617,7 +1640,7 @@ func TestMetaProcessor_ProcessBlockWithMismatchedTxResultsCount(t *testing.T) {
 
 		// The gate being inert must be observable, so pin the check the header
 		// falls through to instead of merely asserting the gate's error is absent.
-		assert.Equal(t, process.ErrTxRootHashDoesNotMatch, err)
+		assert.ErrorIs(t, err, process.ErrTxRootHashDoesNotMatch)
 	})
 }
 
@@ -1679,13 +1702,13 @@ func TestMetaProcessor_ProcessBlockRejectsMismatchedTxResultsOnFirstBlockOfActiv
 			Epoch:   activationEpoch,
 			TxCount: 1,
 		},
-		TxHashes:  [][]byte{[]byte("txHash")},
+		TxHashes:  [][]byte{(&sha256.Sha256{}).Compute("txHash")},
 		TxResults: nil,
 	}
 
 	err = mp.ProcessBlock(header, haveTime)
 
-	assert.Equal(t, process.ErrInvalidTXResultsCount, err)
+	assert.ErrorIs(t, err, process.ErrInvalidTXResultsCount)
 	assert.False(t, epochAdvanced,
 		"the header must be rejected before the epoch notifier is advanced, otherwise the "+
 			"gate is being read from the notifier instead of from the header's own epoch")

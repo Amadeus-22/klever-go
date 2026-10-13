@@ -7,6 +7,7 @@ import (
 	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/data/retriever"
+	"github.com/klever-io/klever-go/storage/timecache"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 )
@@ -335,6 +336,54 @@ func TestResolverRequestHandler_RequestHeaderByNonceShouldRequest(t *testing.T) 
 	rrh.RequestHeaderByNonce(0)
 
 	assert.True(t, wasCalled)
+}
+
+func TestResolverRequestHandler_RemoveHeaderRequestsShouldOnlyForgetThatHeader(t *testing.T) {
+	t.Parallel()
+
+	numNonceRequests := make(map[uint64]int)
+	numHashRequests := make(map[string]int)
+	hdrResolver := &mock.HeaderResolverStub{
+		RequestDataFromNonceCalled: func(nonce uint64, epoch uint32) error {
+			numNonceRequests[nonce]++
+			return nil
+		},
+		RequestDataFromHashCalled: func(hash []byte, epoch uint32) error {
+			numHashRequests[string(hash)]++
+			return nil
+		},
+	}
+
+	rrh, _ := NewResolverRequestHandler(
+		&mock.ResolversFinderStub{
+			ChainResolverCalled: func(baseTopic string) (resolver retriever.Resolver, e error) {
+				return hdrResolver, nil
+			},
+		},
+		timecache.NewTimeCache(time.Minute),
+		&mock.WhiteListHandlerStub{},
+		100,
+		time.Second,
+	)
+
+	droppedHash := []byte("dropped header hash")
+	otherHash := []byte("other header hash")
+	rrh.RequestHeaderByNonce(6)
+	rrh.RequestHeaderByNonce(7)
+	rrh.RequestHeader(droppedHash)
+	rrh.RequestHeader(otherHash)
+
+	rrh.RemoveHeaderRequests(6, droppedHash)
+
+	rrh.RequestHeaderByNonce(6)
+	rrh.RequestHeaderByNonce(7)
+	rrh.RequestHeader(droppedHash)
+	rrh.RequestHeader(otherHash)
+
+	assert.Equal(t, 2, numNonceRequests[6])
+	assert.Equal(t, 1, numNonceRequests[7], "other nonces stay in the time cache")
+	assert.Equal(t, 2, numHashRequests[string(droppedHash)])
+	assert.Equal(t, 1, numHashRequests[string(otherHash)], "other hashes stay in the time cache")
 }
 
 func TestRequestTrieNodes_ShouldWork(t *testing.T) {

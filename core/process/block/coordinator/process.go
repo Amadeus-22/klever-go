@@ -260,11 +260,11 @@ func (tc *transactionCoordinator) ProcessBlockTransactions(
 	}
 
 	if block.GetTxFees() != tc.feeHandler.GetAccumulatedTxFees() {
-		return nil, process.ErrInvalidTXFees
+		return nil, process.WrapBlockExecutionNotMatchingHeader(process.ErrInvalidTXFees)
 	}
 
 	if block.GetKAppFees() != tc.feeHandler.GetAccumulatedKAppFees() {
-		return nil, process.ErrInvalidKAppsFees
+		return nil, process.WrapBlockExecutionNotMatchingHeader(process.ErrInvalidKAppsFees)
 	}
 
 	if tc.forkController.EnableSmartContracts() {

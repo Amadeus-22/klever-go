@@ -106,6 +106,14 @@ func (tc *TimeCache) ResetAll() {
 	tc.data = make(map[string]*span)
 }
 
+// Remove removes the key from the time cache
+func (tc *TimeCache) Remove(key string) {
+	tc.mut.Lock()
+	defer tc.mut.Unlock()
+
+	delete(tc.data, key)
+}
+
 // Has returns if the key is still found in the time cache
 func (tc *TimeCache) Has(key string) bool {
 	tc.mut.RLock()

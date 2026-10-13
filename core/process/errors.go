@@ -114,6 +114,15 @@ var ErrNilBlockPool = errors.New("nil block pool")
 // ErrNilTxHash signals that an operation has been attempted with a nil hash
 var ErrNilTxHash = errors.New("nil transaction hash")
 
+// ErrInvalidTxHashLength signals that a transaction hash does not have the hasher size
+var ErrInvalidTxHashLength = errors.New("invalid transaction hash length")
+
+// ErrBlockBodyNotMatchingHeader signals that a block's transaction list does not match its signed header
+var ErrBlockBodyNotMatchingHeader = errors.New("block body does not match header")
+
+// ErrBlockExecutionNotMatchingHeader signals that executing a block did not reproduce the fees or state roots in its signed header
+var ErrBlockExecutionNotMatchingHeader = errors.New("block execution does not match header")
+
 // ErrInvalidRcvAddr signals that an invalid receiver address was provided
 var ErrInvalidRcvAddr = errors.New("invalid receiver address")
 

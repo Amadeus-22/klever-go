@@ -27,6 +27,10 @@ func (hs *HasherStub) EmptyHash() []byte {
 
 // Size returns the required size in bytes
 func (hs *HasherStub) Size() int {
+	if hs.SizeCalled == nil {
+		return sha256.Size
+	}
+
 	return hs.SizeCalled()
 }
 

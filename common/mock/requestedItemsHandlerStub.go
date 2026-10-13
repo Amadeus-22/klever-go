@@ -6,6 +6,14 @@ type RequestedItemsHandlerStub struct {
 	HasCalled      func(key string) bool
 	SweepCalled    func()
 	ResetAllCalled func()
+	RemoveCalled   func(key string)
+}
+
+// Remove -
+func (rihs *RequestedItemsHandlerStub) Remove(key string) {
+	if rihs.RemoveCalled != nil {
+		rihs.RemoveCalled(key)
+	}
 }
 
 // Add -

@@ -254,6 +254,7 @@ type RequestHandler interface {
 	SetNumPeersToQuery(key string, intra int, cross int) error
 	GetNumPeersToQuery(key string) (int, int, error)
 	ResetRequests()
+	RemoveHeaderRequests(nonce uint64, hash []byte)
 	IsInterfaceNil() bool
 }
 

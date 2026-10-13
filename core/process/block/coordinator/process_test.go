@@ -926,7 +926,8 @@ func TestShardProcessor_ProcessBlockInvalidFees_ShouldFail(t *testing.T) {
 		}
 
 		processResult, err := tc.ProcessBlockTransactions(&body, haveTime, false)
-		assert.Equal(t, process.ErrInvalidTXFees, err)
+		assert.ErrorIs(t, err, process.ErrInvalidTXFees)
+		assert.ErrorIs(t, err, process.ErrBlockExecutionNotMatchingHeader)
 		assert.Nil(t, processResult)
 	})
 
@@ -941,7 +942,8 @@ func TestShardProcessor_ProcessBlockInvalidFees_ShouldFail(t *testing.T) {
 		}
 
 		processResult, err := tc.ProcessBlockTransactions(&body, haveTime, false)
-		assert.Equal(t, process.ErrInvalidKAppsFees, err)
+		assert.ErrorIs(t, err, process.ErrInvalidKAppsFees)
+		assert.ErrorIs(t, err, process.ErrBlockExecutionNotMatchingHeader)
 		assert.Nil(t, processResult)
 	})
 

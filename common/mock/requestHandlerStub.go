@@ -19,6 +19,15 @@ type RequestHandlerStub struct {
 	RequestStartOfEpochBlockCalled  func(epoch uint32)
 	SetNumPeersToQueryCalled        func(key string, intra int, cross int) error
 	GetNumPeersToQueryCalled        func(key string) (int, int, error)
+	ResetRequestsCalled             func()
+	RemoveHeaderRequestsCalled      func(nonce uint64, hash []byte)
+}
+
+// RemoveHeaderRequests -
+func (rhs *RequestHandlerStub) RemoveHeaderRequests(nonce uint64, hash []byte) {
+	if rhs.RemoveHeaderRequestsCalled != nil {
+		rhs.RemoveHeaderRequestsCalled(nonce, hash)
+	}
 }
 
 // RequestInterval -
@@ -105,6 +114,9 @@ func (rhs *RequestHandlerStub) GetNumPeersToQuery(key string) (int, int, error) 
 
 // ResetRequests -
 func (rhs *RequestHandlerStub) ResetRequests() {
+	if rhs.ResetRequestsCalled != nil {
+		rhs.ResetRequestsCalled()
+	}
 }
 
 // IsInterfaceNil returns true if there is no value under the interface

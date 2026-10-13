@@ -316,7 +316,7 @@ func (mp *metaProcessor) handleEpochStartBlock(header *block.Block) error {
 func (mp *metaProcessor) verifyBlockTrieRoots(header *block.Block) error {
 	if !mp.verifyStateRootAccount(header.GetTrieRoot()) {
 		log.Debug("processBlock.verifyStateRootAccount", "blockTrieRoot", logger.DisplayByteSlice(header.GetTrieRoot()))
-		err := process.ErrRootStateDoesNotMatch
+		err := process.WrapBlockExecutionNotMatchingHeader(process.ErrRootStateDoesNotMatch)
 		_ = bugsnag.Notify(fmt.Errorf("process account state: %w", err), bugsnag.MetaData{"data": {"header": header}})
 		return err
 	}
@@ -461,11 +461,11 @@ func (mp *metaProcessor) verifyKAppRootHash(header *block.Block) error {
 
 	if !mp.verifyStateRootKApp(header.GetKAppsTrieRoot()) {
 		log.Debug("kApp root hash mismatch", "received", header.GetKAppsTrieRoot())
-		return fmt.Errorf("%s, received: %s, meta header nonce: %d",
+		return process.WrapBlockExecutionNotMatchingHeader(fmt.Errorf("%w, received: %s, meta header nonce: %d",
 			process.ErrRootStateDoesNotMatch,
 			logger.DisplayByteSlice(header.GetKAppsTrieRoot()),
 			header.Header.Nonce,
-		)
+		))
 	}
 
 	return nil
@@ -487,7 +487,7 @@ func (mp *metaProcessor) verifyValidatorStatisticsRootHash(header *block.Block) 
 			"computed", validatorStatsRH,
 			"received", header.GetValidatorsTrieRoot(),
 		)
-		return fmt.Errorf("%s, metachain, computed: %s, received: %s, meta header nonce: %d",
+		return fmt.Errorf("%w, metachain, computed: %s, received: %s, meta header nonce: %d",
 			process.ErrValidatorStatsRootHashDoesNotMatch,
 			logger.DisplayByteSlice(validatorStatsRH),
 			logger.DisplayByteSlice(header.GetValidatorsTrieRoot()),
