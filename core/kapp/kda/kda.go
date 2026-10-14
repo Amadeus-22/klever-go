@@ -524,9 +524,15 @@ func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (trans
 
 		maxEpochsUnclaimed := tools.SafeI64ToU32(k.KAppController.GetProposalController().GetParameterInt(kapps.EnumParameter_MaxEpochsUnclaimed))
 		//if a fpr is not expired, add it to the valid list
-		if fpr.GetEpoch()+
+		notExpired := fpr.GetEpoch()+
 			maxEpochsUnclaimed >=
-			ctx.Block().GetEpoch() {
+			ctx.Block().GetEpoch()
+		if k.forkController.FixAuditChangesV6() {
+			// summed in uint64: a parameter saturated at MaxUint32 wrapped the uint32 sum above,
+			// which made every FPR past epoch 0 look expired
+			notExpired = uint64(fpr.GetEpoch())+uint64(maxEpochsUnclaimed) >= uint64(ctx.Block().GetEpoch())
+		}
+		if notExpired {
 			validFPRs = append(validFPRs, fpr)
 			continue
 		}

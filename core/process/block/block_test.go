@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3236,4 +3238,471 @@ func TestMetaProcessor_ProcessBlockRestoresEpochStateWhenTimeIsOut(t *testing.T)
 	assert.False(t, trigger.IsEpochStart(), "epoch start trigger must leave epoch start state when processing times out")
 	assert.Equal(t, currentEpoch, epochNotifier.CurrentEpoch(), "epoch notifier must be restored when processing times out")
 	assert.Equal(t, currentEpoch, requestHandler.epoch, "request handler epoch must be restored when processing times out")
+}
+
+const (
+	nativeFPRInitialKLVSupply = int64(100_000_000_000_000)
+	// rewards accumulated in the epoch that the first roll closes, so the entry it
+	// appends is told apart from the empty ones the later rolls append
+	nativeFPRPendingKLV = int64(77)
+	nativeFPRPendingKFI = int64(33)
+)
+
+// seededKLVFPR and seededKFIFPR are four epochs of native rewards, each partly claimed by a
+// different amount so that every trimmed entry leaves its own unclaimed remainder:
+// KLV 900, 450, 1000, 750 and KFI 630, 500, 1099, 400.
+func seededKLVFPR() []*kapps.FPRData {
+	return []*kapps.FPRData{
+		{TotalAmount: 1000, TotalStaked: 50000, Epoch: 1, TotalClaimed: 100},
+		{TotalAmount: 500, TotalStaked: 52000, Epoch: 2, TotalClaimed: 50},
+		{TotalAmount: 1300, TotalStaked: 43000, Epoch: 3, TotalClaimed: 300},
+		{TotalAmount: 1000, TotalStaked: 30000, Epoch: 4, TotalClaimed: 250},
+	}
+}
+
+func seededKFIFPR() []*kapps.FPRData {
+	return []*kapps.FPRData{
+		{TotalAmount: 700, TotalStaked: 9000, Epoch: 1, TotalClaimed: 70},
+		{TotalAmount: 900, TotalStaked: 9100, Epoch: 2, TotalClaimed: 400},
+		{TotalAmount: 1100, TotalStaked: 9200, Epoch: 3, TotalClaimed: 1},
+		{TotalAmount: 600, TotalStaked: 9300, Epoch: 4, TotalClaimed: 200},
+	}
+}
+
+// nativeFPRHarness drives the production epochStartNativeStakingKapps over a trie backed KApp
+// accounts DB and the real proposal controller.
+type nativeFPRHarness struct {
+	t              *testing.T
+	mp             *blproc.MetaProcessorForTests
+	controller     kapps.ActiveProposalController
+	forkController core.ForkController
+	epochNotifier  process.EpochNotifier
+}
+
+func newNativeFPRHarness(
+	t *testing.T,
+	fixAuditChangesV6 bool,
+	maxEpochsUnclaimed int64,
+	klvFPR, kfiFPR []*kapps.FPRData,
+) *nativeFPRHarness {
+	t.Helper()
+
+	forkController := mock.NewForkControllerStub().SetFork("FixAuditChangesV6", fixAuditChangesV6)
+
+	return newNativeFPRHarnessWithFork(t, forkController, nil, maxEpochsUnclaimed, klvFPR, kfiFPR)
+}
+
+// newNativeFPRHarnessActivatingAt answers the gate from the production fork controller, fed by
+// the epoch notifier the way ProcessBlock and CreateBlock feed it, with FixAuditChangesV6
+// enabled at the given epoch.
+func newNativeFPRHarnessActivatingAt(
+	t *testing.T,
+	fixAuditChangesV6Epoch uint32,
+	maxEpochsUnclaimed int64,
+	klvFPR, kfiFPR []*kapps.FPRData,
+) *nativeFPRHarness {
+	t.Helper()
+
+	epochNotifier := notifier.NewGenericEpochNotifier()
+	forkController, err := fork.NewForkController(
+		config.EnableEpochs{FixAuditChangesV6: fixAuditChangesV6Epoch},
+		epochNotifier,
+	)
+	require.NoError(t, err)
+
+	return newNativeFPRHarnessWithFork(t, forkController, epochNotifier, maxEpochsUnclaimed, klvFPR, kfiFPR)
+}
+
+func newNativeFPRHarnessWithFork(
+	t *testing.T,
+	forkController core.ForkController,
+	epochNotifier process.EpochNotifier,
+	maxEpochsUnclaimed int64,
+	klvFPR, kfiFPR []*kapps.FPRData,
+) *nativeFPRHarness {
+	t.Helper()
+
+	hasher := &sha256.Sha256{}
+	marshalizer := marshal.NewProtoMarshalizer()
+
+	cache, err := storageUnit.NewCache(storageUnit.CacheConfig{Type: storageUnit.LRUCache, Capacity: 10, Shards: 1})
+	require.NoError(t, err)
+	persister, err := memorydb.NewlruDB(100000)
+	require.NoError(t, err)
+	unit, err := storageUnit.NewStorageUnit(cache, persister)
+	require.NoError(t, err)
+
+	trieStorage, err := trie.NewTrieStorageManagerWithoutPruning(unit)
+	require.NoError(t, err)
+	tr, err := trie.NewTrie(trieStorage, marshalizer, hasher, 5)
+	require.NoError(t, err)
+	adb, err := state.NewAccountsDB(tr, hasher, marshalizer, factory.NewKAppAccountCreator(), core.Normal)
+	require.NoError(t, err)
+
+	kdaAcc, err := adb.LoadAccount(kapps.KDAKAppAddress)
+	require.NoError(t, err)
+	kdaKapp := kdaAcc.(state.KAppAccountHandler)
+
+	stakingAcc, err := adb.LoadAccount(kapps.StakingKAppAddress)
+	require.NoError(t, err)
+	stakingKapp := stakingAcc.(state.KAppAccountHandler)
+
+	save := func(kappAcc state.KAppAccountHandler, key []byte, value interface{}) {
+		raw, errMarshal := marshalizer.Marshal(value)
+		require.NoError(t, errMarshal)
+		require.NoError(t, kappAcc.DataTrieTracker().SaveKeyValue(key, raw))
+	}
+
+	save(stakingKapp, kdautils.KLVKey, &kapps.StakingData{
+		InterestType:     kapps.StakingData_FPRI,
+		TotalStaked:      61000,
+		CurrentFPRAmount: nativeFPRPendingKLV,
+		FPR:              klvFPR,
+	})
+	save(stakingKapp, kdautils.KFIKey, &kapps.StakingData{
+		InterestType:     kapps.StakingData_FPRI,
+		TotalStaked:      9400,
+		CurrentFPRAmount: nativeFPRPendingKFI,
+		FPR:              kfiFPR,
+	})
+	save(kdaKapp, kdautils.KLVKey, &kapps.KDAData{
+		ID:                kdautils.KLVIdentifier,
+		AssetType:         kapps.KDAData_Fungible,
+		Name:              kdautils.KLVIdentifier,
+		Ticker:            kdautils.KLVIdentifier,
+		Precision:         6,
+		CirculatingSupply: nativeFPRInitialKLVSupply,
+		MaxSupply:         90_000_000_000_000_000,
+	})
+	require.NoError(t, adb.SaveAccounts(kdaKapp, stakingKapp))
+
+	mp, controller, err := blproc.NewMetaProcessorForEpochStartTests(adb, hasher, marshalizer, forkController, epochNotifier)
+	require.NoError(t, err)
+
+	h := &nativeFPRHarness{
+		t:              t,
+		mp:             mp,
+		controller:     controller,
+		forkController: forkController,
+		epochNotifier:  epochNotifier,
+	}
+	h.setMaxEpochsUnclaimed(maxEpochsUnclaimed)
+
+	return h
+}
+
+// setMaxEpochsUnclaimed writes the parameter the way a settled proposal does. It goes around
+// ParseParamAndValidate on purpose: what the trim does with a value is under test here, not
+// which values governance may still vote in.
+func (h *nativeFPRHarness) setMaxEpochsUnclaimed(value int64) {
+	h.t.Helper()
+
+	h.controller.UpdateParameters(map[int32]*kapps.Parameter{
+		int32(kapps.EnumParameter_MaxEpochsUnclaimed): {
+			Type:  kapps.EnumType_Int64,
+			Value: []byte(strconv.FormatInt(value, 10)),
+		},
+	})
+	require.Equal(h.t, value, h.controller.GetParameterInt(kapps.EnumParameter_MaxEpochsUnclaimed))
+}
+
+// roll runs one epoch start and returns what the header reports as burned. The epoch is
+// confirmed first, as block processing does before it reaches the epoch start.
+func (h *nativeFPRHarness) roll(epoch uint32) int64 {
+	h.t.Helper()
+
+	if h.epochNotifier != nil {
+		h.epochNotifier.CheckEpoch(epoch)
+	}
+
+	header := &block.Block{Header: &block.BlockHeader{Nonce: uint64(epoch), Epoch: epoch, IsEpochStart: true}}
+	require.NoError(h.t, h.mp.EpochStartNativeStakingKapps(header))
+
+	return header.GetBurnedUnclaimed()
+}
+
+func (h *nativeFPRHarness) staking() (*kapps.StakingData, *kapps.StakingData) {
+	h.t.Helper()
+
+	klv, kfi, err := h.mp.GetNativeStakingKApps()
+	require.NoError(h.t, err)
+
+	return klv, kfi
+}
+
+// epochs returns the epochs the KLV and the KFI lists currently hold, oldest first.
+func (h *nativeFPRHarness) epochs() ([]uint32, []uint32) {
+	h.t.Helper()
+
+	klv, kfi := h.staking()
+
+	return fprEpochs(klv.FPR), fprEpochs(kfi.FPR)
+}
+
+func fprEpochs(fprs []*kapps.FPRData) []uint32 {
+	epochs := make([]uint32, 0, len(fprs))
+	for _, fpr := range fprs {
+		epochs = append(epochs, fpr.GetEpoch())
+	}
+
+	return epochs
+}
+
+// klvBurned returns what left the KLV circulating supply since the harness was built.
+func (h *nativeFPRHarness) klvBurned() int64 {
+	h.t.Helper()
+
+	acnt, err := h.mp.GetKAppAdapter().LoadAccount(kapps.KDAKAppAddress)
+	require.NoError(h.t, err)
+
+	raw, err := acnt.(state.KAppAccountHandler).DataTrieTracker().RetrieveValue(kdautils.KLVKey)
+	require.NoError(h.t, err)
+
+	klv := &kapps.KDAData{}
+	require.NoError(h.t, h.mp.GetMarshalizer().Unmarshal(klv, raw))
+	require.Equal(h.t, nativeFPRInitialKLVSupply-klv.CirculatingSupply, klv.BurnedValue,
+		"the supply and the burned counter must move together")
+
+	return klv.BurnedValue
+}
+
+// A proposal that lowers MaxEpochsUnclaimed below the current length used to leave the equality
+// trim unreachable: the lists then grew by one entry per epoch and nothing was burned again.
+func TestMetaProcessor_NativeFPRTrim_LoweredParameterTrimsTheExcess(t *testing.T) {
+	t.Parallel()
+
+	h := newNativeFPRHarness(t, true, 4, seededKLVFPR(), seededKFIFPR())
+	h.setMaxEpochsUnclaimed(2)
+
+	// epochs 1, 2 and 3 no longer fit: KLV 900+450+1000 and KFI 630+500+1099
+	burned := h.roll(5)
+	assert.Equal(t, int64(2350+2229), burned)
+	assert.Equal(t, int64(2350+2229), h.klvBurned())
+
+	klvEpochs, kfiEpochs := h.epochs()
+	assert.Equal(t, []uint32{4, 5}, klvEpochs)
+	assert.Equal(t, []uint32{4, 5}, kfiEpochs)
+
+	// the entry appended for the closing epoch carries what that epoch accumulated
+	klv, kfi := h.staking()
+	require.Len(t, klv.FPR, 2)
+	require.Len(t, kfi.FPR, 2)
+	assert.Equal(t, nativeFPRPendingKLV, klv.FPR[1].GetTotalAmount())
+	assert.Equal(t, int64(61000), klv.FPR[1].GetTotalStaked())
+	assert.Zero(t, klv.FPR[1].GetTotalClaimed())
+	assert.Equal(t, nativeFPRPendingKFI, kfi.FPR[1].GetTotalAmount())
+	assert.Equal(t, int64(9400), kfi.FPR[1].GetTotalStaked())
+	assert.Zero(t, kfi.FPR[1].GetTotalClaimed())
+	// the survivor of the trim is untouched
+	assert.Equal(t, int64(1000), klv.FPR[0].GetTotalAmount())
+	assert.Equal(t, int64(250), klv.FPR[0].GetTotalClaimed())
+	assert.Equal(t, int64(600), kfi.FPR[0].GetTotalAmount())
+	assert.Equal(t, int64(200), kfi.FPR[0].GetTotalClaimed())
+	assert.Zero(t, klv.CurrentFPRAmount)
+	assert.Zero(t, kfi.CurrentFPRAmount)
+
+	// from here on it is one entry out, one entry in: epoch 4 (750+400), then epoch 5 (77+33),
+	// then the empty epoch 6
+	assert.Equal(t, int64(750+400), h.roll(6))
+	assert.Equal(t, nativeFPRPendingKLV+nativeFPRPendingKFI, h.roll(7))
+	assert.Zero(t, h.roll(8))
+
+	klvEpochs, kfiEpochs = h.epochs()
+	assert.Equal(t, []uint32{7, 8}, klvEpochs)
+	assert.Equal(t, []uint32{7, 8}, kfiEpochs)
+	assert.Equal(t, int64(2350+2229+750+400+77+33), h.klvBurned())
+}
+
+// The lists are trimmed independently, so one that is already within the new limit keeps its
+// entries while the other sheds its excess.
+func TestMetaProcessor_NativeFPRTrim_KLVAndKFIAreTrimmedIndependently(t *testing.T) {
+	t.Parallel()
+
+	h := newNativeFPRHarness(t, true, 2, seededKLVFPR(), seededKFIFPR()[3:])
+
+	// KLV sheds epochs 1, 2 and 3; KFI only holds epoch 4 and keeps it
+	assert.Equal(t, int64(2350), h.roll(5))
+
+	klvEpochs, kfiEpochs := h.epochs()
+	assert.Equal(t, []uint32{4, 5}, klvEpochs)
+	assert.Equal(t, []uint32{4, 5}, kfiEpochs)
+}
+
+// Where the parameter was never lowered the loop runs at most once per epoch, so the fork
+// changes neither the lists nor the burn.
+func TestMetaProcessor_NativeFPRTrim_UnchangedOrRaisedParameterMatchesBothSidesOfTheFork(t *testing.T) {
+	t.Parallel()
+
+	type roll struct {
+		burned int64
+		epochs []uint32
+	}
+
+	tests := []struct {
+		name               string
+		maxEpochsUnclaimed int64
+		rolls              []roll
+	}{
+		{
+			name:               "unchanged parameter trims one entry per epoch",
+			maxEpochsUnclaimed: 4,
+			rolls: []roll{
+				{burned: 900 + 630, epochs: []uint32{2, 3, 4, 5}},
+				{burned: 450 + 500, epochs: []uint32{3, 4, 5, 6}},
+				{burned: 1000 + 1099, epochs: []uint32{4, 5, 6, 7}},
+				{burned: 750 + 400, epochs: []uint32{5, 6, 7, 8}},
+				{burned: 77 + 33, epochs: []uint32{6, 7, 8, 9}},
+			},
+		},
+		{
+			name:               "raised parameter grows to the new limit and holds there",
+			maxEpochsUnclaimed: 6,
+			rolls: []roll{
+				{burned: 0, epochs: []uint32{1, 2, 3, 4, 5}},
+				{burned: 0, epochs: []uint32{1, 2, 3, 4, 5, 6}},
+				{burned: 900 + 630, epochs: []uint32{2, 3, 4, 5, 6, 7}},
+				{burned: 450 + 500, epochs: []uint32{3, 4, 5, 6, 7, 8}},
+			},
+		},
+		{
+			name:               "a parameter beyond any list length never trims",
+			maxEpochsUnclaimed: math.MaxInt64,
+			rolls: []roll{
+				{burned: 0, epochs: []uint32{1, 2, 3, 4, 5}},
+				{burned: 0, epochs: []uint32{1, 2, 3, 4, 5, 6}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		for _, fixAuditChangesV6 := range []bool{false, true} {
+			t.Run(tt.name+"/FixAuditChangesV6="+strconv.FormatBool(fixAuditChangesV6), func(t *testing.T) {
+				t.Parallel()
+
+				h := newNativeFPRHarness(t, fixAuditChangesV6, tt.maxEpochsUnclaimed, seededKLVFPR(), seededKFIFPR())
+
+				total := int64(0)
+				for i, want := range tt.rolls {
+					burned := h.roll(uint32(5 + i))
+					total += want.burned
+
+					klvEpochs, kfiEpochs := h.epochs()
+					assert.Equal(t, want.burned, burned, "roll %d", i)
+					assert.Equal(t, want.epochs, klvEpochs, "roll %d", i)
+					assert.Equal(t, want.epochs, kfiEpochs, "roll %d", i)
+				}
+				assert.Equal(t, total, h.klvBurned())
+			})
+		}
+	}
+}
+
+// A window of no epochs at all cannot hold any closed entry: every one of them is burned and each
+// list is left with just the entry of the epoch being closed, the same as a window of one.
+func TestMetaProcessor_NativeFPRTrim_ParameterOfOneOrLessKeepsOnlyTheNewEntry(t *testing.T) {
+	t.Parallel()
+
+	for _, maxEpochsUnclaimed := range []int64{1, 0, -1, math.MinInt64} {
+		t.Run(strconv.FormatInt(maxEpochsUnclaimed, 10), func(t *testing.T) {
+			t.Parallel()
+
+			h := newNativeFPRHarness(t, true, maxEpochsUnclaimed, seededKLVFPR(), seededKFIFPR())
+
+			// all four seeded epochs: KLV 900+450+1000+750 and KFI 630+500+1099+400
+			require.NotPanics(t, func() {
+				assert.Equal(t, int64(3100+2629), h.roll(5))
+			})
+
+			klvEpochs, kfiEpochs := h.epochs()
+			assert.Equal(t, []uint32{5}, klvEpochs)
+			assert.Equal(t, []uint32{5}, kfiEpochs)
+
+			require.NotPanics(t, func() {
+				assert.Equal(t, nativeFPRPendingKLV+nativeFPRPendingKFI, h.roll(6))
+			})
+
+			klvEpochs, kfiEpochs = h.epochs()
+			assert.Equal(t, []uint32{6}, klvEpochs)
+			assert.Equal(t, []uint32{6}, kfiEpochs)
+			assert.Equal(t, int64(3100+2629+77+33), h.klvBurned())
+		})
+	}
+}
+
+// With nothing to trim the loop must not reach for the first entry: the equality check did so
+// when both the list length and the parameter were zero.
+func TestMetaProcessor_NativeFPRTrim_ZeroParameterOnEmptyListsDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	h := newNativeFPRHarness(t, true, 0, nil, nil)
+
+	require.NotPanics(t, func() {
+		assert.Zero(t, h.roll(5))
+	})
+
+	klvEpochs, kfiEpochs := h.epochs()
+	assert.Equal(t, []uint32{5}, klvEpochs)
+	assert.Equal(t, []uint32{5}, kfiEpochs)
+	assert.Zero(t, h.klvBurned())
+}
+
+// Before FixAuditChangesV6 the equality trim is kept as it was, so a lowered parameter still
+// leaves the lists growing with nothing burned.
+func TestMetaProcessor_NativeFPRTrim_LoweredParameterBeforeTheForkKeepsGrowing(t *testing.T) {
+	t.Parallel()
+
+	h := newNativeFPRHarness(t, false, 4, seededKLVFPR(), seededKFIFPR())
+	h.setMaxEpochsUnclaimed(2)
+
+	for epoch := uint32(5); epoch < 10; epoch++ {
+		assert.Zero(t, h.roll(epoch), "epoch %d", epoch)
+	}
+
+	klvEpochs, kfiEpochs := h.epochs()
+	assert.Equal(t, []uint32{1, 2, 3, 4, 5, 6, 7, 8, 9}, klvEpochs)
+	assert.Equal(t, []uint32{1, 2, 3, 4, 5, 6, 7, 8, 9}, kfiEpochs)
+	assert.Zero(t, h.klvBurned())
+}
+
+// One chain across the activation epoch, with the gate answered by the production fork controller.
+// The parameter is lowered while the fork is still ahead: up to the last epoch before it the lists
+// keep growing with nothing burned, and the epoch start of the activation epoch itself trims all
+// that piled up and burns it.
+func TestMetaProcessor_NativeFPRTrim_AcrossTheForkActivationEpoch(t *testing.T) {
+	t.Parallel()
+
+	const activationEpoch = uint32(7)
+
+	h := newNativeFPRHarnessActivatingAt(t, activationEpoch, 4, seededKLVFPR(), seededKFIFPR())
+	h.setMaxEpochsUnclaimed(2)
+
+	// pre fork: the equality never matches again
+	for epoch := uint32(5); epoch < activationEpoch; epoch++ {
+		assert.Zero(t, h.roll(epoch), "epoch %d", epoch)
+		require.False(t, h.forkController.FixAuditChangesV6(), "epoch %d", epoch)
+	}
+
+	klvEpochs, kfiEpochs := h.epochs()
+	assert.Equal(t, []uint32{1, 2, 3, 4, 5, 6}, klvEpochs)
+	assert.Equal(t, []uint32{1, 2, 3, 4, 5, 6}, kfiEpochs)
+	assert.Zero(t, h.klvBurned())
+
+	// activation: epochs 1 to 5 no longer fit, KLV 900+450+1000+750+77 and KFI 630+500+1099+400+33
+	burned := h.roll(activationEpoch)
+	require.True(t, h.forkController.FixAuditChangesV6())
+	assert.Equal(t, int64(3177+2662), burned)
+	assert.Equal(t, int64(3177+2662), h.klvBurned())
+
+	klvEpochs, kfiEpochs = h.epochs()
+	assert.Equal(t, []uint32{6, 7}, klvEpochs)
+	assert.Equal(t, []uint32{6, 7}, kfiEpochs)
+
+	// post fork: one entry out, one entry in; epochs 6 and 7 accumulated nothing
+	assert.Zero(t, h.roll(activationEpoch+1))
+	assert.Zero(t, h.roll(activationEpoch+2))
+
+	klvEpochs, kfiEpochs = h.epochs()
+	assert.Equal(t, []uint32{8, 9}, klvEpochs)
+	assert.Equal(t, []uint32{8, 9}, kfiEpochs)
+	assert.Equal(t, int64(3177+2662), h.klvBurned())
 }

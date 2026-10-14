@@ -72,9 +72,14 @@ func loadUserAccount(userDB state.AccountsAdapter, address []byte) state.UserAcc
 }
 
 func createFullArgumentsForKAppsProcessingMemory() (core.ForkController, kapps.ActiveProposalController, state.AccountsCacher) {
+	return createFullArgumentsForKAppsProcessingMemoryWithFork(mock.NewForkControllerStub())
+}
+
+func createFullArgumentsForKAppsProcessingMemoryWithFork(
+	forkController core.ForkController,
+) (core.ForkController, kapps.ActiveProposalController, state.AccountsCacher) {
 	hasher := &sha256.Sha256{}
 	marshalizer := marshal.NewProtoMarshalizer()
-	forkController := mock.NewForkControllerStub()
 
 	trieFactoryManagerAcc, _ := trie.NewTrieStorageManagerWithoutPruning(createMemUnit())
 	trieFactoryManagerKApp, _ := trie.NewTrieStorageManagerWithoutPruning(createMemUnit())
@@ -111,8 +116,13 @@ func createFullArgumentsForKAppsProcessingMemory() (core.ForkController, kapps.A
 
 // default blockchain for tests
 func createMockControllers() (kapp.KAppController, error) {
+	return createMockControllersWithFork(mock.NewForkControllerStub())
+}
+
+// same blockchain, with the forks answered by the given controller
+func createMockControllersWithFork(forkController core.ForkController) (kapp.KAppController, error) {
 	hasher := &sha256.Sha256{}
-	forkController, atcivePC, accCacher := createFullArgumentsForKAppsProcessingMemory()
+	forkController, atcivePC, accCacher := createFullArgumentsForKAppsProcessingMemoryWithFork(forkController)
 	marshalizerMock := &mock.ProtoMarshalizerMock{}
 
 	argsKapp := kappcontroller.ArgsNewKApp{

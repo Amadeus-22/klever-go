@@ -1325,7 +1325,9 @@ func (mp *metaProcessor) epochStartNativeStakingKapps(blk data.HeaderHandler) er
 	maxEpochUnclaimed := mp.proposalController.Get().GetParameterInt(kapps.EnumParameter_MaxEpochsUnclaimed)
 
 	amountKLVToBurn := int64(0)
-	if len(klv.FPR) == int(maxEpochUnclaimed) {
+	if mp.forkController.FixAuditChangesV6() {
+		amountKLVToBurn = trimExpiredFPR(klv, maxEpochUnclaimed)
+	} else if len(klv.FPR) == int(maxEpochUnclaimed) {
 		amountKLVToBurn = klv.FPR[0].TotalAmount - klv.FPR[0].TotalClaimed
 
 		klv.FPR = klv.FPR[1:]
@@ -1339,7 +1341,9 @@ func (mp *metaProcessor) epochStartNativeStakingKapps(blk data.HeaderHandler) er
 	})
 
 	amountKLVToBurnKFI := int64(0)
-	if len(kfi.FPR) == int(maxEpochUnclaimed) {
+	if mp.forkController.FixAuditChangesV6() {
+		amountKLVToBurnKFI = trimExpiredFPR(kfi, maxEpochUnclaimed)
+	} else if len(kfi.FPR) == int(maxEpochUnclaimed) {
 		amountKLVToBurnKFI = kfi.FPR[0].TotalAmount - kfi.FPR[0].TotalClaimed
 
 		kfi.FPR = kfi.FPR[1:]
@@ -1368,6 +1372,23 @@ func (mp *metaProcessor) epochStartNativeStakingKapps(blk data.HeaderHandler) er
 	blk.SetBurnedUnclaimed(burned)
 
 	return mp.setNativeStakingKApps(staking, klv, kfi)
+}
+
+// trimExpiredFPR drops the oldest entries until the one about to be appended fits
+// within maxEpochUnclaimed, and returns their unclaimed remainder, which is burned.
+// It is the FixAuditChangesV6 trim: the equality check it replaces stopped matching
+// for good once a proposal lowered the parameter below the current length, so the
+// list grew by one entry per epoch and nothing was burned again. While the parameter
+// is not lowered the loop runs at most once, exactly like that check.
+func trimExpiredFPR(staking *kapps.StakingData, maxEpochUnclaimed int64) int64 {
+	amountToBurn := int64(0)
+	for len(staking.FPR) > 0 && int64(len(staking.FPR)) >= maxEpochUnclaimed {
+		amountToBurn += staking.FPR[0].TotalAmount - staking.FPR[0].TotalClaimed
+
+		staking.FPR = staking.FPR[1:]
+	}
+
+	return amountToBurn
 }
 
 // processProposalsEndOfEpoch settles the proposals active in the header's epoch
