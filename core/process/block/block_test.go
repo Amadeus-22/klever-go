@@ -2858,8 +2858,10 @@ func TestMetaProcessor_CommitBlockCallsEventsProcessor(t *testing.T) {
 	hdr.PubKeysBitmap = []byte{0x01}
 
 	marshalerMock := &mock.MarshalizerMock{}
+	committed := false
 	accounts := &mock.AccountsStub{
 		CommitCalled: func() ([]byte, error) {
+			committed = true
 			return rootHash, nil
 		},
 		RootHashCalled: func() ([]byte, error) {
@@ -2886,11 +2888,14 @@ func TestMetaProcessor_CommitBlockCallsEventsProcessor(t *testing.T) {
 	store := initStore()
 	store.AddStorer(retriever.BlockUnit, hdrUnit)
 
-	var saveBlockCalled bool
+	// the indexer resolves account documents from live state inside SaveBlock, so it
+	// must run after commitAll and before CommitBlock returns (KLR-68)
+	var saveBlockCalled, committedAtSave bool
 	eventsProc := &mock.EventsProcessorStub{
 		EnabledCalled: func() bool { return true },
 		SaveBlockCalled: func(args *indexer.ArgsSaveBlockData) {
 			saveBlockCalled = true
+			committedAtSave = committed
 		},
 	}
 
@@ -2928,6 +2933,7 @@ func TestMetaProcessor_CommitBlockCallsEventsProcessor(t *testing.T) {
 	err = mp.CommitBlock(hdr)
 	assert.Nil(t, err)
 	assert.True(t, saveBlockCalled)
+	assert.True(t, committedAtSave, "SaveBlock must see the committed state")
 }
 
 type epochAwareRequestHandler struct {

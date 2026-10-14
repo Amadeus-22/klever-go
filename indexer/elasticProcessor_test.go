@@ -1679,6 +1679,22 @@ func decodeAccountsHistoryBulk(t *testing.T, buff *bytes.Buffer) []data.AccountB
 	return records
 }
 
+// captureAccountsHistory returns a DatabaseWriterStub keeping a copy of every
+// accountshistory bulk it receives.
+func captureAccountsHistory() (*imock.DatabaseWriterStub, *[]*bytes.Buffer) {
+	historyBuffers := make([]*bytes.Buffer, 0)
+	dbWriter := &imock.DatabaseWriterStub{
+		DoBulkRequestCalled: func(buff *bytes.Buffer, index string) error {
+			if index == accountsHistoryIndex {
+				historyBuffers = append(historyBuffers, bytes.NewBuffer(buff.Bytes()))
+			}
+			return nil
+		},
+	}
+
+	return dbWriter, &historyBuffers
+}
+
 func TestElasticProcessor_SaveAccountsHistoryRecordsUnfrozenBalance(t *testing.T) {
 	t.Parallel()
 
@@ -1696,15 +1712,7 @@ func TestElasticProcessor_SaveAccountsHistoryRecordsUnfrozenBalance(t *testing.T
 		}, nil
 	}
 
-	historyBuffers := make([]*bytes.Buffer, 0)
-	dbWriter := &imock.DatabaseWriterStub{
-		DoBulkRequestCalled: func(buff *bytes.Buffer, index string) error {
-			if index == accountsHistoryIndex {
-				historyBuffers = append(historyBuffers, bytes.NewBuffer(buff.Bytes()))
-			}
-			return nil
-		},
-	}
+	dbWriter, historyBuffers := captureAccountsHistory()
 
 	arguments := createMockElasticProcessorArgs()
 	elasticDatabase := newTestElasticSearchDatabase(dbWriter, arguments)
@@ -1712,9 +1720,9 @@ func TestElasticProcessor_SaveAccountsHistoryRecordsUnfrozenBalance(t *testing.T
 
 	err := elasticDatabase.SaveAccounts(1234567890, []*data.Account{{UserAccount: userAccount, IsSender: true}})
 	require.NoError(t, err)
-	require.Len(t, historyBuffers, 1)
+	require.Len(t, *historyBuffers, 1)
 
-	records := decodeAccountsHistoryBulk(t, historyBuffers[0])
+	records := decodeAccountsHistoryBulk(t, (*historyBuffers)[0])
 	require.Len(t, records, 1)
 	require.Equal(t, address, records[0].Address)
 	require.Equal(t, int64(1000), records[0].Balance)
@@ -1885,4 +1893,403 @@ func TestElasticProcessor_SaveEpochInfo(t *testing.T) {
 		require.Equal(t, epochIndex, captured.Index)
 		require.Equal(t, "false", captured.Refresh)
 	})
+}
+
+// accountAtBlock drives an AccountsStub that reports one balance for the first
+// LoadAccount call and another for every later call, standing in for block N+1
+// committing while block N's indexing job waits in the queue.
+func accountAtBlock(address string, firstBalance, laterBalance int64) *mock.AccountsStub {
+	calls := int64(0)
+
+	return &mock.AccountsStub{
+		LoadAccountCalled: func(_ []byte) (state.AccountHandler, error) {
+			balance := laterBalance
+			if atomic.AddInt64(&calls, 1) == 1 {
+				balance = firstBalance
+			}
+
+			account := createTestAccountStub()
+			account.AddressBytesCalled = func() []byte { return []byte(address) }
+			account.GetBalanceCalled = func(_ []byte, _ bool) int64 { return balance }
+
+			return account, nil
+		},
+	}
+}
+
+// blockDataForAccounts builds a block with one transaction sent by each address.
+func blockDataForAccounts(t *testing.T, timestamp int64, addresses ...string) (*dataBlock.Block, *indexer.Pool) {
+	t.Helper()
+
+	header := &dataBlock.Block{Header: &dataBlock.BlockHeader{Nonce: 1, Timestamp: timestamp}}
+	pool := &indexer.Pool{Txs: map[string]nodeData.TransactionHandler{}}
+	for i, address := range addresses {
+		txHash := fmt.Sprintf("txhash%d", i)
+		header.TxHashes = append(header.TxHashes, []byte(txHash))
+		pool.Txs[txHash] = &transaction.Transaction{
+			RawData: &transaction.Transaction_Raw{
+				Nonce:  1,
+				Sender: []byte(address),
+				Data:   [][]byte{},
+			},
+		}
+	}
+
+	return header, pool
+}
+
+// TestElasticProcessor_PrepareBlockDataSnapshotsAccountsAtCommit covers CertiK KLR-68.
+// The indexing job is queued by CommitBlock and drained later by a single worker. The
+// worker used to resolve balances from the live state adapter, so a block that committed
+// in the meantime was recorded under the earlier block's timestamp. Resolving on the
+// commit goroutine pins the right state into the payload. A work item is retried forever
+// and re-sent unchanged, so every attempt must emit that same snapshot rather than
+// re-reading state that has drifted further.
+func TestElasticProcessor_PrepareBlockDataSnapshotsAccountsAtCommit(t *testing.T) {
+	address := "klv1d05ju9jaj6u99zph0ant9jh7gksf"
+	const timestamp = int64(1234567890)
+
+	dbWriter, historyBuffers := captureAccountsHistory()
+
+	arguments := createMockElasticProcessorArgs()
+	arguments.AccountsDB = accountAtBlock(address, 100, 70)
+	elasticDatabase := newTestElasticSearchDatabase(dbWriter, arguments)
+	elasticDatabase.kappsController = nil
+
+	header, pool := blockDataForAccounts(t, timestamp, address)
+
+	// on the commit goroutine: live state is still block N's committed state
+	prepared, err := elasticDatabase.PrepareBlockData(header, pool, nil)
+	require.NoError(t, err)
+	require.NotNil(t, prepared)
+	require.Len(t, prepared.Accounts, 1)
+
+	// later, on the worker: live state has moved on to block N+1
+	for attempt := 0; attempt < 3; attempt++ {
+		require.NoError(t, elasticDatabase.SaveTransactions(header, pool, prepared))
+	}
+
+	require.Len(t, *historyBuffers, 3)
+	for attempt, buff := range *historyBuffers {
+		records := decodeAccountsHistoryBulk(t, buff)
+		require.Len(t, records, 1)
+		require.Equal(t, address, records[0].Address)
+		require.Equal(t, int64(100), records[0].Balance, "attempt %d", attempt)
+		require.Equal(t, toMilliseconds(timestamp), records[0].Timestamp)
+	}
+}
+
+// With the accounts index disabled indexAlteredAccounts discards every document - the
+// accountskda ones included - so block commit must pay nothing.
+func TestElasticProcessor_PrepareBlockDataSkipsWhenAccountsIndexDisabled(t *testing.T) {
+	address := "klv1d05ju9jaj6u99zph0ant9jh7gksf"
+
+	loadCalls := int64(0)
+	arguments := createMockElasticProcessorArgs()
+	arguments.EnabledIndexes = map[string]struct{}{blockIndex: {}, txIndex: {}, accountsKDAIndex: {}}
+	arguments.AccountsDB = &mock.AccountsStub{
+		LoadAccountCalled: func(_ []byte) (state.AccountHandler, error) {
+			atomic.AddInt64(&loadCalls, 1)
+			return nil, errors.New("must not be called")
+		},
+	}
+	elasticDatabase := newTestElasticSearchDatabase(&imock.DatabaseWriterStub{}, arguments)
+
+	header, pool := blockDataForAccounts(t, 1234567890, address)
+
+	prepared, err := elasticDatabase.PrepareBlockData(header, pool, nil)
+	require.NoError(t, err)
+	require.Nil(t, prepared)
+	require.Equal(t, int64(0), atomic.LoadInt64(&loadCalls))
+}
+
+// eventsProcessor.prepare returns a typed-nil payload for an empty pool, which reaches
+// PrepareBlockData as a non-nil any. It must be treated as absent and resolved.
+func TestElasticProcessor_PrepareBlockDataResolvesTypedNilPayload(t *testing.T) {
+	address := "klv1d05ju9jaj6u99zph0ant9jh7gksf"
+
+	arguments := createMockElasticProcessorArgs()
+	arguments.AccountsDB = accountAtBlock(address, 100, 70)
+	elasticDatabase := newTestElasticSearchDatabase(&imock.DatabaseWriterStub{}, arguments)
+	elasticDatabase.kappsController = nil
+
+	header, pool := blockDataForAccounts(t, 1234567890, address)
+
+	prepared, err := elasticDatabase.PrepareBlockData(header, pool, (*data.PreparedBlockData)(nil))
+	require.NoError(t, err)
+	require.NotNil(t, prepared)
+	require.Len(t, prepared.Accounts, 1)
+	require.Equal(t, int64(100), prepared.Accounts[address].Balance)
+}
+
+// An account whose state cannot be read at commit is left out and its error returned,
+// without dropping the other accounts of the block. The worker must not retry the read:
+// by then live state may hold a later block, which is KLR-68 again.
+func TestElasticProcessor_PrepareBlockDataSkipsOnlyTheFailingAccount(t *testing.T) {
+	good := "klv1d05ju9jaj6u99zph0ant9jh7gksf"
+	bad := "klv1unreadableaccount"
+	errTrie := errors.New("transient trie error")
+
+	dbWriter, historyBuffers := captureAccountsHistory()
+
+	loadCalls := int64(0)
+	arguments := createMockElasticProcessorArgs()
+	arguments.AccountsDB = &mock.AccountsStub{
+		LoadAccountCalled: func(addr []byte) (state.AccountHandler, error) {
+			atomic.AddInt64(&loadCalls, 1)
+			account := createTestAccountStub()
+			account.AddressBytesCalled = func() []byte { return addr }
+			if string(addr) == bad {
+				account.GetUserKDACalled = func(_ []byte, _ []byte, _ bool) (*kapps.UserKDA, error) {
+					return nil, errTrie
+				}
+			}
+			return account, nil
+		},
+	}
+	elasticDatabase := newTestElasticSearchDatabase(dbWriter, arguments)
+	elasticDatabase.kappsController = nil
+
+	header, pool := blockDataForAccounts(t, 1234567890, good, bad)
+
+	prepared, err := elasticDatabase.PrepareBlockData(header, pool, nil)
+	require.ErrorIs(t, err, errTrie)
+	require.NotNil(t, prepared)
+	require.Len(t, prepared.Accounts, 1)
+	require.Contains(t, prepared.Accounts, good)
+
+	require.NoError(t, elasticDatabase.SaveTransactions(header, pool, prepared))
+	require.Len(t, *historyBuffers, 1)
+	records := decodeAccountsHistoryBulk(t, (*historyBuffers)[0])
+	require.Len(t, records, 1)
+	require.Equal(t, good, records[0].Address)
+	require.Equal(t, int64(2), atomic.LoadInt64(&loadCalls), "the worker must not re-read live state")
+}
+
+// With websocket subscribers on, eventsProcessor has already built the documents of the
+// accounts it dispatched: they are reused rather than built a second time on the commit
+// goroutine, and the websocket's map is left untouched.
+func TestElasticProcessor_resolveAlteredAccountsReusesBuiltDocuments(t *testing.T) {
+	dispatched := "klv1d05ju9jaj6u99zph0ant9jh7gksf"
+	notDispatched := "klv1someaddress"
+
+	builds := int64(0)
+	arguments := createMockElasticProcessorArgs()
+	arguments.AccountsDB = &mock.AccountsStub{
+		LoadAccountCalled: func(addr []byte) (state.AccountHandler, error) {
+			account := createTestAccountStub()
+			account.AddressBytesCalled = func() []byte { return addr }
+			account.GetUserKDACalled = func(_ []byte, _ []byte, _ bool) (*kapps.UserKDA, error) {
+				atomic.AddInt64(&builds, 1)
+				return &kapps.UserKDA{}, nil
+			}
+			return account, nil
+		},
+	}
+	elasticDatabase := newTestElasticSearchDatabase(&imock.DatabaseWriterStub{}, arguments)
+	elasticDatabase.kappsController = nil
+
+	built := map[string]*data.AccountInfo{dispatched: {Address: dispatched, Balance: 999}}
+	accountsInfo, _, err := elasticDatabase.resolveAlteredAccounts(
+		1234567890,
+		map[string][]*data.AlteredAccount{dispatched: {{IsSender: true}}, notDispatched: {{IsSender: true}}},
+		built,
+	)
+	require.NoError(t, err)
+	require.Len(t, accountsInfo, 2)
+	require.Same(t, built[dispatched], accountsInfo[dispatched])
+	require.Equal(t, int64(1), atomic.LoadInt64(&builds), "only the account not dispatched is built")
+	require.Len(t, built, 1)
+}
+
+// getKDAInfo reads the KDA and staking KApp accounts for every altered entry, and those
+// are the same two addresses for a whole block. Now that resolution happens on the
+// commit goroutine, loading them once per block rather than once per entry is what keeps
+// the cost off the critical path.
+func TestElasticProcessor_resolveAlteredAccountsLoadsKAppAccountsOncePerBlock(t *testing.T) {
+	address := "klv1d05ju9jaj6u99zph0ant9jh7gksf"
+
+	mustMarshal := func(obj interface{}) []byte {
+		raw, err := (&mock.MarshalizerMock{}).Marshal(obj)
+		require.NoError(t, err)
+		return raw
+	}
+
+	assetIDs := []string{"AAA-1111", "BBB-2222", "CCC-3333"}
+	kdaRecords := map[string][]byte{}
+	for _, assetID := range assetIDs {
+		key := string(kdautils.ToKDAKey([]byte(assetID), nil))
+		kdaRecords[key] = mustMarshal(&kapps.KDAData{Name: []byte(assetID), Precision: 6})
+	}
+
+	newApp := func(records map[string][]byte) state.AccountHandler {
+		return &mock.KAppAccountHandlerStub{
+			DataTrieTrackerCalled: func() state.DataTrieTracker {
+				return &mock.DataTrieTrackerStub{RetrieveValueCalled: func(key []byte) ([]byte, error) {
+					return records[string(key)], nil
+				}}
+			},
+		}
+	}
+	apps := map[string]state.AccountHandler{
+		string(kapps.KDAKAppAddress):     newApp(kdaRecords),
+		string(kapps.StakingKAppAddress): newApp(map[string][]byte{}),
+	}
+
+	kappLoads := int64(0)
+	arguments := createMockElasticProcessorArgs()
+	arguments.EnabledIndexes[accountsKDAIndex] = struct{}{}
+	arguments.KappsDB = &mock.AccountsStub{LoadAccountCalled: func(addr []byte) (state.AccountHandler, error) {
+		atomic.AddInt64(&kappLoads, 1)
+		app, ok := apps[string(addr)]
+		require.True(t, ok, "unexpected KApp address")
+		return app, nil
+	}}
+	arguments.AccountsDB = &mock.AccountsStub{
+		LoadAccountCalled: func(_ []byte) (state.AccountHandler, error) {
+			account := createTestAccountStub()
+			account.AddressBytesCalled = func() []byte { return []byte(address) }
+			account.GetUserKDACalled = func(_ []byte, _ []byte, _ bool) (*kapps.UserKDA, error) {
+				return &kapps.UserKDA{Balance: 42}, nil
+			}
+			return account, nil
+		},
+	}
+
+	elasticDatabase := newTestElasticSearchDatabase(&imock.DatabaseWriterStub{}, arguments)
+	elasticDatabase.kappsController = nil
+	elasticDatabase.marshalizer = &mock.MarshalizerMock{}
+
+	altered := make([]*data.AlteredAccount, 0, len(assetIDs))
+	for _, assetID := range assetIDs {
+		altered = append(altered, &data.AlteredAccount{
+			IsKDAOperation:  true,
+			TokenIdentifier: assetID,
+		})
+	}
+
+	accountsInfo, accountsKDA, err := elasticDatabase.resolveAlteredAccounts(
+		1234567890,
+		map[string][]*data.AlteredAccount{address: altered},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, accountsInfo, 1)
+	require.Len(t, accountsKDA, len(assetIDs))
+
+	// the KDA and staking accounts, once each - not once per altered entry
+	require.Equal(t, int64(2), atomic.LoadInt64(&kappLoads))
+}
+
+// TestElasticProcessor_resolveAlteredAccountsSkipPaths pins the routing of the paths that
+// are logged and skipped: a failed load must not drop the whole block, and an account
+// whose KApp state cannot be read is still indexed - only its KDA entries are skipped.
+func TestElasticProcessor_resolveAlteredAccountsSkipPaths(t *testing.T) {
+	errLoad := errors.New("cannot load account")
+
+	tests := []struct {
+		name          string
+		address       string
+		accountsDBErr error
+		numAccounts   int
+	}{
+		{
+			name:        "address that cannot be decoded is skipped",
+			address:     "not-an-address",
+			numAccounts: 0,
+		},
+		{
+			name:          "user account that cannot be loaded is skipped",
+			address:       "klv1someaddress",
+			accountsDBErr: errLoad,
+			numAccounts:   0,
+		},
+		{
+			name:        "kapp account that cannot be loaded is still indexed, without its KDA",
+			address:     hex.EncodeToString(kapps.KDAKAppAddress),
+			numAccounts: 1,
+		},
+		{
+			name:        "KDA entry is skipped when the kapp lookups cannot be loaded",
+			address:     "klv1someaddress",
+			numAccounts: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			arguments := createMockElasticProcessorArgs()
+			arguments.EnabledIndexes[accountsKDAIndex] = struct{}{}
+			arguments.AccountsDB = &mock.AccountsStub{
+				LoadAccountCalled: func(addr []byte) (state.AccountHandler, error) {
+					if tt.accountsDBErr != nil {
+						return nil, tt.accountsDBErr
+					}
+
+					account := createTestAccountStub()
+					account.AddressBytesCalled = func() []byte { return addr }
+					return account, nil
+				},
+			}
+			// both the KApp account of a KApp address and the KDA lookups come from here
+			arguments.KappsDB = &mock.AccountsStub{
+				LoadAccountCalled: func(_ []byte) (state.AccountHandler, error) {
+					return nil, errLoad
+				},
+			}
+
+			elasticDatabase := newTestElasticSearchDatabase(&imock.DatabaseWriterStub{}, arguments)
+			elasticDatabase.kappsController = nil
+			elasticDatabase.marshalizer = &mock.MarshalizerMock{}
+
+			accountsInfo, accountsKDA, err := elasticDatabase.resolveAlteredAccounts(
+				1234567890,
+				map[string][]*data.AlteredAccount{
+					tt.address: {{IsKDAOperation: true, TokenIdentifier: "AAA-1111"}},
+				},
+				nil,
+			)
+			require.NoError(t, err)
+			require.Len(t, accountsInfo, tt.numAccounts)
+			require.Empty(t, accountsKDA)
+		})
+	}
+}
+
+// A failed KApp load is memoised for the block too, so later KDA entries neither retry
+// it nor log it again.
+func TestElasticProcessor_resolveAlteredAccountsDoesNotRetryFailedKAppLoad(t *testing.T) {
+	kappLoads := int64(0)
+	arguments := createMockElasticProcessorArgs()
+	arguments.EnabledIndexes[accountsKDAIndex] = struct{}{}
+	arguments.AccountsDB = &mock.AccountsStub{
+		LoadAccountCalled: func(addr []byte) (state.AccountHandler, error) {
+			account := createTestAccountStub()
+			account.AddressBytesCalled = func() []byte { return addr }
+			return account, nil
+		},
+	}
+	arguments.KappsDB = &mock.AccountsStub{
+		LoadAccountCalled: func(_ []byte) (state.AccountHandler, error) {
+			atomic.AddInt64(&kappLoads, 1)
+			return nil, errors.New("cannot load account")
+		},
+	}
+
+	elasticDatabase := newTestElasticSearchDatabase(&imock.DatabaseWriterStub{}, arguments)
+	elasticDatabase.kappsController = nil
+
+	kdaEntries := []*data.AlteredAccount{
+		{IsKDAOperation: true, TokenIdentifier: "AAA-1111"},
+		{IsKDAOperation: true, TokenIdentifier: "BBB-2222"},
+	}
+	accountsInfo, accountsKDA, err := elasticDatabase.resolveAlteredAccounts(
+		1234567890,
+		map[string][]*data.AlteredAccount{"klv1someaddress1": kdaEntries, "klv1someaddress2": kdaEntries},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, accountsInfo, 2)
+	require.Empty(t, accountsKDA)
+	require.Equal(t, int64(1), atomic.LoadInt64(&kappLoads))
 }
