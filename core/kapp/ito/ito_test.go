@@ -1,6 +1,7 @@
 package ito
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"testing"
@@ -2322,7 +2323,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_KDAOwnerLoadUserError(t *testing.
 	}
 
 	accCacher := &mock.AccountsCacherStub{
-		GetExistingUserCalled: func(address []byte) (state.UserAccountHandler, error) {
+		LoadUserCalled: func(address []byte) (state.UserAccountHandler, error) {
 			return nil, mockError
 		},
 	}
@@ -2360,7 +2361,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_KDAOwnerAddToBalanceError(t *test
 	}
 
 	accCacher := &mock.AccountsCacherStub{
-		GetExistingUserCalled: func(address []byte) (state.UserAccountHandler, error) {
+		LoadUserCalled: func(address []byte) (state.UserAccountHandler, error) {
 			return &mock.UserAccountHandlerStub{
 				AddToBalanceCalled: func(value int64, assetID []byte, cdd bool, userKDA ...*kapps.UserKDA) error {
 					return mockError
@@ -2411,7 +2412,7 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_KDAOwnerUpdateUserError(t *testin
 	}
 
 	accCacher := &mock.AccountsCacherStub{
-		GetExistingUserCalled: func(address []byte) (state.UserAccountHandler, error) {
+		LoadUserCalled: func(address []byte) (state.UserAccountHandler, error) {
 			return kdaOwner, nil
 		},
 		UpdateUserCalled: func(account state.AccountHandler) error {
@@ -2492,6 +2493,100 @@ func Test_BuyIto_ComputeITOPercentBuyRoyalties_ShouldWork(t *testing.T) {
 	status, err := itoKapp.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, value, royaltiesPercentAmount, nil)
 	require.NoError(t, err)
 	assert.Equal(t, transaction.Transaction_Ok, status)
+}
+
+// The ITO percentage royalty used to load its receiver with GetExistingUserAccount, so a
+// royalties address that never had an account failed every buy that owed it a share. Under
+// FixAuditChangesV6 the receiver is created like every other payee. Before the fork the legacy
+// loads are kept, so a replay of history returns the same result: the receiver after KdaFpr,
+// the asset owner before it.
+func Test_BuyIto_ComputeITOPercentBuyRoyalties_ReceiverWithoutAccount(t *testing.T) {
+	const royaltiesPercentAmount = int64(20)
+
+	receiver := makeAddress("receiver-no-account")
+	assetOwner := makeAddress("asset-owner")
+
+	tests := []struct {
+		name            string
+		epochs          config.EnableEpochs
+		expectedStatus  transaction.Transaction_TXResultCode
+		expectedErr     error
+		expectedPaid    []byte
+		expectedCreated [][]byte
+	}{
+		{
+			name:            "ForkActive_CreatesAndPaysReceiver",
+			epochs:          config.EnableEpochs{},
+			expectedStatus:  transaction.Transaction_Ok,
+			expectedPaid:    receiver,
+			expectedCreated: [][]byte{receiver},
+		},
+		{
+			name:           "ForkInactive_ReceiverWithoutAccountFails",
+			epochs:         config.EnableEpochs{FixAuditChangesV6: 1},
+			expectedStatus: transaction.Transaction_LoadAccountError,
+			expectedErr:    common.ErrAccNotFound,
+		},
+		{
+			name:           "PreKdaFpr_PaysTheAssetOwner",
+			epochs:         config.EnableEpochs{FixAuditChangesV6: 1, KdaFpr: 1},
+			expectedStatus: transaction.Transaction_Ok,
+			expectedPaid:   assetOwner,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			itoKapp := setupITOKapp(t, tt.epochs)
+
+			paid := make(map[string]int64)
+			newAccount := func(addr []byte) *mock.UserAccountHandlerStub {
+				return &mock.UserAccountHandlerStub{
+					AddressBytesCalled: func() []byte { return addr },
+					AddToBalanceCalled: func(value int64, _ []byte, _ bool, _ ...*kapps.UserKDA) error {
+						paid[string(addr)] += value
+						return nil
+					},
+				}
+			}
+
+			var created [][]byte
+			accCacher := &mock.AccountsCacherStub{
+				GetExistingUserCalled: func(address []byte) (state.UserAccountHandler, error) {
+					if bytes.Equal(address, assetOwner) {
+						return newAccount(address), nil
+					}
+					return nil, common.ErrAccNotFound
+				},
+				LoadUserCalled: func(address []byte) (state.UserAccountHandler, error) {
+					created = append(created, address)
+					return newAccount(address), nil
+				},
+				UpdateUserCalled: func(_ state.AccountHandler) error { return nil },
+			}
+			require.NoError(t, itoKapp.SetAccountsCacher(accCacher))
+
+			buyer := &mock.UserAccountHandlerStub{
+				AddressBytesCalled: func() []byte { return makeAddress("buyer") },
+			}
+			asset := &kapps.KDAData{
+				OwnerAddress: assetOwner,
+				Royalties:    &kapps.RoyaltiesData{Address: receiver},
+			}
+
+			status, err := itoKapp.ComputeITOPercentBuyRoyalties(kapp.NewKappContext(kapp.ArgsNewKAppContext{}),
+				asset, buyer, kdautils.KLVIdentifier, 100_000_000, royaltiesPercentAmount, nil)
+			require.ErrorIs(t, err, tt.expectedErr)
+			require.Equal(t, tt.expectedStatus, status)
+			require.Equal(t, tt.expectedCreated, created, "only the fork path may create an account")
+
+			if tt.expectedPaid == nil {
+				require.Empty(t, paid, "a failed load must pay no one")
+				return
+			}
+			require.Equal(t, map[string]int64{string(tt.expectedPaid): royaltiesPercentAmount}, paid)
+		})
+	}
 }
 
 func Test_BuyITO_Retrieve_Account_To_Send_Percent_And_Fixed_Royalties(t *testing.T) {

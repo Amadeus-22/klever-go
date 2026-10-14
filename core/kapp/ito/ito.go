@@ -444,13 +444,16 @@ func (i *itoKapp) ComputeITOPercentBuyRoyalties(ctx kapp.KappContext, asset *kap
 		return transaction.Transaction_Ok, nil
 	}
 
+	// A receiver without an account used to fail the buy. Under FixAuditChangesV6 it is created
+	// like the fixed-royalty receiver and every other payee; before the fork the legacy loads
+	// are kept as they were.
 	var kdaOwner state.UserAccountHandler
 	var err error
-
-	switch i.forkController.KdaFpr() {
-	case true:
+	if i.forkController.FixAuditChangesV6() {
+		kdaOwner, err = i.LoadUserAccount(asset.Royalties.Address)
+	} else if i.forkController.KdaFpr() {
 		kdaOwner, err = i.GetExistingUserAccount(asset.Royalties.Address)
-	default:
+	} else {
 		kdaOwner, err = i.GetExistingUserAccount(asset.OwnerAddress)
 	}
 	if err != nil {

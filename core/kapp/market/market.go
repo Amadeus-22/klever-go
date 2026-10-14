@@ -619,9 +619,18 @@ func (m *marketKapp) computeRoyaltiesAmount(ctx kapp.KappContext, marketOrder *k
 		return transaction.Transaction_Ok, nil
 	}
 
-	kdaOwner, err := m.GetExistingUserAccount(asset.Royalties.Address)
-	if !m.forkController.KdaFpr() {
-		kdaOwner, err = m.GetExistingUserAccount(asset.OwnerAddress)
+	// A receiver without an account used to fail settlement, leaving an ended auction stuck in
+	// escrow. Under FixAuditChangesV6 it is created like any other payee (KdaFpr is always
+	// active by then); before the fork the legacy loads are kept as they were.
+	var kdaOwner state.UserAccountHandler
+	var err error
+	if m.forkController.FixAuditChangesV6() {
+		kdaOwner, err = m.LoadUserAccount(asset.Royalties.Address)
+	} else {
+		kdaOwner, err = m.GetExistingUserAccount(asset.Royalties.Address)
+		if !m.forkController.KdaFpr() {
+			kdaOwner, err = m.GetExistingUserAccount(asset.OwnerAddress)
+		}
 	}
 	if err != nil {
 		return transaction.Transaction_LoadAccountError, err
