@@ -55,18 +55,19 @@ var contractLoadCost = 3 * contractSize
 // kvm/test/contracts/delete-contract/output/delete-contract.wasm
 func TestBaseOps_DeleteContractValidateGas(t *testing.T) {
 	// before FixAuditChangesV6 the gas must stay exactly historical, so blocks from before the fork
-	// replay unchanged; from it, each GetOwner call also pays for copying its function name
+	// replay unchanged; from it, each GetOwner call also pays for copying its function name, and the
+	// contract's getArgument pays for copying the 32-byte address it deletes
 	t.Run("before FixAuditChangesV6", func(t *testing.T) {
-		testDeleteContractValidateGas(t, blockchainConfig.EnableEpochs{FixAuditChangesV6: 1_000_000}, 0)
+		testDeleteContractValidateGas(t, blockchainConfig.EnableEpochs{FixAuditChangesV6: 1_000_000}, 0, 0)
 	})
 	t.Run("from FixAuditChangesV6", func(t *testing.T) {
-		testDeleteContractValidateGas(t, blockchainConfig.EnableEpochs{}, 22)
+		testDeleteContractValidateGas(t, blockchainConfig.EnableEpochs{}, 22, 32)
 	})
 }
 
-func testDeleteContractValidateGas(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64) {
+func testDeleteContractValidateGas(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64, argCopyGas uint64) {
 	// (Initial Call + 2 ExecDestCall) * contractSize + 2*GetOwner+ DeleteCost
-	baseCost := contractLoadCost + 2*(GetOwnerReturn+nameCopyGas) + 2*GetOwner + DeleteExec + DeleteCost
+	baseCost := contractLoadCost + 2*(GetOwnerReturn+nameCopyGas) + 2*GetOwner + DeleteExec + DeleteCost + argCopyGas
 
 	baseOpsCode := common.GetTestSCCodeModule(contractName, contractName, "../../")
 	codeHash := worldmock.DefaultHasher.Compute(string(baseOpsCode))

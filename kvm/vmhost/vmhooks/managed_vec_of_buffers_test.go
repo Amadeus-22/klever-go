@@ -207,10 +207,10 @@ type callingHook struct {
 	// returnItems is how many return items the hook converts into the result vector, each charged
 	// MBufferNewFromBytes post-fork
 	returnItems uint64
-	// metadataCopyPostFork is the code-metadata buffer the hook pays for post-fork and cloned for
-	// free pre-fork; only the deploy hooks were converted
-	metadataCopyPostFork uint64
-	call                 func(host vmhost.VMHost, argumentsHandle int32) func()
+	// bufferCopyPostFork is what the hook pays post-fork for the buffers it clones (the code
+	// metadata, and the upgrade's code), cloned for free pre-fork
+	bufferCopyPostFork uint64
+	call               func(host vmhost.VMHost, argumentsHandle int32) func()
 }
 
 func callingHooks() []callingHook {
@@ -239,23 +239,23 @@ func callingHooks() []callingHook {
 			dst, fn, result := buffer(host, test.ChildAddress), buffer(host, []byte(managedHookChildFunction)), buffer(host, nil)
 			return func() { _ = hooks(host).ManagedExecuteReadOnly(childGas, dst, fn, args, result) }
 		}},
-		{name: "managedCreateContract", preForkGas: 8096, chargedTwicePreFork: true, returnItems: 1, metadataCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args int32) func() {
+		{name: "managedCreateContract", preForkGas: 8096, chargedTwicePreFork: true, returnItems: 1, bufferCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args int32) func() {
 			value, code, meta := zero(host), buffer(host, childCode), buffer(host, upgradeableMetadata)
 			address, result := buffer(host, nil), buffer(host, nil)
 			return func() { _ = hooks(host).ManagedCreateContract(childGas, value, code, meta, args, address, result) }
 		}},
-		{name: "managedDeployFromSourceContract", preForkGas: 8096, chargedTwicePreFork: true, returnItems: 1, metadataCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args int32) func() {
+		{name: "managedDeployFromSourceContract", preForkGas: 8096, chargedTwicePreFork: true, returnItems: 1, bufferCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args int32) func() {
 			value, source, meta := zero(host), buffer(host, test.ChildAddress), buffer(host, upgradeableMetadata)
 			address, result := buffer(host, nil), buffer(host, nil)
 			return func() {
 				_ = hooks(host).ManagedDeployFromSourceContract(childGas, value, source, meta, args, address, result)
 			}
 		}},
-		{name: "managedUpgradeContract", preForkGas: 8598, chargedTwicePreFork: true, returnItems: 1, call: func(host vmhost.VMHost, args int32) func() {
+		{name: "managedUpgradeContract", preForkGas: 8598, chargedTwicePreFork: true, returnItems: 1, bufferCopyPostFork: uint64(len(childCode)+len(upgradeableMetadata)) * mainnetDataCopyPerByte, call: func(host vmhost.VMHost, args int32) func() {
 			dst, value, code, meta, result := buffer(host, test.ChildAddress), zero(host), buffer(host, childCode), buffer(host, upgradeableMetadata), buffer(host, nil)
 			return func() { hooks(host).ManagedUpgradeContract(dst, childGas, value, code, meta, args, result) }
 		}},
-		{name: "managedUpgradeFromSourceContract", preForkGas: 8598, chargedTwicePreFork: true, returnItems: 1, call: func(host vmhost.VMHost, args int32) func() {
+		{name: "managedUpgradeFromSourceContract", preForkGas: 8598, chargedTwicePreFork: true, returnItems: 1, bufferCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args int32) func() {
 			dst, value, source, meta, result := buffer(host, test.ChildAddress), zero(host), buffer(host, test.ChildAddress), buffer(host, upgradeableMetadata), buffer(host, nil)
 			return func() { hooks(host).ManagedUpgradeFromSourceContract(dst, childGas, value, source, meta, args, result) }
 		}},
@@ -294,7 +294,7 @@ func TestManagedVecOfBuffers_CallArguments_PostForkPaysEachByteOnce(t *testing.T
 		if hook.chargedTwicePreFork {
 			saving = argumentBytes * mainnetDataCopyPerByte
 		}
-		expected := pre.gasUsed - saving + hook.returnItems*testMBufferNewFromBytes + hook.metadataCopyPostFork
+		expected := pre.gasUsed - saving + hook.returnItems*testMBufferNewFromBytes + hook.bufferCopyPostFork
 		require.Equal(t, expected, post.gasUsed, hook.name)
 	}
 }

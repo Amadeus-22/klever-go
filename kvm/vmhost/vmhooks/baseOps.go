@@ -15,6 +15,7 @@ import (
 	"github.com/klever-io/klever-go/kvm/math"
 	"github.com/klever-io/klever-go/kvm/vmhost"
 	"github.com/klever-io/klever-go/vmcommon"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -260,6 +261,36 @@ func (context *VMHooksImpl) GetBlockHash(nonce int64, resultOffset executor.MemP
 	return 0
 }
 
+// kdaTokenDecodedLen is the encoded size of the records GetKDAToken decoded, a nil one counting
+// nothing. proto.Size sums every field and map entry on its own, so it does not depend on map
+// iteration order, and it sizes the decoded structs without marshalling them again
+func kdaTokenDecodedLen(kdaData *kapps.KDAData, userKDA *kapps.UserKDA) uint64 {
+	decodedLen := uint64(0)
+	if kdaData != nil {
+		decodedLen = uint64(proto.Size(kdaData)) // #nosec G115 - a size is non-negative
+	}
+	if userKDA != nil {
+		decodedLen = math.AddUint64(decodedLen, uint64(proto.Size(userKDA))) // #nosec G115 - a size is non-negative
+	}
+	return decodedLen
+}
+
+// chargeKDATokenDecode charges, from FixAuditChangesV6, DataCopyPerByte for every byte of the
+// records GetKDAToken just decoded, bounded, before anything uses them; before the fork it charges
+// nothing. GetKDAToken reads and unmarshals the KDAData and, given an address, the UserKDA, whose
+// metadata alone can reach MaxLeafSize, for the flat cost of the read. BlockchainHook has no raw-size
+// accessor: the UserKDA blob could be read a second time through GetUserAccount, but the KDAData
+// lives in the KDA KApp account, which that does not reach. So this charges after the decode rather
+// than before it: what is left unpaid is at most one decode per failing transaction, up to
+// MaxLeafSize plus the KDAData, while a contract looping over a read pays for every decode after the
+// first. A raw-size accessor that lets this charge before the decode is tracked in KLC-2795
+func chargeKDATokenDecode(host vmhost.VMHost, kdaData *kapps.KDAData, userKDA *kapps.UserKDA) error {
+	if !host.ForkController().FixAuditChangesV6() {
+		return nil
+	}
+	return host.ManagedTypes().ConsumeGasForByteLenBounded(kdaTokenDecodedLen(kdaData, userKDA))
+}
+
 func getKDADataFromBlockchainHook(
 	context *VMHooksImpl,
 	addressOffset executor.MemPtr,
@@ -297,6 +328,11 @@ func getKDADataFromBlockchainHook(
 	}
 
 	kdaToken, userKDA, err := blockchain.GetKDAToken(address, tokenID, uint64(nonce)) // #nosec G115
+	if err != nil {
+		return nil, nil, err
+	}
+
+	err = chargeKDATokenDecode(host, kdaToken, userKDA)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -415,12 +451,29 @@ func (context *VMHooksImpl) GetKDATokenData(
 		return -1
 	}
 
-	value := managedType.GetBigIntOrCreate(precisionHandle)
-	value.Set(big.NewInt(int64(kdaData.Precision)))
+	var properties []byte
+	if context.host.ForkController().FixAuditChangesV6() {
+		// from FixAuditChangesV6 the properties JSON is paid for, bounded, before anything is
+		// written, the precision handle included: it was written for free before the fork (KLC-2755)
+		properties, err = json.Marshal(kdaData.Properties)
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return -1
+		}
+		err = managedType.ConsumeGasForByteLenBounded(uint64(len(properties)))
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return -1
+		}
 
-	properties, err := json.Marshal(kdaData.Properties)
-	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
-		return -1
+		value := managedType.GetBigIntOrCreate(precisionHandle)
+		value.Set(big.NewInt(int64(kdaData.Precision)))
+	} else {
+		value := managedType.GetBigIntOrCreate(precisionHandle)
+		value.Set(big.NewInt(int64(kdaData.Precision)))
+
+		properties, err = json.Marshal(kdaData.Properties)
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return -1
+		}
 	}
 	err = context.MemStore(propertiesOffset, properties)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
@@ -441,7 +494,17 @@ func (context *VMHooksImpl) ValidateTokenIdentifier(
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetArgument
-	metering.UseGasAndAddTracedGas(validateTokenIdentifierName, gasToUse)
+	// from FixAuditChangesV6 the flat gas is bounded, and a buffer longer than any token identifier
+	// is answered 0, as ValidateToken answers it, without being cloned first
+	err := startTracingAndUseGas(context.host, validateTokenIdentifierName, gasToUse)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
+
+	if context.host.ForkController().FixAuditChangesV6() &&
+		managedType.GetLength(tokenIdHandle) > vmcommon.TokenIdentifierMaxLength {
+		return 0
+	}
 
 	tokenID, err := managedType.GetBytes(tokenIdHandle)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
@@ -954,7 +1017,12 @@ func (context *VMHooksImpl) GetArgument(id int32, argOffset executor.MemPtr) int
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetArgument
-	metering.UseGasAndAddTracedGas(getArgumentName, gasToUse)
+	// from FixAuditChangesV6 the flat gas is bounded and the argument is paid for before it is
+	// written to contract memory, as MBufferGetArgument pays for it
+	err := startTracingAndUseGas(context.host, getArgumentName, gasToUse)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
 
 	args := runtime.Arguments()
 	// #nosec G115
@@ -963,7 +1031,14 @@ func (context *VMHooksImpl) GetArgument(id int32, argOffset executor.MemPtr) int
 		return -1
 	}
 
-	err := context.MemStore(argOffset, args[id])
+	if context.host.ForkController().FixAuditChangesV6() {
+		err = context.GetManagedTypesContext().ConsumeGasForByteLenBounded(uint64(len(args[id])))
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return -1
+		}
+	}
+
+	err = context.MemStore(argOffset, args[id])
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
@@ -1430,14 +1505,31 @@ func (context *VMHooksImpl) GetKDATokenName(resultOffset executor.MemPtr) int32 
 func (context *VMHooksImpl) GetKDATokenNameByIndex(resultOffset executor.MemPtr, index int32) int32 {
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetCallValue
-	metering.UseGasAndAddTracedGas(getKDATokenNameByIndexName, gasToUse)
+	if !fixAuditV6 {
+		metering.UseGasAndAddTracedGas(getKDATokenNameByIndexName, gasToUse)
+	} else {
+		// from FixAuditChangesV6 the fixed cost is bounded, so an underfunded call copies nothing
+		err := startTracingAndUseGas(context.host, getKDATokenNameByIndexName, gasToUse)
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return -1
+		}
+	}
 
 	kdaTransfer := getKDATransferFromInputFailIfWrongIndex(context.GetVMHost(), index)
 	var tokenName []byte
 	if kdaTransfer != nil {
 		tokenName = kdaTransfer.KDATokenName
+		// from FixAuditChangesV6 the name, which the calling contract sets, is paid for, bounded,
+		// before it is copied out
+		if fixAuditV6 {
+			err := context.GetManagedTypesContext().ConsumeGasForByteLenBounded(uint64(len(tokenName)))
+			if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+				return -1
+			}
+		}
 	}
 
 	err := context.MemStore(resultOffset, tokenName)
@@ -1564,15 +1656,32 @@ func (context *VMHooksImpl) GetCallValueTokenNameByIndex(
 
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetCallValue
-	metering.UseGasAndAddTracedGas(getCallValueTokenNameByIndexName, gasToUse)
+	if !fixAuditV6 {
+		metering.UseGasAndAddTracedGas(getCallValueTokenNameByIndexName, gasToUse)
+	} else {
+		// from FixAuditChangesV6 the fixed cost is bounded, so an underfunded call copies nothing
+		err := startTracingAndUseGas(context.host, getCallValueTokenNameByIndexName, gasToUse)
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return -1
+		}
+	}
 
 	callValue := big.NewInt(0).Bytes()
 	tokenName := make([]byte, 0)
 	kdaTransfer := getKDATransferFromInputFailIfWrongIndex(context.GetVMHost(), index)
 
 	if kdaTransfer != nil {
+		// from FixAuditChangesV6 the name, which the calling contract sets, is paid for, bounded,
+		// before it is copied out
+		if fixAuditV6 {
+			err := context.GetManagedTypesContext().ConsumeGasForByteLenBounded(uint64(len(kdaTransfer.KDATokenName)))
+			if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+				return -1
+			}
+		}
 		tokenName = make([]byte, len(kdaTransfer.KDATokenName))
 		copy(tokenName, kdaTransfer.KDATokenName)
 		callValue = kdaTransfer.KDAValue.Bytes()
@@ -2466,14 +2575,30 @@ func (context *VMHooksImpl) GetReturnDataSize(resultID int32) int32 {
 // @autogenerate(VMHooks)
 func (context *VMHooksImpl) GetReturnData(resultID int32, dataOffset executor.MemPtr) int32 {
 	host := context.GetVMHost()
+	runtime := context.GetRuntimeContext()
+	metering := context.GetMeteringContext()
+
+	// from FixAuditChangesV6 the flat gas is bounded and the item is paid for before it is written
+	// to contract memory
+	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetReturnData
+	err := startTracingAndUseGas(host, getReturnDataName, gasToUse)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return 0
+	}
 
 	result := GetReturnDataWithHostAndTypedArgs(host, resultID)
 	if result == nil {
 		return 0
 	}
 
-	runtime := context.GetRuntimeContext()
-	err := context.MemStore(dataOffset, result)
+	if host.ForkController().FixAuditChangesV6() {
+		err = context.GetManagedTypesContext().ConsumeGasForByteLenBounded(uint64(len(result)))
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return 0
+		}
+	}
+
+	err = context.MemStore(dataOffset, result)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 0
 	}
@@ -2481,14 +2606,10 @@ func (context *VMHooksImpl) GetReturnData(resultID int32, dataOffset executor.Me
 	return int32(len(result)) // #nosec G115
 }
 
+// GetReturnDataWithHostAndTypedArgs returns the return data item at resultID, faulting on an index
+// out of range. It charges nothing: GetReturnData charges for the item before looking it up
 func GetReturnDataWithHostAndTypedArgs(host vmhost.VMHost, resultID int32) []byte {
-	output := host.Output()
-	metering := host.Metering()
-
-	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetReturnData
-	metering.UseGasAndAddTracedGas(getReturnDataName, gasToUse)
-
-	returnData := output.ReturnData()
+	returnData := host.Output().ReturnData()
 	// #nosec G115
 	if resultID >= int32(len(returnData)) || resultID < 0 {
 		WithFaultAndHost(host, vmhost.ErrInvalidArgument, host.Runtime().BaseOpsErrorShouldFailExecution())

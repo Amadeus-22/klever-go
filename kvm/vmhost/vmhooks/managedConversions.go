@@ -503,6 +503,130 @@ func writeKDATransfersToBytes(
 	return destinationBytes
 }
 
+// unchargedManagedTypes exists only for the KDA getters that, from FixAuditChangesV6, pay bounded and
+// up front for every byte the builders above would charge after the work, and then build their
+// outputs through it: the builders do the same work and allocate the same handles, and their
+// ConsumeGasForBytes does nothing, so nothing is paid for twice. Every other charge goes through: the
+// big ints the wrapped builders copy are all int64 or uint32 values, at most 8 bytes, which
+// ConsumeGasForBigIntCopy never charges for, so silencing it too would only fail open on a future
+// copy. Any new charge in a write* builder must also be added to the matching *ChargedLen helper below
+// (the KDA getters' exact gas test on both sides of the fork catches the drift). Scheduled for
+// removal in KLC-2793, which makes the builders pure serialisers and hoists their charges into the hooks
+type unchargedManagedTypes struct {
+	vmhost.ManagedTypesContext
+}
+
+// ConsumeGasForBytes charges nothing: the getter paid for these bytes before building them
+func (unchargedManagedTypes) ConsumeGasForBytes(_ []byte) {
+	// intentionally empty: charging here would make the getter pay for these bytes twice
+}
+
+// kdaTransfersChargedLen is the length of what writeKDATransfersToBytes builds for count transfers,
+// which is what the call value getters charge DataCopyPerByte for. It counts neither the transfers'
+// names nor their values: from FixAuditChangesV6 consumeGasForKDATransfersBounded adds the kept
+// names to this charge and charges the values on their own
+func kdaTransfersChargedLen(count int) uint64 {
+	return math.MulUint64(kdaTransferLen, uint64(count)) // #nosec G115 -- a slice length is never negative
+}
+
+// kdaValueCopyLen is the length of the big int handle writeKDATransfer copies a transfer's value into,
+// which the call value getters charge the big int copy for from FixAuditChangesV6: 0 for a nil value,
+// which it copies as 0
+func kdaValueCopyLen(value *big.Int) int64 {
+	if value == nil {
+		return 0
+	}
+	return int64((value.BitLen() + 7) / 8)
+}
+
+// consumeGasForKDATransfersBounded charges, bounded, what the call value getters pay from
+// FixAuditChangesV6 before encoding kdaTransfers: the encoded transfers and their names, which the
+// calling contract sets, in one charge, then each value's big int copy, in that order, stopping at the
+// first that cannot be paid. Transfers skip reports true for are left out of all of them, and are only
+// counted, never copied
+func consumeGasForKDATransfersBounded(
+	managedType vmhost.ManagedTypesContext,
+	kdaTransfers []*vmcommon.KDATransfer,
+	skip func(*vmcommon.KDATransfer) bool,
+) error {
+	kept := 0
+	nameBytes := uint64(0)
+	for _, kdaTransfer := range kdaTransfers {
+		if skip == nil || !skip(kdaTransfer) {
+			kept++
+			nameBytes = math.AddUint64(nameBytes, uint64(len(kdaTransfer.KDATokenName))) // #nosec G115
+		}
+	}
+	err := managedType.ConsumeGasForByteLenBounded(math.AddUint64(kdaTransfersChargedLen(kept), nameBytes))
+	if err != nil {
+		return err
+	}
+
+	for _, kdaTransfer := range kdaTransfers {
+		if skip != nil && skip(kdaTransfer) {
+			continue
+		}
+		err = managedType.ConsumeGasForThisIntNumberOfBytesBounded(kdaValueCopyLen(kdaTransfer.KDAValue))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// userBucketsChargedLen is what writeUserBuckets charges DataCopyPerByte for, plus its output, which
+// ManagedGetUserKDA charges for after it: each bucket's key and delegation, and UserBucketsLen
+func userBucketsChargedLen(buckets map[string]*kapps.UserBucket) uint64 {
+	total := uint64(0)
+	for key, bucket := range buckets {
+		total = math.AddUint64(total, uint64(UserBucketsLen+len(key)+len(bucket.Delegation))) // #nosec G115
+	}
+	return total
+}
+
+// royaltiesChargedLen is what writeRoyaltiesToBytes charges DataCopyPerByte for, plus its output,
+// which ManagedGetKDATokenData charges for after it: nothing for no royalties; otherwise the address,
+// the transfer percentages and split royalties buffers, each split royalty key, and RoyaltiesLen
+func royaltiesChargedLen(royalties *kapps.RoyaltiesData) uint64 {
+	if royalties == nil {
+		return 0
+	}
+
+	total := uint64(RoyaltiesLen + len(royalties.Address))                                                          // #nosec G115
+	total = math.AddUint64(total, math.MulUint64(TransferPercentageLen, uint64(len(royalties.TransferPercentage)))) // #nosec G115
+	for key := range royalties.SplitRoyalties {
+		total = math.AddUint64(total, uint64(SplitRoyaltiesLen+len(key))) // #nosec G115
+	}
+	return total
+}
+
+// rolesChargedLen is what writeRolesToBytes charges DataCopyPerByte for, plus its output, which the
+// getters charge for after it: each role's address and RolesDataLen
+func rolesChargedLen(roles []*kapps.RolesData) uint64 {
+	total := uint64(0)
+	for _, role := range roles {
+		total = math.AddUint64(total, uint64(RolesDataLen+len(role.Address))) // #nosec G115
+	}
+	return total
+}
+
+// urisChargedLen is what writeURIsToBytes charges DataCopyPerByte for, plus its output, which
+// ManagedGetKDATokenData charges for after it: each URI's key and value, and URIsDataLen
+func urisChargedLen(uris map[string]string) uint64 {
+	total := uint64(0)
+	for key, value := range uris {
+		total = math.AddUint64(total, uint64(URIsDataLen+len(key)+len(value))) // #nosec G115
+	}
+	return total
+}
+
+// sftMetaChargedLen is what writeSFTMeta charges DataCopyPerByte for: the metadata's name, hash and
+// attributes. Its SFTMetaLen output and the SFTMetadataLen buffer inside it are not charged
+func sftMetaChargedLen(meta *kapps.MetaV2) uint64 {
+	metadata := meta.Metadata
+	return uint64(len(metadata.Name) + len(metadata.Hash) + len(metadata.Attributes)) // #nosec G115
+}
+
 type vmInputData struct {
 	destination []byte
 	function    string

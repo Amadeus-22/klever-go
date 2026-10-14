@@ -801,6 +801,13 @@ func (sc *scProcessor) processSCOutputAccounts(
 	outputAccounts []*vmcommon.OutputAccount,
 ) error {
 	for _, outAcc := range outputAccounts {
+		// from FixAuditChangesV6 no user account may exist under an address that is not pubkey-length,
+		// so loading one here, which creates and persists it, is refused instead
+		if sc.forkController.FixAuditChangesV6() && len(outAcc.Address) != sc.pubkeyConv.Len() {
+			log.Warn("processSCOutputAccounts", "error", process.ErrInvalidOutputAccountAddressLength, "addressLength", len(outAcc.Address))
+			return process.ErrInvalidOutputAccountAddressLength
+		}
+
 		acc, err := sc.getAccountFromAddress(outAcc.Address)
 		if err != nil {
 			return err

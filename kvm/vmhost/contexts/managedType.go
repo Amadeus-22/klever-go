@@ -982,11 +982,28 @@ func (context *managedTypesContext) NewManagedMap() int32 {
 	return newHandle
 }
 
-// ManagedMapPut puts the key and value bytes stored at those respective handles in the map
+// ManagedMapPut puts the key and value bytes stored at those respective handles in the map. From
+// FixAuditChangesV6 it charges, bounded and before either is cloned, DataCopyPerByte for each byte
+// of the key and of the value, the amount it used to charge after cloning them
 func (context *managedTypesContext) ManagedMapPut(mMapHandle int32, keyHandle int32, valueHandle int32) error {
 	mMap, ok := context.managedTypesValues.mMapValues[mMapHandle]
 	if !ok {
 		return vmhost.ErrNoManagedMapUnderThisHandle
+	}
+
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
+	if fixAuditV6 {
+		// a missing key or value is not charged and is reported before either is cloned: it is the
+		// error GetBytes reports for either of them
+		keyLen := context.GetLength(keyHandle)
+		valueLen := context.GetLength(valueHandle)
+		if keyLen < 0 || valueLen < 0 {
+			return vmhost.ErrNoManagedBufferUnderThisHandle
+		}
+		err := context.ConsumeGasForByteLenBounded(uint64(keyLen) + uint64(valueLen))
+		if err != nil {
+			return err
+		}
 	}
 
 	key, err := context.GetBytes(keyHandle)
@@ -1001,19 +1018,40 @@ func (context *managedTypesContext) ManagedMapPut(mMapHandle int32, keyHandle in
 	valueCopy := make([]byte, len(value))
 	copy(valueCopy, value)
 
-	context.ConsumeGasForBytes(key)
-	context.ConsumeGasForBytes(value)
+	if !fixAuditV6 {
+		context.ConsumeGasForBytes(key)
+		context.ConsumeGasForBytes(value)
+	}
 
 	mMap[string(key)] = valueCopy
 
 	return nil
 }
 
-// ManagedMapGet gets the bytes stored as the key handle in an output value handle
+// ManagedMapGet gets the bytes stored as the key handle in an output value handle. From
+// FixAuditChangesV6 it charges, bounded, DataCopyPerByte for each byte of the key before cloning it,
+// which it did not charge before, and for each byte of the value before writing it
 func (context *managedTypesContext) ManagedMapGet(mMapHandle int32, keyHandle int32, outValueHandle int32) error {
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
+	if fixAuditV6 {
+		err := context.consumeGasForManagedMapKeyBounded(mMapHandle, keyHandle)
+		if err != nil {
+			return err
+		}
+	}
+
 	_, _, value, _, err := context.getKeyValueFromManagedMap(mMapHandle, keyHandle)
 	if err != nil {
 		return err
+	}
+
+	if fixAuditV6 {
+		err = context.ConsumeGasForByteLenBounded(uint64(len(value)))
+		if err != nil {
+			return err
+		}
+		context.SetBytes(outValueHandle, value)
+		return nil
 	}
 
 	context.SetBytes(outValueHandle, value)
@@ -1022,11 +1060,32 @@ func (context *managedTypesContext) ManagedMapGet(mMapHandle int32, keyHandle in
 	return nil
 }
 
-// ManagedMapRemove removes the bytes stored as the key handle and returns it in an output value handle
+// ManagedMapRemove removes the bytes stored as the key handle and returns it in an output value
+// handle. From FixAuditChangesV6 it charges, bounded, DataCopyPerByte for each byte of the key
+// before cloning it and for each byte of the value before writing it, the amounts it used to charge
+// after both
 func (context *managedTypesContext) ManagedMapRemove(mMapHandle int32, keyHandle int32, outValueHandle int32) error {
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
+	if fixAuditV6 {
+		err := context.consumeGasForManagedMapKeyBounded(mMapHandle, keyHandle)
+		if err != nil {
+			return err
+		}
+	}
+
 	mMap, key, value, _, err := context.getKeyValueFromManagedMap(mMapHandle, keyHandle)
 	if err != nil {
 		return err
+	}
+
+	if fixAuditV6 {
+		err = context.ConsumeGasForByteLenBounded(uint64(len(value)))
+		if err != nil {
+			return err
+		}
+		context.SetBytes(outValueHandle, value)
+		delete(mMap, string(key))
+		return nil
 	}
 
 	context.SetBytes(outValueHandle, value)
@@ -1037,14 +1096,36 @@ func (context *managedTypesContext) ManagedMapRemove(mMapHandle int32, keyHandle
 	return nil
 }
 
-// ManagedMapContains checks if the managed map contains the given key
+// ManagedMapContains checks if the managed map contains the given key. From FixAuditChangesV6 it
+// charges, bounded and before the key is cloned, DataCopyPerByte for each byte of the key
 func (context *managedTypesContext) ManagedMapContains(mMapHandle int32, keyHandle int32) (bool, error) {
+	if context.host.ForkController().FixAuditChangesV6() {
+		err := context.consumeGasForManagedMapKeyBounded(mMapHandle, keyHandle)
+		if err != nil {
+			return false, err
+		}
+	}
+
 	_, _, value, foundValue, err := context.getKeyValueFromManagedMap(mMapHandle, keyHandle)
 	if err != nil {
 		return false, err
 	}
 
 	return foundValue && len(value) > 0, nil
+}
+
+// consumeGasForManagedMapKeyBounded charges, bounded, DataCopyPerByte for each byte of the key a map
+// lookup is about to clone. An unknown map or a missing key is not charged, so that
+// getKeyValueFromManagedMap reports them as before, the map first
+func (context *managedTypesContext) consumeGasForManagedMapKeyBounded(mMapHandle int32, keyHandle int32) error {
+	if _, ok := context.managedTypesValues.mMapValues[mMapHandle]; !ok {
+		return nil
+	}
+	keyLen := context.GetLength(keyHandle)
+	if keyLen < 0 {
+		return nil
+	}
+	return context.ConsumeGasForByteLenBounded(uint64(keyLen))
 }
 
 func (context *managedTypesContext) getKeyValueFromManagedMap(mMapHandle int32, keyHandle int32) (map[string][]byte, []byte, []byte, bool, error) {

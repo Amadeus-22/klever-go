@@ -22,6 +22,7 @@ SetPointsUsed: 225
 VM hook end:   GetNumArguments()
 VM hook begin: BigIntGetUnsignedArgument(0, -101)
 GetPointsUsed: 315
+GetPointsUsed: 315
 SetPointsUsed: 1315
 VM hook end:   BigIntGetUnsignedArgument(0, -101)
 VM hook begin: MBufferSetBytes(-102, 131072, 3)
@@ -106,7 +107,9 @@ SetPointsUsed: 20212
 VM hook end:   MBufferToBigIntUnsigned(-102, -103)
 VM hook begin: BigIntFinishUnsigned(-103)
 GetPointsUsed: 20232
+GetPointsUsed: 20232
 SetPointsUsed: 21232
+GetPointsUsed: 21232
 GetPointsUsed: 21232
 SetPointsUsed: 22232
 VM hook end:   BigIntFinishUnsigned(-103)
@@ -129,6 +132,7 @@ GetPointsUsed: 125
 SetPointsUsed: 225
 VM hook end:   GetNumArguments()
 VM hook begin: BigIntGetUnsignedArgument(0, -101)
+GetPointsUsed: 315
 GetPointsUsed: 315
 SetPointsUsed: 1315
 VM hook end:   BigIntGetUnsignedArgument(0, -101)
@@ -162,6 +166,7 @@ GetPointsUsed: 21252
 SetPointsUsed: 21302
 VM hook end:   MBufferToBigIntUnsigned(-103, -104)
 VM hook begin: BigIntAdd(-104, -104, -101)
+GetPointsUsed: 21352
 GetPointsUsed: 21352
 SetPointsUsed: 23352
 VM hook end:   BigIntAdd(-104, -104, -101)
@@ -207,8 +212,8 @@ func TestRustAdderLog(t *testing.T) {
 }
 
 // expectedAdderLogPreFork is the adder log exactly as the release this branch forked from
-// produced it. Running the same scenarios with FixAuditChangesV5 scheduled in the future
-// must reproduce it byte for byte: that pins the pre-fork gas path, which no per-hook test
+// produced it. Running the same scenarios with FixAuditChangesV5 and FixAuditChangesV6 scheduled
+// in the future must reproduce it byte for byte: that pins the pre-fork gas path, which no per-hook test
 // can see because the pre-fork helpers overdraw silently instead of failing.
 const expectedAdderLogPreFork = `starting log:
 GetFunctionNames: [add add_payable getSum init upgrade]
@@ -356,7 +361,7 @@ Clean: true
 func TestRustAdderLogPreFork(t *testing.T) {
 	ScenariosTest(t).
 		Folder("adder/scenarios").
-		WithEnableEpochs(config.EnableEpochs{FixAuditChangesV5: 1_000_000}).
+		WithEnableEpochs(config.EnableEpochs{FixAuditChangesV5: 1_000_000, FixAuditChangesV6: 1_000_000}).
 		WithExecutorLogs().
 		Run().
 		CheckNoError().

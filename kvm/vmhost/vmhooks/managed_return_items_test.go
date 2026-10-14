@@ -41,10 +41,10 @@ type returnItemsHook struct {
 	// failureReturn is what the hook returns when the conversion fails: -1 for the execute hooks, 1
 	// for create and deploy, 0 for the upgrade hooks, which return nothing
 	failureReturn int32
-	// metadataCopyPostFork is the code-metadata buffer the hook pays for post-fork and cloned for
-	// free pre-fork; only the deploy hooks were converted
-	metadataCopyPostFork uint64
-	call                 func(host vmhost.VMHost, argumentsHandle int32, resultHandle int32) func() int32
+	// bufferCopyPostFork is what the hook pays post-fork for the buffers it clones (the code
+	// metadata, and the upgrade's code), cloned for free pre-fork
+	bufferCopyPostFork uint64
+	call               func(host vmhost.VMHost, argumentsHandle int32, resultHandle int32) func() int32
 }
 
 // returnItemsNumItems is how many empty items the pinned calls return.
@@ -82,26 +82,26 @@ func returnItemsHooksCalling(function string) []returnItemsHook {
 			dst, fn := buffer(host, test.ChildAddress), buffer(host, emitEmptyItems)
 			return func() int32 { return hooks(host).ManagedExecuteReadOnly(childGas, dst, fn, args, result) }
 		}},
-		{name: "managedCreateContract", preForkGas: 2096, failureReturn: 1, metadataCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args, result int32) func() int32 {
+		{name: "managedCreateContract", preForkGas: 2096, failureReturn: 1, bufferCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args, result int32) func() int32 {
 			value, code, meta, address := zero(host), buffer(host, childCode), buffer(host, upgradeableMetadata), buffer(host, nil)
 			return func() int32 {
 				return hooks(host).ManagedCreateContract(childGas, value, code, meta, args, address, result)
 			}
 		}},
-		{name: "managedDeployFromSourceContract", preForkGas: 2096, failureReturn: 1, metadataCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args, result int32) func() int32 {
+		{name: "managedDeployFromSourceContract", preForkGas: 2096, failureReturn: 1, bufferCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args, result int32) func() int32 {
 			value, source, meta, address := zero(host), buffer(host, test.ChildAddress), buffer(host, upgradeableMetadata), buffer(host, nil)
 			return func() int32 {
 				return hooks(host).ManagedDeployFromSourceContract(childGas, value, source, meta, args, address, result)
 			}
 		}},
-		{name: "managedUpgradeContract", preForkGas: 2048, call: func(host vmhost.VMHost, args, result int32) func() int32 {
+		{name: "managedUpgradeContract", preForkGas: 2048, bufferCopyPostFork: uint64(len(childCode)+len(upgradeableMetadata)) * mainnetDataCopyPerByte, call: func(host vmhost.VMHost, args, result int32) func() int32 {
 			dst, value, code, meta := buffer(host, test.ChildAddress), zero(host), buffer(host, childCode), buffer(host, upgradeableMetadata)
 			return func() int32 {
 				hooks(host).ManagedUpgradeContract(dst, childGas, value, code, meta, args, result)
 				return 0
 			}
 		}},
-		{name: "managedUpgradeFromSourceContract", preForkGas: 2048, call: func(host vmhost.VMHost, args, result int32) func() int32 {
+		{name: "managedUpgradeFromSourceContract", preForkGas: 2048, bufferCopyPostFork: managedDeployMetadataCopy, call: func(host vmhost.VMHost, args, result int32) func() int32 {
 			dst, value, source, meta := buffer(host, test.ChildAddress), zero(host), buffer(host, test.ChildAddress), buffer(host, upgradeableMetadata)
 			return func() int32 {
 				hooks(host).ManagedUpgradeFromSourceContract(dst, childGas, value, source, meta, args, result)
@@ -187,7 +187,7 @@ func TestManagedReturnItems_PostForkChargesEachItem(t *testing.T) {
 		// on top of that, every empty item now costs MBufferNewFromBytes where it cost nothing, and
 		// the deploy hooks pay for the code-metadata buffer they clone
 		saving := postCall.argumentBytes * mainnetDataCopyPerByte
-		expected := pre.gasUsed - saving + returnItemsNumItems*mainnetMBufferNewFromBytes + hook.metadataCopyPostFork
+		expected := pre.gasUsed - saving + returnItemsNumItems*mainnetMBufferNewFromBytes + hook.bufferCopyPostFork
 		require.Equal(t, expected, post.gasUsed, hook.name)
 	}
 }

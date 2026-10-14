@@ -514,25 +514,72 @@ func (context *VMHooksImpl) pow(base *big.Float, exp int32) (*big.Float, error) 
 	return result, nil
 }
 
-// BigFloatFloor VMHooks implementation.
-// @autogenerate(VMHooks)
-func (context *VMHooksImpl) BigFloatFloor(destBigIntHandle, opHandle int32) {
-	managedType := context.GetManagedTypesContext()
-	metering := context.GetMeteringContext()
-	runtime := context.GetRuntimeContext()
-	metering.StartGasTracing(bigFloatFloorName)
+// bigFloatIntPartByteLen is the byte length of op's integer part, (op.Int(nil).BitLen()+7)/8, computed
+// without converting. A finite nonzero op is mant × 2**exp with 0.5 <= |mant| < 1, so for exp > 0 its
+// integer part lies in [2**(exp-1), 2**exp) and has exactly exp bits; for exp <= 0, |op| < 1 and the
+// integer part is 0, as it is for ±0, whose exp is 0
+func bigFloatIntPartByteLen(op *big.Float) int64 {
+	exp := op.MantExp(nil)
+	if exp <= 0 {
+		return 0
+	}
+	return (int64(exp) + 7) / 8
+}
 
-	gasToUse := metering.GasSchedule().BigFloatAPICost.BigFloatFloor
-	metering.UseAndTraceGas(gasToUse)
+// consumeGasForBigFloatIntPartCopy charges, from FixAuditChangesV6, the copy of op's integer part, what
+// ConsumeGasForBigIntCopy charges once op has been converted, bounded and before the conversion: an
+// underfunded call faults with ErrNotEnoughGas, through the BigFloat API predicate, and it returns
+// false so the hook stops before creating or writing its destination. Before the fork it charges
+// nothing: the hook charges the converted value afterwards, unbounded, as it always did
+func (context *VMHooksImpl) consumeGasForBigFloatIntPartCopy(op *big.Float, fixAuditV6 bool) bool {
+	if !fixAuditV6 {
+		return true
+	}
+	managedType := context.GetManagedTypesContext()
+	runtime := context.GetRuntimeContext()
+	err := managedType.ConsumeGasForThisIntNumberOfBytesBounded(bigFloatIntPartByteLen(op))
+	return !context.WithFault(err, runtime.BigFloatAPIErrorShouldFailExecution())
+}
+
+// bigFloatToBigInt charges a BigFloat-to-BigInt conversion's flat gas and sets the big int at
+// destBigIntHandle to the integer part of the big float at opHandle, truncated toward zero. It returns
+// both, or false after a fault. From FixAuditChangesV6 the integer part's copy is paid for, bounded,
+// before the conversion and before the destination is created; before it the converted value is
+// charged afterwards, unbounded, as it always was
+func (context *VMHooksImpl) bigFloatToBigInt(hookName string, gasToUse uint64, destBigIntHandle, opHandle int32) (*big.Float, *big.Int, bool) {
+	managedType := context.GetManagedTypesContext()
+	runtime := context.GetRuntimeContext()
+
+	err := startTracingAndUseGas(context.host, hookName, gasToUse)
+	if context.WithFault(err, runtime.BigFloatAPIErrorShouldFailExecution()) {
+		return nil, nil, false
+	}
 
 	op, err := managedType.GetBigFloat(opHandle)
 	if context.WithFault(err, runtime.BigFloatAPIErrorShouldFailExecution()) {
-		return
+		return nil, nil, false
+	}
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
+	if !context.consumeGasForBigFloatIntPartCopy(op, fixAuditV6) {
+		return nil, nil, false
 	}
 	bigIntOp := managedType.GetBigIntOrCreate(destBigIntHandle)
 
 	op.Int(bigIntOp)
-	managedType.ConsumeGasForBigIntCopy(bigIntOp)
+	if !fixAuditV6 {
+		managedType.ConsumeGasForBigIntCopy(bigIntOp)
+	}
+	return op, bigIntOp, true
+}
+
+// BigFloatFloor VMHooks implementation.
+// @autogenerate(VMHooks)
+func (context *VMHooksImpl) BigFloatFloor(destBigIntHandle, opHandle int32) {
+	gasToUse := context.GetMeteringContext().GasSchedule().BigFloatAPICost.BigFloatFloor
+	op, bigIntOp, ok := context.bigFloatToBigInt(bigFloatFloorName, gasToUse, destBigIntHandle, opHandle)
+	if !ok {
+		return
+	}
 	if op.IsInt() {
 		return
 	}
@@ -544,22 +591,11 @@ func (context *VMHooksImpl) BigFloatFloor(destBigIntHandle, opHandle int32) {
 // BigFloatCeil VMHooks implementation.
 // @autogenerate(VMHooks)
 func (context *VMHooksImpl) BigFloatCeil(destBigIntHandle, opHandle int32) {
-	managedType := context.GetManagedTypesContext()
-	metering := context.GetMeteringContext()
-	runtime := context.GetRuntimeContext()
-	metering.StartGasTracing(bigFloatCeilName)
-
-	gasToUse := metering.GasSchedule().BigFloatAPICost.BigFloatCeil
-	metering.UseAndTraceGas(gasToUse)
-
-	op, err := managedType.GetBigFloat(opHandle)
-	if context.WithFault(err, runtime.BigFloatAPIErrorShouldFailExecution()) {
+	gasToUse := context.GetMeteringContext().GasSchedule().BigFloatAPICost.BigFloatCeil
+	op, bigIntOp, ok := context.bigFloatToBigInt(bigFloatCeilName, gasToUse, destBigIntHandle, opHandle)
+	if !ok {
 		return
 	}
-	bigIntOp := managedType.GetBigIntOrCreate(destBigIntHandle)
-
-	op.Int(bigIntOp)
-	managedType.ConsumeGasForBigIntCopy(bigIntOp)
 	if op.IsInt() {
 		return
 	}
@@ -571,22 +607,8 @@ func (context *VMHooksImpl) BigFloatCeil(destBigIntHandle, opHandle int32) {
 // BigFloatTruncate VMHooks implementation.
 // @autogenerate(VMHooks)
 func (context *VMHooksImpl) BigFloatTruncate(destBigIntHandle, opHandle int32) {
-	managedType := context.GetManagedTypesContext()
-	metering := context.GetMeteringContext()
-	runtime := context.GetRuntimeContext()
-	metering.StartGasTracing(bigFloatTruncateName)
-
-	gasToUse := metering.GasSchedule().BigFloatAPICost.BigFloatTruncate
-	metering.UseAndTraceGas(gasToUse)
-
-	op, err := managedType.GetBigFloat(opHandle)
-	if context.WithFault(err, runtime.BigFloatAPIErrorShouldFailExecution()) {
-		return
-	}
-	bigIntValue := managedType.GetBigIntOrCreate(destBigIntHandle)
-
-	op.Int(bigIntValue)
-	managedType.ConsumeGasForBigIntCopy(bigIntValue)
+	gasToUse := context.GetMeteringContext().GasSchedule().BigFloatAPICost.BigFloatTruncate
+	context.bigFloatToBigInt(bigFloatTruncateName, gasToUse, destBigIntHandle, opHandle)
 }
 
 // BigFloatSetInt64 VMHooks implementation.
@@ -632,10 +654,12 @@ func (context *VMHooksImpl) BigFloatSetBigInt(destinationHandle, bigIntHandle in
 	managedType := context.GetManagedTypesContext()
 	metering := context.GetMeteringContext()
 	runtime := context.GetRuntimeContext()
-	metering.StartGasTracing(bigFloatSetBigIntName)
 
 	gasToUse := metering.GasSchedule().BigFloatAPICost.BigFloatSetBigInt
-	metering.UseAndTraceGas(gasToUse)
+	err := startTracingAndUseGas(context.host, bigFloatSetBigIntName, gasToUse)
+	if context.WithFault(err, runtime.BigFloatAPIErrorShouldFailExecution()) {
+		return
+	}
 
 	bigIntValue, err := managedType.GetBigInt(bigIntHandle)
 	// from FixAuditChangesV6 the handle is checked before the copy is charged: pre-fork a missing
@@ -644,7 +668,10 @@ func (context *VMHooksImpl) BigFloatSetBigInt(destinationHandle, bigIntHandle in
 		context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution())
 		return
 	}
-	managedType.ConsumeGasForBigIntCopy(bigIntValue)
+	// the copy faults through the BigInt API predicate on purpose: so does the GetBigInt fault above
+	if !context.consumeGasForBigIntCopy(bigIntValue) {
+		return
+	}
 	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
 		return
 	}

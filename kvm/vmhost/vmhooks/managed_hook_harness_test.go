@@ -24,7 +24,7 @@ const testMBufferNewFromBytes = 1
 
 // managedDeployMetadataCopy is what ManagedCreateContract and ManagedDeployFromSourceContract pay
 // post-fork for the code-metadata buffer they clone, on the two-byte upgradeableMetadata both
-// tables pass them. The upgrade hooks still clone theirs for free and are a declared follow-up
+// tables pass them. ManagedUpgradeFromSourceContract pays the same; ManagedUpgradeContract pays for its code too
 const managedDeployMetadataCopy = 2 * mainnetDataCopyPerByte
 
 // managedHookChildFunction is the endpoint of the child contract the calling hooks target.

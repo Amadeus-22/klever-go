@@ -190,7 +190,8 @@ func TestExecution_DeployWASM_Successful(t *testing.T) {
 		AndAssertResults(func(blockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
 			verify.Ok().
 				ReturnData([]byte("init successful")).
-				GasRemaining(226).
+				// every fork is active here, so init's getArgument pays for its 1-byte argument
+				GasRemaining(226-1).
 				Code(newAddress, input.ContractCode)
 		})
 }
@@ -1498,6 +1499,12 @@ func TestExecution_ExecuteOnSameContext_Successful(t *testing.T) {
 		childExecutionCost := uint64(437 - 22)
 		parentGasBeforeExecuteAPI := uint64(172 - 9)
 		finalCost := uint64(134)
+		// the child's getArgument copies of the 32-byte recipient and the 6-byte transfer data,
+		// charged to the parent account because the child runs on the same context
+		argCopyGas := uint64(0)
+		if fromFixAuditChangesV6(epochs) {
+			argCopyGas = 32 + 6
+		}
 
 		parentAccountBalance := int64(10000)
 		parentAccountBalanceAfter := int64(8550)
@@ -1538,7 +1545,7 @@ func TestExecution_ExecuteOnSameContext_Successful(t *testing.T) {
 				verify.WithTrace().Ok().
 					// test.ParentAddress
 					Balance(host, test.ParentAddress, parentAccountBalanceAfter).
-					GasUsed(test.ParentAddress, 906609+copyGas).
+					GasUsed(test.ParentAddress, 906609+copyGas+argCopyGas).
 					GasUsed(test.ChildAddress, 0).
 					// others
 					GasRemaining(test.GasProvided-
@@ -1547,6 +1554,7 @@ func TestExecution_ExecuteOnSameContext_Successful(t *testing.T) {
 						executeAPICost-
 						test.ChildCompilationCostSameCtx-
 						childExecutionCost-
+						argCopyGas-
 						finalCost).
 					ReturnData(returnData...).
 					Storage(
@@ -1999,10 +2007,11 @@ func TestExecution_ExecuteOnDestContext_Successful(t *testing.T) {
 		executeAPICost := uint64(54) + copyGas
 		childExecutionCost := uint64(272)
 		finalCost := uint64(808596)
-		// the child's own storage write, charged to the child account rather than to the caller
+		// the child's own storage write and its getArgument copy of the 16-byte "Second sentence.",
+		// charged to the child account rather than to the caller
 		childCopyGas := uint64(0)
 		if fromFixAuditChangesV6(epochs) {
-			childCopyGas = 41
+			childCopyGas = 41 + 16
 		}
 		// childTransferValue := int64(12)
 
@@ -2067,10 +2076,16 @@ func TestExecution_ExecuteOnDestContext_Successful_ChildReturns(t *testing.T) {
 		executeAPICost := uint64(54) + copyGas
 		childExecutionCost := uint64(272)
 		parentGasAfterExecuteAPI := uint64(793519)
-		// the child's own storage write, charged to the child account rather than to the caller
+		// the parent's getReturnData copy of the child's 11-byte "childFinish"
+		returnDataCopyGas := uint64(0)
+		if fromFixAuditChangesV6(epochs) {
+			returnDataCopyGas = 11
+		}
+		// the child's own storage write and its getArgument copy of the 16-byte "Second sentence.",
+		// charged to the child account rather than to the caller
 		childCopyGas := uint64(0)
 		if fromFixAuditChangesV6(epochs) {
-			childCopyGas = 41
+			childCopyGas = 41 + 16
 		}
 		// childTransferValue := int64(12)
 
@@ -2097,7 +2112,7 @@ func TestExecution_ExecuteOnDestContext_Successful_ChildReturns(t *testing.T) {
 				verify.Ok().
 					// test.ParentAddress
 					Balance(host, test.ParentAddress, 9703).
-					GasUsed(test.ParentAddress, 800381+copyGas).
+					GasUsed(test.ParentAddress, 800381+copyGas+returnDataCopyGas).
 					Balance(host, test.ChildAddress, 8790).
 					GasUsed(test.ChildAddress, test.ChildCompilationCostDestCtx+childExecutionCost+childCopyGas).
 					GasRemaining(test.GasProvided-
@@ -2107,7 +2122,8 @@ func TestExecution_ExecuteOnDestContext_Successful_ChildReturns(t *testing.T) {
 						test.ChildCompilationCostDestCtx-
 						childExecutionCost-
 						childCopyGas-
-						parentGasAfterExecuteAPI).
+						parentGasAfterExecuteAPI-
+						returnDataCopyGas).
 					ReturnData(test.ParentFinishA, test.ParentFinishB, []byte("succ"), test.ChildFinish, []byte("succ")).
 					Storage(
 						test.CreateStoreEntry(test.ParentAddress).WithKey(test.ParentKeyA).WithValue(test.ParentDataA),

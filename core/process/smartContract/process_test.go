@@ -2522,7 +2522,7 @@ func TestScProcessor_ProcessSCOutputAccountsRejectsProtectedKeyWrite(t *testing.
 	tx, _ := createTransactionMock(&contract, transaction.TXContract_SmartContractType, []byte("SRC"), 0, [][]byte{[]byte("data")})
 	ctx := createDefaultContext(tx)
 
-	address := []byte("output-account-address")
+	address := []byte("output-account-address-32-bytes!")
 	buildAccounts := func(offset []byte, written bool) []*vmcommon.OutputAccount {
 		return []*vmcommon.OutputAccount{
 			{
@@ -2575,7 +2575,7 @@ func TestScProcessor_ProcessSCOutputAccountsRejectsOverLimitStorageKeyWrite(t *t
 	tx, _ := createTransactionMock(&contract, transaction.TXContract_SmartContractType, []byte("SRC"), 0, [][]byte{[]byte("data")})
 	ctx := createDefaultContext(tx)
 
-	address := []byte("output-account-address")
+	address := []byte("output-account-address-32-bytes!")
 	buildAccounts := func(offset []byte, data []byte, written bool) []*vmcommon.OutputAccount {
 		return []*vmcommon.OutputAccount{
 			{
@@ -2640,4 +2640,221 @@ func TestScProcessor_ProcessSCOutputAccountsRejectsOverLimitStorageKeyWrite(t *t
 		require.NoError(t, err)
 		require.True(t, isPersisted(preForkSc, readOnlyKeyOverLimit))
 	})
+}
+
+func newOutputAccountAddressProcessor(t *testing.T, fixV6 bool) (*scProcessor, ArgsNewSmartContractProcessor) {
+	arguments := createMockSmartContractProcessorArguments()
+	if !fixV6 {
+		forkController, err := fork.NewForkController(config.EnableEpochs{FixAuditChangesV6: 100}, &commommock.EpochNotifierStub{})
+		require.Nil(t, err)
+		arguments.ForkController = forkController
+	}
+	sc, err := NewSmartContractProcessor(arguments)
+	require.Nil(t, err)
+
+	return sc, arguments
+}
+
+// userAccountExists reports whether a user account is held under address, first in the
+// accounts cacher and then, once flushed and reset, in the accounts trie
+func userAccountExists(t *testing.T, cacher state.AccountsCacher, address []byte) (bool, bool) {
+	_, errCached := cacher.GetExistingUser(address)
+	require.Nil(t, cacher.SaveAll())
+	cacher.ResetAll(true)
+	_, errStored := cacher.GetExistingUser(address)
+
+	return errCached == nil, errStored == nil
+}
+
+func TestScProcessor_ProcessSCOutputAccountsRejectsInvalidAddressLength(t *testing.T) {
+	t.Parallel()
+
+	contract := transaction.SmartContract{
+		Type:      transaction.SmartContract_SCInvoke,
+		CallValue: map[string]*transaction.CallValue{"KLV": {Amount: 0}},
+	}
+	tx, _ := createTransactionMock(&contract, transaction.TXContract_SmartContractType, []byte("SRC"), 0, [][]byte{[]byte("data")})
+
+	buildAccounts := func(address []byte) []*vmcommon.OutputAccount {
+		return []*vmcommon.OutputAccount{
+			{
+				Address: address,
+				StorageUpdates: map[string]*vmcommon.StorageUpdate{
+					"key": {Offset: []byte("key"), Data: []byte("data"), Written: true},
+				},
+			},
+		}
+	}
+
+	for _, addressLen := range []int{31, 33} {
+		address := bytes.Repeat([]byte{0x01}, addressLen)
+
+		t.Run(fmt.Sprintf("%d-byte account is rejected after FixAuditChangesV6", addressLen), func(t *testing.T) {
+			t.Parallel()
+
+			sc, arguments := newOutputAccountAddressProcessor(t, true)
+			err := sc.processSCOutputAccounts(createDefaultContext(tx), &vmcommon.VMOutput{}, buildAccounts(address))
+			require.ErrorIs(t, err, process.ErrInvalidOutputAccountAddressLength)
+
+			cached, stored := userAccountExists(t, arguments.AccountsCacher, address)
+			require.False(t, cached)
+			require.False(t, stored)
+		})
+
+		t.Run(fmt.Sprintf("%d-byte account is persisted before FixAuditChangesV6", addressLen), func(t *testing.T) {
+			t.Parallel()
+
+			sc, arguments := newOutputAccountAddressProcessor(t, false)
+			err := sc.processSCOutputAccounts(createDefaultContext(tx), &vmcommon.VMOutput{}, buildAccounts(address))
+			require.NoError(t, err)
+
+			cached, stored := userAccountExists(t, arguments.AccountsCacher, address)
+			require.True(t, cached)
+			require.True(t, stored)
+		})
+	}
+
+	for _, fixV6 := range []bool{true, false} {
+		t.Run(fmt.Sprintf("32-byte account is persisted (FixAuditChangesV6=%v)", fixV6), func(t *testing.T) {
+			t.Parallel()
+
+			address := bytes.Repeat([]byte{0x01}, 32)
+			sc, arguments := newOutputAccountAddressProcessor(t, fixV6)
+			err := sc.processSCOutputAccounts(createDefaultContext(tx), &vmcommon.VMOutput{}, buildAccounts(address))
+			require.NoError(t, err)
+
+			cached, stored := userAccountExists(t, arguments.AccountsCacher, address)
+			require.True(t, cached)
+			require.True(t, stored)
+		})
+	}
+}
+
+func TestScProcessor_ExecuteSmartContractTransactionInvalidOutputAccountAddressLength(t *testing.T) {
+	t.Parallel()
+
+	const gasLimit = uint64(1000)
+	const gasRemaining = uint64(400)
+
+	execute := func(t *testing.T, fixV6 bool, isSimulation bool, outputAddress []byte) (vmcommon.ReturnCode, kapp.KappContext, state.AccountsCacher, error) {
+		_, arguments := newOutputAccountAddressProcessor(t, fixV6)
+		arguments.ArgsParser = &contextmock.ArgumentParserMock{}
+		arguments.VmContainer = &contextmock.VMContainerMock{
+			GetCalled: func(key []byte) (vmcommon.VMExecutionHandler, error) {
+				return &contextmock.VMExecutionHandlerStub{
+					RunSmartContractCallCalled: func(input *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error) {
+						return &vmcommon.VMOutput{
+							ReturnCode:   vmcommon.Ok,
+							GasRemaining: gasRemaining,
+							OutputAccounts: map[string]*vmcommon.OutputAccount{
+								string(outputAddress): {Address: outputAddress},
+							},
+						}, nil
+					},
+				}, nil
+			},
+		}
+
+		contract := transaction.SmartContract{
+			Type:      transaction.SmartContract_SCInvoke,
+			CallValue: map[string]*transaction.CallValue{"KLV": {Amount: 45}},
+			Address:   core.ZeroAddress,
+		}
+		tx, _ := createTransactionMock(&contract, transaction.TXContract_SmartContractType, []byte("SRC"), 0, [][]byte{[]byte("abba@0500@0000")})
+		tx.GasLimit = gasLimit
+
+		computedHash, err := tools.CalculateHash(arguments.Marshalizer, arguments.Hasher, tx.RawData)
+		require.Nil(t, err)
+
+		ctx := kapp.NewKappContext(kapp.ArgsNewKAppContext{
+			OriginalSender: tx.GetSender(),
+			ContractID:     0,
+			ContractType:   tx.RawData.GetContract()[0].Type,
+			Block:          &block.Block{},
+			TxHash:         computedHash,
+			TX:             tx,
+			IsScSimulation: isSimulation,
+		})
+
+		tc, err := tx.RawData.Contract[ctx.ContractID()].GetSmartContract()
+		require.Nil(t, err)
+
+		arguments.BlockChainHook = &contextmock.BlockchainHookStub{
+			GetKAppControllerCalled: func() kapp.KAppController {
+				kappCtrl, errCtrl := kappcontroller.NewKappController(kappcontroller.ArgsNewKApp{
+					Hasher:         arguments.Hasher,
+					Marshalizer:    arguments.Marshalizer,
+					PubkeyConv:     arguments.PubkeyConv,
+					ForkController: arguments.ForkController,
+					AccountsCacher: arguments.AccountsCacher,
+					RatingsData:    &commommock.RatingsInfoMock{},
+				})
+				require.Nil(t, errCtrl)
+				_ = kappCtrl.GetAccountsKApp().SetAccountsCacher(arguments.AccountsCacher)
+				_ = kappCtrl.GetAccountsKApp().SetKAppController(kappCtrl)
+				_ = kappCtrl.GetKDAKApp().SetAccountsCacher(arguments.AccountsCacher)
+				_ = kappCtrl.GetKDAKApp().SetKAppController(kappCtrl)
+				kappCtrl.SetCurrentKAppContext(ctx)
+
+				return kappCtrl
+			},
+		}
+
+		sc, err := NewSmartContractProcessor(arguments)
+		require.Nil(t, err)
+
+		acntSrc, acntDst := initAccounts(tx, arguments.AccountsCacher, contract.CallValue["KLV"].Amount*2)
+		acntDst.SetCode([]byte("code"))
+
+		returnCode, err := sc.ExecuteSmartContractTransaction(ctx, tc, acntSrc, acntDst)
+		return returnCode, ctx, arguments.AccountsCacher, err
+	}
+
+	shortAddress := bytes.Repeat([]byte{0x01}, 31)
+
+	// the address check runs before processSCOutputAccounts' simulation guard, so each case runs on
+	// both paths: in a simulation, and in a real execution, which also saves storage updates
+	for _, isSimulation := range []bool{true, false} {
+		mode := fmt.Sprintf("simulation=%v", isSimulation)
+
+		t.Run(mode+"/short output account fails the transaction and charges the full gas after FixAuditChangesV6", func(t *testing.T) {
+			t.Parallel()
+
+			returnCode, ctx, cacher, err := execute(t, true, isSimulation, shortAddress)
+			require.Equal(t, vmcommon.VMExecutionFailed, returnCode)
+			require.EqualError(t, err, process.ErrInvalidOutputAccountAddressLength.Error())
+			require.Zero(t, ctx.GetGasLimit())
+
+			cached, stored := userAccountExists(t, cacher, shortAddress)
+			require.False(t, cached)
+			require.False(t, stored)
+		})
+
+		t.Run(mode+"/short output account succeeds before FixAuditChangesV6", func(t *testing.T) {
+			t.Parallel()
+
+			returnCode, ctx, cacher, err := execute(t, false, isSimulation, shortAddress)
+			require.Equal(t, vmcommon.Ok, returnCode)
+			require.NoError(t, err)
+			require.Equal(t, gasRemaining, ctx.GetGasLimit())
+
+			cached, stored := userAccountExists(t, cacher, shortAddress)
+			require.True(t, cached)
+			require.True(t, stored)
+		})
+
+		t.Run(mode+"/32-byte output account succeeds after FixAuditChangesV6", func(t *testing.T) {
+			t.Parallel()
+
+			address := bytes.Repeat([]byte{0x01}, 32)
+			returnCode, ctx, cacher, err := execute(t, true, isSimulation, address)
+			require.Equal(t, vmcommon.Ok, returnCode)
+			require.NoError(t, err)
+			require.Equal(t, gasRemaining, ctx.GetGasLimit())
+
+			cached, stored := userAccountExists(t, cacher, address)
+			require.True(t, cached)
+			require.True(t, stored)
+		})
+	}
 }

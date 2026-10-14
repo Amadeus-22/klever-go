@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	goruntime "runtime"
 	"testing"
 	"time"
 
@@ -497,7 +498,7 @@ func TestVMHooksImpl_WriteEventLog_TracesGasOnce(t *testing.T) {
 // overdrawing, and BaseOpsErrorShouldFailExecution true as in production, so a shortfall is
 // observable as the error the hook fails the execution with.
 func newMockVMHostWithRealMetering(
-	t *testing.T,
+	t testing.TB,
 	fixAuditChangesV6 bool,
 	gasMap map[string]map[string]uint64,
 	gasProvided uint64,
@@ -581,6 +582,17 @@ func TestVMHooksImpl_CopyGas_SameBeforeAndFromV6(t *testing.T) {
 	addressGas := gasMap["BaseOperationCost"]["DataCopyPerByte"] * uint64(len(address))
 	// the managed deploy hooks also pay for the code-metadata buffer they clone
 	metadataGas := gasMap["BaseOperationCost"]["DataCopyPerByte"] * uint64(len(codeMetadata))
+	// the KDA reads also pay for the records the stub below hands back, as decoded; the roles read
+	// passes no address, so for the KDAData alone
+	stubKDA := func() *kapps.KDAData {
+		// Properties and Attributes are dereferenced unconditionally
+		return &kapps.KDAData{Properties: &kapps.PropertiesData{}, Attributes: &kapps.AttributesData{}}
+	}
+	stubUser := func() *kapps.UserKDA { return &kapps.UserKDA{Balance: 1} }
+	// literal encoded sizes: the stub KDAData (empty Properties and Attributes messages) is 6 bytes,
+	// and the stub UserKDA (Balance 1) 2 more, so a proto.Size change breaks this table
+	kdaReadGas := gasMap["BaseOperationCost"]["DataCopyPerByte"] * 8
+	kdaRolesGas := gasMap["BaseOperationCost"]["DataCopyPerByte"] * 6
 
 	tests := []struct {
 		name           string
@@ -618,25 +630,25 @@ func TestVMHooksImpl_CopyGas_SameBeforeAndFromV6(t *testing.T) {
 		{"GetCallValueByTokenName", gasMap["BaseOpsAPICost"]["GetCallValue"], 0, tokenIDGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
 			hooks.GetCallValueByTokenName(resultPtr, codePtr, codeLen)
 		}},
-		{"GetKDABalance", gasMap["BaseOpsAPICost"]["GetExternalBalance"], 0, tokenIDGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
+		{"GetKDABalance", gasMap["BaseOpsAPICost"]["GetExternalBalance"], 0, tokenIDGas + kdaReadGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
 			hooks.GetKDABalance(addressPtr, codePtr, codeLen, 0, resultPtr)
 		}},
 		{"ManagedGetKDACallValue", gasMap["BaseOpsAPICost"]["GetCallValue"], 0, tokenIDGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
 			hooks.ManagedGetKDACallValue(outHandle, tokenIDHandle)
 		}},
-		{"ManagedGetKDABalance", gasMap["BaseOpsAPICost"]["GetExternalBalance"], 0, addressGas + tokenIDGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
+		{"ManagedGetKDABalance", gasMap["BaseOpsAPICost"]["GetExternalBalance"], 0, addressGas + tokenIDGas + kdaReadGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
 			hooks.ManagedGetKDABalance(addressHandle, tokenIDHandle, 0, outHandle)
 		}},
-		{"ManagedGetUserKDA", gasMap["BaseOpsAPICost"]["GetUserKDA"], 0, addressGas + tokenIDGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
+		{"ManagedGetUserKDA", gasMap["BaseOpsAPICost"]["GetUserKDA"], 0, addressGas + tokenIDGas + kdaReadGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
 			hooks.ManagedGetUserKDA(addressHandle, tokenIDHandle, 0,
 				outHandle, outHandle, outHandle, outHandle, outHandle, outHandle)
 		}},
-		{"ManagedGetKDATokenData", gasMap["BaseOpsAPICost"]["GetKDATokenData"], 0, addressGas + tokenIDGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
+		{"ManagedGetKDATokenData", gasMap["BaseOpsAPICost"]["GetKDATokenData"], 0, addressGas + tokenIDGas + kdaReadGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
 			hooks.ManagedGetKDATokenData(addressHandle, tokenIDHandle, 0,
 				outHandle, outHandle, outHandle, outHandle, outHandle, outHandle, outHandle, outHandle,
 				outHandle, outHandle, outHandle, outHandle, outHandle, outHandle, outHandle, outHandle, outHandle)
 		}},
-		{"ManagedGetKDARoles", gasMap["BaseOpsAPICost"]["GetKDARoles"], 0, tokenIDGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
+		{"ManagedGetKDARoles", gasMap["BaseOpsAPICost"]["GetKDARoles"], 0, tokenIDGas + kdaRolesGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
 			hooks.ManagedGetKDARoles(tokenIDHandle, outHandle)
 		}},
 		{"ManagedGetSftMetadata", gasMap["BaseOpsAPICost"]["GetSFTMetadata"], 0, tokenIDGas, true, 0, func(hooks *vmhooks.VMHooksImpl) {
@@ -661,7 +673,7 @@ func TestVMHooksImpl_CopyGas_SameBeforeAndFromV6(t *testing.T) {
 		// budget one short of the first is what the shortfall half needs
 		{"BigIntGetKDAExternalBalance",
 			bigIntCost["BigIntGetExternalBalance"] + gasMap["BaseOpsAPICost"]["GetExternalBalance"],
-			0, tokenIDGas, true, bigIntCost["BigIntGetExternalBalance"],
+			0, tokenIDGas + kdaReadGas, true, bigIntCost["BigIntGetExternalBalance"],
 			func(hooks *vmhooks.VMHooksImpl) {
 				hooks.BigIntGetKDAExternalBalance(addressPtr, codePtr, codeLen, 0, valueHandle)
 			}},
@@ -705,11 +717,7 @@ func TestVMHooksImpl_CopyGas_SameBeforeAndFromV6(t *testing.T) {
 					blockchain.GetKDATokenCalled =
 						func(_ []byte, _ []byte, _ uint64) (*kapps.KDAData, *kapps.UserKDA, error) {
 							sideEffects++
-							// Properties and Attributes are dereferenced unconditionally
-							return &kapps.KDAData{
-								Properties: &kapps.PropertiesData{},
-								Attributes: &kapps.AttributesData{},
-							}, &kapps.UserKDA{Balance: 1}, nil
+							return stubKDA(), stubUser(), nil
 						}
 					blockchain.GetSFTMetaCalled = func(_ []byte, _ uint64) (*kapps.MetaV2, error) {
 						sideEffects++
@@ -2273,5 +2281,355 @@ func TestVMHooksImpl_GetReturnData(t *testing.T) {
 				assert.Equal(t, tt.returnData[tt.index], stored)
 			}
 		})
+	}
+}
+
+// argumentGetterGasMap prices the argument and return data getters with distinct values, so a test
+// can tell a fixed cost from a per-byte one and DataCopyPerByte from CopyPerByteForTooBig
+func argumentGetterGasMap() config.GasScheduleMap {
+	gasMap := config.MakeGasMapForTests()
+	gasMap["BigIntAPICost"]["BigIntGetUnsignedArgument"] = 11
+	gasMap["BigIntAPICost"]["BigIntGetSignedArgument"] = 13
+	gasMap["BigIntAPICost"]["CopyPerByteForTooBig"] = 7
+	gasMap["BaseOpsAPICost"]["Int64GetArgument"] = 17
+	gasMap["BaseOpsAPICost"]["GetArgument"] = 19
+	gasMap["BaseOpsAPICost"]["GetReturnData"] = 23
+	gasMap["BaseOperationCost"]["DataCopyPerByte"] = 50
+	return gasMap
+}
+
+// argumentGetterGasCase is one hook that copies a whole call argument or return data item, sized
+// by the caller rather than by the contract, for runArgumentGetterGasCases
+type argumentGetterGasCase struct {
+	fixedCost uint64
+	// perByteFromV6 is what the hook charges, from FixAuditChangesV6, for an item of argLen bytes
+	perByteFromV6 func(argLen int) uint64
+	// badIndexErr is the fault an out-of-range index raises; nil for a hook that returns silently
+	badIndexErr error
+	// failed is what the hook returns when it copies nothing
+	failed int64
+	// returnData serves the item as return data instead of as a call argument
+	returnData bool
+	call       func(hooks *vmhooks.VMHooksImpl, id int32) int64
+	// assertCopied checks the hook's result and destination after it copied arg
+	assertCopied func(t *testing.T, host *contextmock.VMHostMock, result int64, arg []byte)
+	// assertUntouched checks the destination holds nothing the hook could have copied
+	assertUntouched func(t *testing.T, host *contextmock.VMHostMock)
+}
+
+// argumentGetterDestPtr is where the legacy getters write; it is pre-filled with
+// argumentGetterSentinel, sized to hold the oversized argument, so an unpaid copy shows up
+const argumentGetterDestPtr = executor.MemPtr(0)
+
+var (
+	argumentGetterSmallArg = []byte{0x01, 0x02, 0x03}
+	// 100 KB of leading zeros: still the small value, so the int getters parse it as before, but
+	// far past the 32 bytes CopyPerByteForTooBig lets through for free
+	argumentGetterOversizedArg = append(make([]byte, 100_000), argumentGetterSmallArg...)
+	argumentGetterSentinel     = bytes.Repeat([]byte{0xEE}, len(argumentGetterOversizedArg))
+)
+
+func assertArgumentGetterMemoryCopied(t *testing.T, host *contextmock.VMHostMock, result int64, arg []byte) {
+	t.Helper()
+	assert.Equal(t, int64(len(arg)), result)
+	stored, err := host.MemLoadFromMock(argumentGetterDestPtr, len(arg))
+	require.NoError(t, err)
+	assert.Equal(t, arg, stored)
+}
+
+func assertArgumentGetterMemoryUntouched(t *testing.T, host *contextmock.VMHostMock) {
+	t.Helper()
+	stored, err := host.MemLoadFromMock(argumentGetterDestPtr, len(argumentGetterSentinel))
+	require.NoError(t, err)
+	assert.Equal(t, argumentGetterSentinel, stored, "contract memory must not change for an unpaid copy")
+}
+
+// Before FixAuditChangesV6 the argument and return data getters charge a flat cost whatever the size
+// of what they copy, and charge it unbounded; from it the flat cost is bounded and the copy is paid
+// for, bounded, before it happens. Pre-fork every total and every effect must stay as it was, or
+// blocks from before the fork would stop replaying. From the fork a budget one short of either
+// charge must fault with ErrNotEnoughGas and leave the destination as it was.
+func runArgumentGetterGasCases(t *testing.T, tc argumentGetterGasCase) {
+	t.Helper()
+
+	const plentyOfGas = uint64(100_000_000)
+	small, oversized := argumentGetterSmallArg, argumentGetterOversizedArg
+
+	type scenario struct {
+		name        string
+		arg         []byte
+		id          int32
+		gasProvided uint64
+		// failErr is the fault expected, nil for none; a fault drains the gas left, so the
+		// points are only checked when there is none
+		failErr error
+		// pointsUsed is checked when failErr is nil
+		pointsUsed uint64
+		copied     bool
+	}
+
+	for _, fixV6 := range []bool{false, true} {
+		perByte := func(arg []byte) uint64 {
+			if !fixV6 {
+				return 0
+			}
+			return tc.perByteFromV6(len(arg))
+		}
+
+		scenarios := []scenario{
+			{"small", small, 0, plentyOfGas, nil, tc.fixedCost + perByte(small), true},
+			{"oversized", oversized, 0, plentyOfGas, nil, tc.fixedCost + perByte(oversized), true},
+			{"badIndex", small, 1, plentyOfGas, tc.badIndexErr, tc.fixedCost, false},
+		}
+		if fixV6 {
+			scenarios = append(scenarios,
+				scenario{"fixedShortfall", small, 0, tc.fixedCost - 1, vmhost.ErrNotEnoughGas, 0, false},
+				scenario{"perByteShortfall", oversized, 0, tc.fixedCost + tc.perByteFromV6(len(oversized)) - 1,
+					vmhost.ErrNotEnoughGas, 0, false},
+			)
+		} else {
+			// pre-fork the flat cost overdraws and the copy is free, so neither budget stops it
+			scenarios = append(scenarios,
+				scenario{"fixedShortfall", small, 0, tc.fixedCost - 1, nil, tc.fixedCost, true},
+				scenario{"perByteShortfall", oversized, 0, tc.fixedCost + tc.perByteFromV6(len(oversized)) - 1,
+					nil, tc.fixedCost, true},
+			)
+		}
+
+		for _, sc := range scenarios {
+			t.Run(fmt.Sprintf("FixAuditChangesV6=%v/%s", fixV6, sc.name), func(t *testing.T) {
+				host, _ := newMockVMHostWithRealMetering(t, fixV6, argumentGetterGasMap(), sc.gasProvided)
+				runtime := host.RuntimeContext.(*contextmock.RuntimeContextMock)
+				if tc.returnData {
+					host.OutputContext.(*contextmock.OutputContextStub).ReturnDataCalled = func() [][]byte {
+						return [][]byte{sc.arg}
+					}
+				} else {
+					runtime.VMInput = &vmcommon.ContractCallInput{VMInput: vmcommon.VMInput{Arguments: [][]byte{sc.arg}}}
+				}
+				require.NoError(t, host.MemStoreToMock(argumentGetterDestPtr, argumentGetterSentinel))
+
+				result := tc.call(vmhooks.NewVMHooksImpl(host), sc.id)
+
+				if sc.failErr != nil {
+					require.ErrorIs(t, runtime.FailExecutionErr, sc.failErr)
+				} else {
+					require.Nil(t, runtime.FailExecutionErr)
+					assert.Equal(t, sc.pointsUsed, runtime.GetPointsUsed())
+				}
+
+				if sc.copied {
+					tc.assertCopied(t, host, result, sc.arg)
+					return
+				}
+				assert.Equal(t, tc.failed, result)
+				tc.assertUntouched(t, host)
+			})
+		}
+	}
+}
+
+func TestVMHooksImpl_GetArgument_GasPerByteFromV6(t *testing.T) {
+	t.Parallel()
+
+	gasMap := argumentGetterGasMap()
+	runArgumentGetterGasCases(t, argumentGetterGasCase{
+		fixedCost: gasMap["BaseOpsAPICost"]["GetArgument"],
+		perByteFromV6: func(argLen int) uint64 {
+			return uint64(argLen) * gasMap["BaseOperationCost"]["DataCopyPerByte"]
+		},
+		badIndexErr: vmhost.ErrInvalidArgument,
+		failed:      -1,
+		call: func(hooks *vmhooks.VMHooksImpl, id int32) int64 {
+			return int64(hooks.GetArgument(id, argumentGetterDestPtr))
+		},
+		assertCopied:    assertArgumentGetterMemoryCopied,
+		assertUntouched: assertArgumentGetterMemoryUntouched,
+	})
+}
+
+func TestVMHooksImpl_GetReturnData_GasPerByteFromV6(t *testing.T) {
+	t.Parallel()
+
+	gasMap := argumentGetterGasMap()
+	runArgumentGetterGasCases(t, argumentGetterGasCase{
+		fixedCost: gasMap["BaseOpsAPICost"]["GetReturnData"],
+		perByteFromV6: func(argLen int) uint64 {
+			return uint64(argLen) * gasMap["BaseOperationCost"]["DataCopyPerByte"]
+		},
+		badIndexErr: vmhost.ErrInvalidArgument,
+		failed:      0,
+		returnData:  true,
+		call: func(hooks *vmhooks.VMHooksImpl, id int32) int64 {
+			return int64(hooks.GetReturnData(id, argumentGetterDestPtr))
+		},
+		assertCopied:    assertArgumentGetterMemoryCopied,
+		assertUntouched: assertArgumentGetterMemoryUntouched,
+	})
+}
+
+// flatCloneGasMap prices the hooks that used to clone a caller-sized handle for a flat cost with
+// distinct values, so a test can tell each fixed cost apart from DataCopyPerByte
+func flatCloneGasMap() config.GasScheduleMap {
+	gasMap := config.MakeGasMapForTests()
+	gasMap["BigIntAPICost"]["BigIntUnsignedByteLength"] = 29
+	gasMap["BigIntAPICost"]["BigIntSignedByteLength"] = 31
+	gasMap["BaseOpsAPICost"]["GetArgument"] = 19
+	gasMap["ManagedMapAPICost"]["ManagedMapContains"] = 37
+	gasMap["BaseOpsAPICost"]["GetCodeMetadata"] = 41
+	gasMap["ManagedBufferAPICost"]["MBufferSetBytes"] = 43
+	gasMap["BaseOpsAPICost"]["Int64Finish"] = 47
+	gasMap["BaseOpsAPICost"]["GetOwnerAddress"] = 53
+	gasMap["BaseOperationCost"]["DataCopyPerByte"] = 50
+	return gasMap
+}
+
+const (
+	// flatCloneOversizedLen is the size of the oversized inputs: a clone of it is plain in the
+	// allocation count, which flatCloneNoCloneBelow is far below
+	flatCloneOversizedLen = 1 << 20
+	flatCloneNoCloneBelow = flatCloneOversizedLen / 4
+	flatCloneGasProvided  = uint64(10_000_000_000)
+)
+
+// newFlatCloneHost is a mock host on the real metering and managed types, priced by
+// flatCloneGasMap, where every API predicate the flat clone hooks use fails execution on an error
+func newFlatCloneHost(t *testing.T, fixV6 bool) (*contextmock.VMHostMock, *contextmock.RuntimeContextMock) {
+	t.Helper()
+	host, _ := newMockVMHostWithRealMetering(t, fixV6, flatCloneGasMap(), flatCloneGasProvided)
+	runtime := host.RuntimeContext.(*contextmock.RuntimeContextMock)
+	runtime.FailManagedMapAPI = true
+	return host, runtime
+}
+
+// perByteHookGasMap prices the hooks that charge per byte after the work (until FixAuditChangesV6)
+// with distinct fixed costs on top of flatCloneGasMap, and PersistPerByte as in gasScheduleV1
+func perByteHookGasMap() config.GasScheduleMap {
+	gasMap := flatCloneGasMap()
+	gasMap["ManagedMapAPICost"]["ManagedMapPut"] = 59
+	gasMap["ManagedMapAPICost"]["ManagedMapGet"] = 61
+	gasMap["ManagedMapAPICost"]["ManagedMapRemove"] = 67
+	gasMap["BigIntAPICost"]["BigIntFinishUnsigned"] = 71
+	gasMap["BigIntAPICost"]["BigIntFinishSigned"] = 73
+	gasMap["BaseOpsAPICost"]["SignalError"] = 79
+	gasMap["BaseOperationCost"]["PersistPerByte"] = 1_000
+	// the real schedule prices an oversized BigInt operand well above a copied byte; keeping that
+	// ratio lets BigIntToString's operandShortfall be refused by the operand charge, not the digits
+	gasMap["BigIntAPICost"]["CopyPerByteForTooBig"] = 1_000
+	return gasMap
+}
+
+// newPerByteHost is newFlatCloneHost priced by perByteHookGasMap, with the managed buffer API
+// failing execution on an error too, and an output that records what is finished
+func newPerByteHost(t *testing.T, fixV6 bool) (*contextmock.VMHostMock, *contextmock.RuntimeContextMock, *[][]byte) {
+	t.Helper()
+	host, _ := newMockVMHostWithRealMetering(t, fixV6, perByteHookGasMap(), flatCloneGasProvided)
+	runtime := host.RuntimeContext.(*contextmock.RuntimeContextMock)
+	runtime.FailManagedMapAPI = true
+	runtime.FailManagedBuffersAPI = true
+	finished := &[][]byte{}
+	host.OutputContext = &contextmock.OutputContextStub{FinishCalled: func(data []byte) {
+		*finished = append(*finished, data)
+	}}
+	return host, runtime, finished
+}
+
+// runFlatCloneHook calls hook with budget gas left, and returns the gas it used and the bytes it
+// allocated. Only for tests that are not parallel, or the other tests' allocations count too
+func runFlatCloneHook(host vmhost.VMHost, budget uint64, hook func()) (uint64, uint64) {
+	metering := host.Metering()
+	metering.UseGas(metering.GasLeft() - budget)
+	pointsBefore := host.Runtime().GetPointsUsed()
+
+	var before, after goruntime.MemStats
+	goruntime.GC()
+	goruntime.ReadMemStats(&before)
+	hook()
+	goruntime.ReadMemStats(&after)
+
+	return host.Runtime().GetPointsUsed() - pointsBefore, after.TotalAlloc - before.TotalAlloc
+}
+
+// ValidateTokenIdentifier cloned the whole buffer to check it, for a flat cost. From
+// FixAuditChangesV6 the flat cost is bounded and a buffer longer than any token identifier is
+// answered 0 without the clone: every result and every gas total stay as they were. Not parallel:
+// it counts allocations
+func TestVMHooksImpl_ValidateTokenIdentifier_NoCloneFromV6(t *testing.T) {
+	fixedCost := flatCloneGasMap()["BaseOpsAPICost"]["GetArgument"]
+	maxLen := vmcommon.TokenIdentifierMaxLength
+	oversized := bytes.Repeat([]byte{'A'}, flatCloneOversizedLen)
+
+	type scenario struct {
+		name    string
+		tokenID []byte
+		missing bool
+		budget  uint64
+		failErr error
+		result  int32
+		cloned  bool
+	}
+	validate := func(tokenID []byte) int32 {
+		if vmcommon.ValidateToken(tokenID) {
+			return 1
+		}
+		return 0
+	}
+
+	for _, fixV6 := range []bool{false, true} {
+		scenarios := []scenario{
+			{name: "official", tokenID: []byte("KLV"), result: 1},
+			{name: "generated", tokenID: generateAssetIdentifier(), result: 1},
+			{name: "maxLength", tokenID: []byte("ABCDEFGHIJ-1A2B")},
+			{name: "maxLengthBadTicker", tokenID: append(bytes.Repeat([]byte{'a'}, maxLen-5), []byte("-1A2B")...)},
+			{name: "maxLengthPlusOne", tokenID: []byte("ABCDEFGHIJK-1A2B")},
+			{name: "oversized", tokenID: oversized, cloned: !fixV6},
+			{name: "missing", missing: true, failErr: vmhost.ErrNoManagedBufferUnderThisHandle, result: -1},
+		}
+		if fixV6 {
+			scenarios = append(scenarios,
+				scenario{name: "fixedShortfall", tokenID: oversized, budget: fixedCost - 1,
+					failErr: vmhost.ErrNotEnoughGas, result: -1})
+		} else {
+			// pre-fork the flat cost overdraws and the hook carries on
+			scenarios = append(scenarios,
+				scenario{name: "fixedShortfall", tokenID: oversized, budget: fixedCost - 1, cloned: true})
+		}
+
+		for _, sc := range scenarios {
+			t.Run(fmt.Sprintf("FixAuditChangesV6=%v/%s", fixV6, sc.name), func(t *testing.T) {
+				host, runtime := newFlatCloneHost(t, fixV6)
+				handle := int32(1234)
+				if !sc.missing {
+					handle = host.ManagedTypes().NewManagedBufferFromBytes(sc.tokenID)
+					if sc.failErr == nil {
+						sc.result = validate(sc.tokenID)
+					}
+				}
+				budget := sc.budget
+				if budget == 0 {
+					budget = 1_000_000
+				}
+
+				var result int32
+				gasUsed, allocated := runFlatCloneHook(host, budget, func() {
+					result = vmhooks.NewVMHooksImpl(host).ValidateTokenIdentifier(handle)
+				})
+
+				assert.Equal(t, sc.result, result)
+				if sc.failErr != nil {
+					require.ErrorIs(t, runtime.FailExecutionErr, sc.failErr)
+				} else {
+					require.Nil(t, runtime.FailExecutionErr)
+					assert.Equal(t, fixedCost, gasUsed)
+				}
+				if len(sc.tokenID) == flatCloneOversizedLen {
+					if sc.cloned {
+						assert.GreaterOrEqual(t, allocated, uint64(flatCloneOversizedLen))
+					} else {
+						assert.Less(t, allocated, uint64(flatCloneNoCloneBelow), "the buffer must not be cloned")
+					}
+				}
+			})
+		}
 	}
 }
