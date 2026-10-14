@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/klever-io/klever-go/common"
+	"github.com/klever-io/klever-go/common/types"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
 	"github.com/klever-io/klever-go/core/process"
@@ -447,6 +448,39 @@ func (k *kdaKapp) checkDepositPauseAndTransferControls(sender []byte, asset, cur
 	return transaction.Transaction_Ok, nil
 }
 
+// expiredResidualAccount returns the account an expired FPR residual is paid to: the staking asset's
+// owner once FixAuditChangesV6 is active, the depositor before it. The owner can be any address, so
+// its account is loaded the way a transfer destination is.
+func (k *kdaKapp) expiredResidualAccount(depositorAcc state.UserAccountHandler, asset *kapps.KDAData) (state.UserAccountHandler, error) {
+	if !k.forkController.FixAuditChangesV6() || bytes.Equal(asset.GetOwnerAddress(), depositorAcc.AddressBytes()) {
+		return depositorAcc, nil
+	}
+
+	return k.LoadUserAccount(asset.GetOwnerAddress())
+}
+
+// refundExpiredFPR pays the unclaimed residual of one currency of an expired FPR entry and records
+// the Transfer receipt for it.
+func (k *kdaKapp) refundExpiredFPR(recipient state.UserAccountHandler, amount int64, currencyID []byte) error {
+	if err := recipient.AddToBalance(amount, currencyID, k.forkController.EnableSmartContracts()); err != nil {
+		return err
+	}
+
+	ctx := k.KAppController.GetCurrentKAppContext()
+	ctx.Receipts().Add(txProcess.NewReceipt(
+		txProcess.Transfer,
+		ctx.ContractID(),
+		core.ZeroAddress,
+		recipient.AddressBytes(),
+		[]byte(strconv.FormatInt(amount, 10)),
+		currencyID,
+		nil,
+		[]byte{byte(kapps.KDAData_Fungible)},
+	))
+
+	return nil
+}
+
 func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
@@ -504,13 +538,18 @@ func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (trans
 		return transaction.Transaction_AssetTypeInvalid, common.ErrAssetTypeInvalid
 	}
 
-	ownerAcc, err := k.GetExistingUserAccount(sender)
+	depositorAcc, err := k.GetExistingUserAccount(sender)
 	if err != nil {
 		return transaction.Transaction_LoadAccountError, err
 	}
 
-	if err := ownerAcc.SubFromBalance(tc.GetAmount(), currencyID, k.forkController.EnableSmartContracts()); err != nil {
+	if err := depositorAcc.SubFromBalance(tc.GetAmount(), currencyID, k.forkController.EnableSmartContracts()); err != nil {
 		return transaction.Transaction_BalanceError, err
+	}
+
+	residualAcc, err := k.expiredResidualAccount(depositorAcc, kda)
+	if err != nil {
+		return transaction.Transaction_LoadAccountError, err
 	}
 
 	validFPRs := make([]*kapps.FPRData, 0)
@@ -540,42 +579,20 @@ func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (trans
 		//pay expired KLV
 		expiredKLV := fpr.TotalAmount - fpr.TotalClaimed
 		if expiredKLV > 0 {
-			err = ownerAcc.AddToBalance(expiredKLV, nil, k.forkController.EnableSmartContracts())
-			if err != nil {
+			if err := k.refundExpiredFPR(residualAcc, expiredKLV, kdautils.KLVIdentifier); err != nil {
 				return transaction.Transaction_AssetError, err
 			}
-
-			ctx.Receipts().Add(txProcess.NewReceipt(
-				txProcess.Transfer,
-				ctx.ContractID(),
-				core.ZeroAddress,
-				ownerAcc.AddressBytes(),
-				[]byte(strconv.FormatInt(expiredKLV, 10)),
-				kdautils.KLVIdentifier,
-				nil,
-				[]byte{byte(kapps.KDAData_Fungible)},
-			))
 		}
 
 		//pay expired KDAS
-		for key, value := range fpr.GetKDAS() {
+		kdas := fpr.GetKDAS()
+		for _, key := range types.OrderedKeys(kdas, k.forkController.FixAuditChangesV6()) {
+			value := kdas[key]
 			expiredKDA := value.TotalAmount - value.TotalClaimed
 			if expiredKDA > 0 {
-				err = ownerAcc.AddToBalance(expiredKDA, []byte(key), k.forkController.EnableSmartContracts())
-				if err != nil {
+				if err := k.refundExpiredFPR(residualAcc, expiredKDA, []byte(key)); err != nil {
 					return transaction.Transaction_AssetError, err
 				}
-
-				ctx.Receipts().Add(txProcess.NewReceipt(
-					txProcess.Transfer,
-					ctx.ContractID(),
-					core.ZeroAddress,
-					ownerAcc.AddressBytes(),
-					[]byte(strconv.FormatInt(expiredKDA, 10)),
-					[]byte(key),
-					nil,
-					[]byte{byte(kapps.KDAData_Fungible)},
-				))
 			}
 		}
 	}
@@ -589,7 +606,7 @@ func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (trans
 	ctx.Receipts().Add(txProcess.NewReceipt(
 		txProcess.Deposit,
 		ctx.ContractID(),
-		ownerAcc.AddressBytes(),
+		depositorAcc.AddressBytes(),
 		[]byte(strconv.FormatInt(int64(transaction.DepositContract_FPRDeposit.Number()), 10)),
 		[]byte(strconv.FormatInt(tc.GetAmount(), 10)),
 		assetID,

@@ -5,8 +5,10 @@ import (
 
 	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/common/mock"
+	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
 	"github.com/klever-io/klever-go/core/process"
+	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	txProcess "github.com/klever-io/klever-go/core/process/transaction"
 	"github.com/klever-io/klever-go/data/block"
 	"github.com/klever-io/klever-go/data/transaction"
@@ -299,7 +301,7 @@ func forkCases(t *testing.T, run func(t *testing.T, kc kapp.KAppController, v6 b
 }
 
 // Scenario 2, deposit side: a paused reward currency does not hold the pool of another asset, so its
-// expired residual still goes back to the depositor on both sides of the fork.
+// expired residual is still paid on both sides of the fork. The depositor here is the asset's owner.
 func TestKDAKapp_DepositPaysTheExpiredResidualOfAPausedRewardCurrency(t *testing.T) {
 	t.Parallel()
 
@@ -322,6 +324,166 @@ func TestKDAKapp_DepositPaysTheExpiredResidualOfAPausedRewardCurrency(t *testing
 		require.NoError(t, err)
 		require.Len(t, staking.FPR, 1)
 		assert.Equal(t, uint32(201), staking.FPR[0].GetEpoch())
+	})
+}
+
+// setStakingAssetOwner hands the staking asset to another owner and gives the deposit role to the
+// depositor, who holds 10 of the asset and nothing else.
+func setStakingAssetOwner(t *testing.T, kc kapp.KAppController, owner, depositor []byte) {
+	t.Helper()
+
+	cacher := kc.GetKDAKApp().GetAccountsCacher()
+
+	kdaKapp, asset, err := kc.GetKDAKApp().GetKDA(defaultAssetID)
+	require.NoError(t, err)
+	asset.OwnerAddress = owner
+	asset.Roles = append(asset.Roles, &kapps.RolesData{Address: depositor, HasRoleDeposit: true})
+	require.NoError(t, kc.GetKDAKApp().SetKDA(kdaKapp, defaultAssetID, asset))
+	require.NoError(t, cacher.UpdateKapp(kdaKapp))
+
+	acc, err := cacher.LoadUser(depositor)
+	require.NoError(t, err)
+	require.NoError(t, acc.AddToBalance(10, defaultAssetID, true, nil))
+	require.NoError(t, cacher.UpdateUser(acc))
+}
+
+// balanceOf is the balance of an account that may not exist yet.
+func balanceOf(t *testing.T, kc kapp.KAppController, address, assetID []byte) int64 {
+	t.Helper()
+
+	acc, err := kc.GetKDAKApp().GetAccountsCacher().GetExistingUser(address)
+	if err != nil {
+		return 0
+	}
+
+	return acc.GetBalance(assetID, true)
+}
+
+// After the fork the expired residual of every currency is paid to the staking asset's owner,
+// whatever account that is; before the fork it is paid to whoever deposits next.
+func TestKDAKapp_DepositPaysTheExpiredResidualToTheStakingAssetOwner(t *testing.T) {
+	t.Parallel()
+
+	contractOwner := makeAddress("")
+	copy(contractOwner[core.NumInitCharactersForScAddress-core.VMTypeLen:], common.WasmVirtualMachine)
+	copy(contractOwner[core.NumInitCharactersForScAddress:], "contract-owner")
+	require.True(t, core.IsSmartContractAddress(contractOwner))
+
+	tests := []struct {
+		name  string
+		owner []byte
+	}{
+		{name: "an owner with an account", owner: defaultSender},
+		{name: "an owner with no account yet", owner: makeAddress("ghost-owner")},
+		{name: "an owner in the smart contract address format", owner: contractOwner},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			forkCases(t, func(t *testing.T, kc kapp.KAppController, v6 bool) {
+				depositor := defaultOtherSender
+
+				createStakingAsset(t, kc, transaction.StakingInfo_FPRI)
+				registerRewardCurrency(t, kc, false, nil)
+				setStakingAssetOwner(t, kc, tt.owner, depositor)
+				overwriteFPR(t, kc, expiredFPRWithRewardCurrency())
+
+				currencies := [][]byte{nil, defaultAssetID, rewardCurrencyID}
+				residual := []int64{60, 20, 250}
+				ownerBefore := make([]int64, len(currencies))
+				depositorBefore := make([]int64, len(currencies))
+				for i, currency := range currencies {
+					ownerBefore[i] = balanceOf(t, kc, tt.owner, currency)
+					depositorBefore[i] = balanceOf(t, kc, depositor, currency)
+				}
+
+				// MaxEpochsUnclaimed defaults to 100, so epoch 200 leaves the epoch 0 entry expired
+				setBlockEpoch(kc, 200)
+				code, err := kc.GetKDAKApp().Deposit(depositor, &transaction.DepositContract{
+					ID:         defaultAssetID,
+					CurrencyID: defaultAssetID,
+					Amount:     10,
+				})
+				require.NoError(t, err)
+				require.Equal(t, transaction.Transaction_Ok, code)
+
+				paid, notPaid := depositor, tt.owner
+				if v6 {
+					paid, notPaid = tt.owner, depositor
+				}
+
+				// the depositor spent the 10 of the staking asset it deposited
+				depositorBefore[1] -= 10
+				for i, currency := range currencies {
+					ownerAfter, depositorAfter := ownerBefore[i], depositorBefore[i]
+					if v6 {
+						ownerAfter += residual[i]
+					} else {
+						depositorAfter += residual[i]
+					}
+					assert.Equal(t, ownerAfter, balanceOf(t, kc, tt.owner, currency))
+					assert.Equal(t, depositorAfter, balanceOf(t, kc, depositor, currency))
+				}
+
+				receipts := kc.GetCurrentKAppContext().Receipts().GetByType(int8(txProcess.Transfer))
+				require.Len(t, receipts, 3)
+				for _, receipt := range receipts {
+					assert.Equal(t, paid, receipt.Data[2])
+					assert.NotEqual(t, notPaid, receipt.Data[2])
+				}
+				// after the fork the KDA receipts follow the sorted currency IDs, not map order
+				if v6 {
+					wantOrder := [][]byte{kdautils.KLVIdentifier, rewardCurrencyID, defaultAssetID}
+					for i, receipt := range receipts {
+						assert.Equal(t, wantOrder[i], receipt.Data[4])
+					}
+				}
+
+				_, staking, err := kc.GetKDAKApp().GetStaking(defaultAssetID)
+				require.NoError(t, err)
+				require.Len(t, staking.FPR, 1)
+				assert.Equal(t, uint32(201), staking.FPR[0].GetEpoch())
+			})
+		})
+	}
+}
+
+// An entry with nothing left to pay credits the owner nothing and records no Transfer receipt. The
+// owner's account is resolved up front once FixAuditChangesV6 is active, so it is loaded there even
+// though nothing is paid; before the fork it is never touched.
+func TestKDAKapp_DepositWithNoResidualPaysTheOwnerNothing(t *testing.T) {
+	t.Parallel()
+
+	forkCases(t, func(t *testing.T, kc kapp.KAppController, v6 bool) {
+		ghostOwner := makeAddress("ghost-owner")
+
+		createStakingAsset(t, kc, transaction.StakingInfo_FPRI)
+		setStakingAssetOwner(t, kc, ghostOwner, defaultOtherSender)
+		overwriteFPR(t, kc, []*kapps.FPRData{{
+			Epoch:        0,
+			TotalAmount:  100,
+			TotalClaimed: 100,
+			KDAS:         map[string]*kapps.KDAFPRData{string(defaultAssetID): {TotalAmount: 30, TotalClaimed: 30}},
+		}})
+
+		setBlockEpoch(kc, 200)
+		code, err := kc.GetKDAKApp().Deposit(defaultOtherSender, &transaction.DepositContract{
+			ID:         defaultAssetID,
+			CurrencyID: defaultAssetID,
+			Amount:     10,
+		})
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, code)
+
+		ownerAcc, err := kc.GetKDAKApp().GetAccountsCacher().GetExistingUser(ghostOwner)
+		if v6 {
+			require.NoError(t, err)
+			assert.Zero(t, ownerAcc.GetBalance(defaultAssetID, true))
+		} else {
+			require.Error(t, err)
+		}
+		assert.Empty(t, kc.GetCurrentKAppContext().Receipts().GetByType(int8(txProcess.Transfer)))
 	})
 }
 

@@ -1605,7 +1605,8 @@ func TestStakingTxProcessor_KDA_FPRClaim_Unfreeze_Before_Maturity_PreFix(t *test
 
 	c := NewController(t)
 	// Activate FixStakingBuckets only; keep FixAuditChangesV3 inactive to reproduce the bug.
-	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV3: math.MaxUint32})
+	// FixAuditChangesV6 stays inactive too: from it on the expired pool goes to the asset's owner.
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV3: math.MaxUint32, FixAuditChangesV6: math.MaxUint32})
 	c.AddUser(RefAddress, initialKLVBalance, nil)
 	c.AddUser(OwnerAddress, initialFPRBalance, FPRIdentifier)
 	c.AddUser(OwnerAddress, initialKLVBalance, nil)
@@ -1920,7 +1921,8 @@ func expireTopUpPool(t *testing.T, c *Controller, blk *block.Block) {
 
 func TestStakingTxProcessor_KDA_FPRClaim_TopUpBeforeMaturity_RawTx_PreFix(t *testing.T) {
 	c := NewController(t)
-	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV5: math.MaxUint32})
+	// FixAuditChangesV6 stays inactive too: from it on the expired pool goes to the asset's owner.
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV5: math.MaxUint32, FixAuditChangesV6: math.MaxUint32})
 
 	blk := stakeFPRAndDepositReward(t, c)
 	topUpWhileClaimWindowShut(t, c, blk, topUpRewardEpoch)
@@ -1959,6 +1961,141 @@ func TestStakingTxProcessor_KDA_FPRClaim_TopUpBeforeMaturity_RawTx_PostFix(t *te
 	expireTopUpPool(t, c, blk)
 	c.CheckBalance(RefAddress, kdautils.KLVIdentifier,
 		topUpInitialKLV-topUpRewardPool-topUpExpiryDeposit)
+}
+
+const (
+	residualRefFPR  = int64(1_000_000)
+	residualFPRPool = int64(200_000)
+)
+
+func depositFPRReward(t *testing.T, c *Controller, blk *block.Block, sender, currencyID []byte, amount int64) {
+	t.Helper()
+
+	runStakingContractTx(t, c, blk, &transaction.DepositContract{
+		DepositType: transaction.DepositContract_FPRDeposit,
+		ID:          FPRIdentifier,
+		CurrencyID:  currencyID,
+		Amount:      amount,
+	}, transaction.TXContract_DepositContractType, sender, nil)
+}
+
+// fundUnclaimedFPRPool has RefAddress, a holder of the deposit role that does not own the asset,
+// fund the reward epoch with topUpRewardPool of KLV and residualFPRPool of the staked asset.
+// Nobody claims it, so the whole pool is the residual once the epoch expires.
+func fundUnclaimedFPRPool(t *testing.T, c *Controller) *block.Block {
+	t.Helper()
+
+	c.AddUser(RefAddress, residualRefFPR, FPRIdentifier)
+	blk := stakeFPRAndDepositReward(t, c)
+	depositFPRReward(t, c, blk, RefAddress, FPRIdentifier, residualFPRPool)
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	require.Equal(t, residualFPRPool, staking.FPR[0].KDAS[string(FPRIdentifier)].TotalAmount)
+
+	return blk
+}
+
+func checkFPRResidualBalances(c *Controller, refKLV, refFPR, ownerKLV, ownerFPR int64) {
+	c.CheckBalance(RefAddress, kdautils.KLVIdentifier, refKLV)
+	c.CheckBalance(RefAddress, FPRIdentifier, refFPR)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, ownerKLV)
+	c.CheckBalance(OwnerAddress, FPRIdentifier, ownerFPR)
+}
+
+// Before FixAuditChangesV6 the expired residual of every currency is paid to whoever deposits next.
+func TestStakingTxProcessor_KDA_FPRExpiredResidual_PaidToTheNextDepositor_PreFork(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	blk := fundUnclaimedFPRPool(t, c)
+	expireTopUpPool(t, c, blk)
+
+	checkFPRResidualBalances(c,
+		topUpInitialKLV-topUpExpiryDeposit, residualRefFPR,
+		topUpInitialKLV, topUpInitialFPR-topUpBaseStake)
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	assert.Equal(t, topUpExpiryEpoch+1, staking.FPR[0].Epoch)
+}
+
+// From FixAuditChangesV6 on the expired residual of every currency is paid to the staking asset's
+// owner, and the depositor that triggered the expiry only pays its own deposit.
+func TestStakingTxProcessor_KDA_FPRExpiredResidual_PaidToTheAssetOwner_PostFork(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	blk := fundUnclaimedFPRPool(t, c)
+	expireTopUpPool(t, c, blk)
+
+	checkFPRResidualBalances(c,
+		topUpInitialKLV-topUpRewardPool-topUpExpiryDeposit, residualRefFPR-residualFPRPool,
+		topUpInitialKLV+topUpRewardPool, topUpInitialFPR-topUpBaseStake+residualFPRPool)
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	assert.Equal(t, topUpExpiryEpoch+1, staking.FPR[0].Epoch)
+}
+
+// When the owner is the one that deposits next, the residual reaches the same account on both
+// sides of the fork.
+func TestStakingTxProcessor_KDA_FPRExpiredResidual_OwnerDepositsNext(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		v6   uint32
+	}{
+		{name: "pre fork", v6: math.MaxUint32},
+		{name: "post fork", v6: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewController(t)
+			c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: tt.v6})
+
+			blk := fundUnclaimedFPRPool(t, c)
+			blk.Header.Epoch = topUpExpiryEpoch
+			depositFPRReward(t, c, blk, OwnerAddress, kdautils.KLVIdentifier, topUpExpiryDeposit)
+
+			checkFPRResidualBalances(c,
+				topUpInitialKLV-topUpRewardPool, residualRefFPR-residualFPRPool,
+				topUpInitialKLV+topUpRewardPool-topUpExpiryDeposit, topUpInitialFPR-topUpBaseStake+residualFPRPool)
+		})
+	}
+}
+
+// The same pool crosses the fork: the epoch that expires before FixAuditChangesV6 pays the
+// depositor, the one that expires after it pays the owner.
+func TestStakingTxProcessor_KDA_FPRExpiredResidual_AcrossTheFork(t *testing.T) {
+	const (
+		secondPool        = int64(300_000)
+		secondExpiryEpoch = topUpExpiryEpoch + 102
+	)
+
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	blk := fundUnclaimedFPRPool(t, c)
+
+	// pre fork: the deposit that funds the second pool expires the first one, and collects it
+	blk.Header.Epoch = topUpExpiryEpoch
+	depositFPRReward(t, c, blk, RefAddress, kdautils.KLVIdentifier, secondPool)
+	checkFPRResidualBalances(c,
+		topUpInitialKLV-secondPool, residualRefFPR,
+		topUpInitialKLV, topUpInitialFPR-topUpBaseStake)
+
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	// post fork: the second pool expires on the next deposit, and goes to the owner
+	blk.Header.Epoch = secondExpiryEpoch
+	depositFPRReward(t, c, blk, RefAddress, kdautils.KLVIdentifier, topUpExpiryDeposit)
+	checkFPRResidualBalances(c,
+		topUpInitialKLV-secondPool-topUpExpiryDeposit, residualRefFPR,
+		topUpInitialKLV+secondPool, topUpInitialFPR-topUpBaseStake)
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	assert.Equal(t, secondExpiryEpoch+1, staking.FPR[0].Epoch)
+	assert.Equal(t, topUpExpiryDeposit, staking.FPR[0].TotalAmount)
 }
 
 func TestStakingTxProcessor_KDA_FPRClaim_RepeatedTopUpsKeepClaimWindow_PostFix(t *testing.T) {
@@ -2476,8 +2613,9 @@ func TestStakingTxProcessor_KDA_FPRClaim_UnfreezeBeforeMaturity_RawTx_PreFix(t *
 		expiryDeposit     = int64(1)
 	)
 	c := NewController(t)
-	// Disable FixAuditChangesV3 to reproduce the pre-fix behavior.
-	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV3: math.MaxUint32})
+	// Disable FixAuditChangesV3 to reproduce the pre-fix behavior. FixAuditChangesV6 stays
+	// inactive too: from it on the expired pool goes to the asset's owner.
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV3: math.MaxUint32, FixAuditChangesV6: math.MaxUint32})
 	c.AddUser(OwnerAddress, initialKLVBalance, kdautils.KLVIdentifier)
 	c.AddUser(OwnerAddress, initialFPRBalance, FPRIdentifier)
 	c.AddUser(RefAddress, initialKLVBalance, kdautils.KLVIdentifier)
