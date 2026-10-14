@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"math"
 	"math/big"
 	"testing"
 
@@ -839,6 +840,28 @@ func TestReadBigUint(t *testing.T) {
 		result, err := readBigUint(buf)
 		assert.Nil(t, result)
 		assert.ErrorContains(t, err, "unexpected EOF")
+	})
+	t.Run("Saturates values wider than 64 bits", func(t *testing.T) {
+		data := []byte{0, 0, 0, 9, 1, 0, 0, 0, 0, 0, 0, 0, 5}
+		result, err := readBigUint(bytes.NewReader(data))
+		assert.NoError(t, err)
+		assert.Equal(t, new(big.Int).SetUint64(math.MaxUint64), result)
+		assert.Equal(t, int64(-1), result.Int64())
+	})
+
+	t.Run("Saturates exactly 2^64", func(t *testing.T) {
+		data := []byte{0, 0, 0, 9, 1, 0, 0, 0, 0, 0, 0, 0, 0}
+		result, err := readBigUint(bytes.NewReader(data))
+		assert.NoError(t, err)
+		assert.Equal(t, new(big.Int).SetUint64(math.MaxUint64), result)
+		assert.Equal(t, int64(-1), result.Int64())
+	})
+
+	t.Run("Zero padded value", func(t *testing.T) {
+		data := []byte{0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 5}
+		result, err := readBigUint(bytes.NewReader(data))
+		assert.NoError(t, err)
+		assert.Equal(t, big.NewInt(5), result)
 	})
 }
 
