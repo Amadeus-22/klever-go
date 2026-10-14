@@ -29,6 +29,7 @@ import (
 	"github.com/klever-io/klever-go/tools/marshal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 const MaxGasLimitPerBlock = uint64(100000)
@@ -556,8 +557,10 @@ func TestTransactionPreprocessor_GetAllTxsFromBlockShouldWork(t *testing.T) {
 	assert.Equal(t, len(txsSlice), len(txsRetrieved))
 	assert.Equal(t, len(txsSlice), len(txHashesRetrieved))
 	for idx, tx := range txsSlice {
-		//txReceived should be all txs in the same order
-		assert.Equal(t, txsRetrieved[idx], tx)
+		//txReceived should be all txs in the same order, as candidate-local copies
+		//rather than the pooled objects themselves
+		assert.NotSame(t, tx, txsRetrieved[idx])
+		assert.True(t, proto.Equal(tx, txsRetrieved[idx]))
 		//verify corresponding transaction hashes
 		assert.Equal(t, txHashesRetrieved[idx], computeHash(tx, marshalizer, hasher))
 	}
@@ -1175,4 +1178,309 @@ func TestTransactions_CreateAndProcessBlock_SkipsSenderAfterHigherNonce(t *testi
 	require.False(t, processed[string(gappedSender)], "no tx from the gapped sender may reach ProcessTransaction")
 	require.True(t, processed[string(healthySender)], "the skip must be scoped to the gapped sender")
 	require.Equal(t, 1, processResult.Length(), "only the healthy sender's tx should be included in the proposed block")
+}
+
+// TestTransactions_RejectedCandidateLeavesPooledTxUntouched covers CertiK KLR-64 and
+// KLR-69, which are the same defect seen from two sides: block validation used to
+// execute against the transaction objects the pool stores, and no rejection path undid
+// those writes.
+//
+// Candidate A fails T during execution, which stamps Result = FAILED. A is then
+// rejected, so T never became ledger state. The pooled object must carry none of that:
+// a leftover FAILED made the next candidate count T as processed although it never
+// executed (KLR-64), and a leftover Block made the API report T as on-chain with
+// receipts from the discarded block (KLR-69).
+func TestTransactions_RejectedCandidateLeavesPooledTxUntouched(t *testing.T) {
+	t.Parallel()
+
+	pooledTx := &transaction.Transaction{
+		RawData: &transaction.Transaction_Raw{Version: 0, Nonce: 1, Sender: []byte("addr1"), Data: [][]byte{}},
+	}
+	poolHolders := createCacheWithTransactions(t, []*txcache.WrappedTransaction{
+		{TxHash: []byte("TX_T"), Tx: pooledTx},
+	})
+
+	txs := createGoodPreprocessor(poolHolders)
+	blkA := &block.Block{Header: &block.BlockHeader{Nonce: 42}, TxHashes: [][]byte{[]byte("TX_T")}}
+	haveTime := func() bool { return true }
+
+	// Candidate A: T fails during execution. ProcessTransaction writes the execution
+	// metadata a real processor would before reporting the failure.
+	txs.GetTXProcessor().(*mock.TxProcessorMock).ProcessTransactionCalled = func(blk *block.Block, txHash []byte, tx *transaction.Transaction) error {
+		tx.Block = blk.GetNonce()
+		tx.ResultCode = transaction.Transaction_FeeInvalid
+		tx.Receipts = []*transaction.Transaction_Receipt{{Data: [][]byte{[]byte("receipt")}}}
+		return errors.New("execution failed")
+	}
+
+	// An executed failure is legitimately counted - it still pays fees and belongs in
+	// the block. A is rejected afterwards, by the fee-total or processed-count check in
+	// the coordinator, which is where the leak used to survive.
+	processResult, err := txs.ProcessBlockTransactions(blkA, haveTime)
+	assert.Nil(t, err)
+	assert.Equal(t, 1, processResult.Length())
+
+	// Candidate A was rejected. The pooled object must be pristine.
+	assert.Equal(t, transaction.Transaction_SUCCESS, pooledTx.Result)
+	assert.Equal(t, transaction.Transaction_Ok, pooledTx.ResultCode)
+	assert.Equal(t, uint64(0), pooledTx.Block)
+	assert.Empty(t, pooledTx.Receipts)
+}
+
+// TestTransactions_PrecheckRejectionAfterFailedCandidateIsNotCounted is the
+// two-candidate scenario from KLR-64. Candidate A stamps T as FAILED and is rejected.
+// In candidate B a valid same-sender transaction precedes T, so T is rejected by the
+// nonce precheck before it ever executes. With the stale FAILED on the shared object,
+// the bad-tx branch was skipped and T's hash was still counted as processed, letting
+// this node accept a block a clean validator rejects.
+func TestTransactions_PrecheckRejectionAfterFailedCandidateIsNotCounted(t *testing.T) {
+	t.Parallel()
+
+	pooledTx := &transaction.Transaction{
+		RawData: &transaction.Transaction_Raw{Version: 0, Nonce: 1, Sender: []byte("addr1"), Data: [][]byte{}},
+	}
+	poolHolders := createCacheWithTransactions(t, []*txcache.WrappedTransaction{
+		{TxHash: []byte("TX_T"), Tx: pooledTx},
+	})
+
+	txs := createGoodPreprocessor(poolHolders)
+	haveTime := func() bool { return true }
+	txProc := txs.GetTXProcessor().(*mock.TxProcessorMock)
+
+	// Candidate A: T fails during execution and is stamped FAILED, then A is rejected.
+	txProc.ProcessTransactionCalled = func(blk *block.Block, txHash []byte, tx *transaction.Transaction) error {
+		tx.Result = transaction.Transaction_FAILED
+		return errors.New("execution failed")
+	}
+	_, err := txs.ProcessBlockTransactions(&block.Block{Header: &block.BlockHeader{Nonce: 42}, TxHashes: [][]byte{[]byte("TX_T")}}, haveTime)
+	assert.Nil(t, err)
+	assert.Equal(t, transaction.Transaction_SUCCESS, pooledTx.Result)
+
+	// Candidate B: T is rejected by the precheck, before any execution.
+	txs.CreateBlockStarted()
+	txProc.PreProcessTransactionCalled = func(tx *transaction.Transaction) (state.UserAccountHandler, []byte, error) {
+		return nil, nil, process.ErrLowerNonceInTransaction
+	}
+	txProc.ProcessTransactionCalled = func(blk *block.Block, txHash []byte, tx *transaction.Transaction) error {
+		assert.Fail(t, "a precheck-rejected transaction must not be executed")
+		return nil
+	}
+
+	processResult, err := txs.ProcessBlockTransactions(&block.Block{Header: &block.BlockHeader{Nonce: 43}, TxHashes: [][]byte{[]byte("TX_T")}}, haveTime)
+	assert.Nil(t, err)
+	assert.Equal(t, 0, processResult.Length())
+}
+
+// A hash repeated in one block whose first run fails: the second run is nonce-rejected.
+// Before FixAuditChangesV6 both entries share the pooled pointer, so the second inherits
+// FAILED and is counted, as on older binaries; the gate keeps a mixed fleet in agreement.
+func TestTransactions_DuplicateHashCountingIsForkGated(t *testing.T) {
+	t.Parallel()
+
+	run := func(t *testing.T, fixAuditChangesV6 bool) int {
+		poolHolders := createCacheWithTransactions(t, []*txcache.WrappedTransaction{
+			{TxHash: []byte("TX_T"), Tx: &transaction.Transaction{
+				RawData: &transaction.Transaction_Raw{Version: 0, Nonce: 1, Sender: []byte("addr1"), Data: [][]byte{}},
+			}},
+		})
+		forkController := commonMock.NewForkControllerStub().SetFork("FixAuditChangesV6", fixAuditChangesV6)
+		txs := createGoodPreprocessorWithFork(poolHolders, forkController)
+		txProc := txs.GetTXProcessor().(*mock.TxProcessorMock)
+
+		preProcessed := 0
+		txProc.PreProcessTransactionCalled = func(tx *transaction.Transaction) (state.UserAccountHandler, []byte, error) {
+			preProcessed++
+			if preProcessed > 1 {
+				return nil, nil, process.ErrLowerNonceInTransaction
+			}
+			return nil, nil, nil
+		}
+		txProc.ProcessTransactionCalled = func(blk *block.Block, txHash []byte, tx *transaction.Transaction) error {
+			return errors.New("execution failed")
+		}
+
+		blk := &block.Block{Header: &block.BlockHeader{Nonce: 42}, TxHashes: [][]byte{[]byte("TX_T"), []byte("TX_T")}}
+		processResult, err := txs.ProcessBlockTransactions(blk, func() bool { return true })
+		require.NoError(t, err)
+
+		return processResult.Length()
+	}
+
+	t.Run("before FixAuditChangesV6", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, 2, run(t, false))
+	})
+	t.Run("from FixAuditChangesV6", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, 1, run(t, true))
+	})
+}
+
+// Block processing only gas-stamps copies now, so a restored tx must keep its stored gas:
+// the proposer's tx selection reads GasLimit from the pooled object.
+func TestTransactions_RestoreBlockDataIntoPoolsKeepsGas(t *testing.T) {
+	t.Parallel()
+
+	marshalizer := &commonMock.MarshalizerMock{}
+	storedTx := &transaction.Transaction{
+		RawData:       &transaction.Transaction_Raw{Nonce: 1, Sender: []byte("addr1")},
+		GasLimit:      123,
+		GasMultiplier: 4,
+		Block:         7,
+		Result:        transaction.Transaction_FAILED,
+	}
+	txBuff, err := marshalizer.Marshal(storedTx)
+	require.NoError(t, err)
+
+	var restored *transaction.Transaction
+	preprocessor, err := preprocess.NewTransactionPreprocessor(
+		&commonMock.ShardedDataStub{
+			AddDataCalled: func(_ []byte, data interface{}, _ int, _ string) {
+				restored = data.(*transaction.Transaction)
+			},
+		},
+		&commonMock.ChainStorerMock{
+			GetAllCalled: func(_ retriever.UnitType, _ [][]byte) (map[string][]byte, error) {
+				return map[string][]byte{"TX_T": txBuff}, nil
+			},
+			GetStorerCalled: func(_ retriever.UnitType) storage.Storer {
+				return &commonMock.StorerStub{RemoveCalled: func(_ []byte) error { return nil }}
+			},
+		},
+		&commonMock.HasherMock{},
+		marshalizer,
+		&mock.TxProcessorMock{},
+		&commonMock.AccountsStub{},
+		&commonMock.AccountsStub{},
+		&commonMock.AccountsStub{},
+		func(txHashes [][]byte) {},
+		&commonMock.FeeHandlerStub{},
+		createMockPubkeyConverter(),
+		newForkController(),
+	)
+	require.NoError(t, err)
+
+	_, err = preprocessor.RestoreBlockDataIntoPools(&block.Block{Header: &block.BlockHeader{}, TxHashes: [][]byte{[]byte("TX_T")}})
+	require.NoError(t, err)
+
+	require.NotNil(t, restored)
+	assert.Equal(t, uint64(123), restored.GasLimit)
+	assert.Equal(t, uint64(4), restored.GasMultiplier)
+	assert.Equal(t, uint64(0), restored.Block)
+	assert.Equal(t, transaction.Transaction_SUCCESS, restored.Result)
+}
+
+// The proposer path must execute against copies too: its own execution leaves no
+// metadata on the pooled object (KLR-69). The second half is a guard only - the old
+// proposer path also cleared a stale FAILED, via PrepareForProcessing on the pooled tx.
+func TestTransactions_CreateAndProcessBlockLeavesPooledTxUntouched(t *testing.T) {
+	t.Parallel()
+
+	pooledTx := &transaction.Transaction{
+		RawData: &transaction.Transaction_Raw{Version: 0, Nonce: 1, Sender: []byte("addr1"), Data: [][]byte{}},
+	}
+	poolHolders := createCacheWithTransactions(t, []*txcache.WrappedTransaction{
+		{TxHash: []byte("TX_T"), Tx: pooledTx},
+	})
+
+	txs := createGoodPreprocessor(poolHolders)
+	haveTime := func() bool { return true }
+	txProc := txs.GetTXProcessor().(*mock.TxProcessorMock)
+
+	txProc.ProcessTransactionCalled = func(blk *block.Block, txHash []byte, tx *transaction.Transaction) error {
+		tx.Block = blk.GetNonce()
+		tx.ResultCode = transaction.Transaction_FeeInvalid
+		tx.Receipts = []*transaction.Transaction_Receipt{{Data: [][]byte{[]byte("receipt")}}}
+		return errors.New("execution failed")
+	}
+	processResult, err := txs.CreateAndProcessBlockTransactions(&block.Block{Header: &block.BlockHeader{Nonce: 42}}, haveTime)
+	require.NoError(t, err)
+	require.Equal(t, 1, processResult.Length())
+	require.True(t, proto.Equal(&transaction.Transaction{RawData: pooledTx.RawData}, pooledTx), "pooled tx must keep its proto defaults")
+
+	pooledTx.Result = transaction.Transaction_FAILED
+	txs.CreateBlockStarted()
+	txProc.PreProcessTransactionCalled = func(tx *transaction.Transaction) (state.UserAccountHandler, []byte, error) {
+		return nil, nil, process.ErrLowerNonceInTransaction
+	}
+	processResult, err = txs.CreateAndProcessBlockTransactions(&block.Block{Header: &block.BlockHeader{Nonce: 43}}, haveTime)
+	require.NoError(t, err)
+	require.Equal(t, 0, processResult.Length())
+}
+
+// KLC-2806: verifiers bound a block's declared gas from FixAuditChangesV6 and accept it unchanged before.
+func TestTransactions_ProcessBlockTransactionsGasBoundIsForkGated(t *testing.T) {
+	t.Parallel()
+
+	run := func(t *testing.T, fixAuditChangesV6 bool) (int, error) {
+		poolHolders := createCacheWithTransactions(t, []*txcache.WrappedTransaction{
+			{TxHash: []byte("TX_A"), Tx: &transaction.Transaction{
+				RawData: &transaction.Transaction_Raw{Nonce: 1, Sender: []byte("addr1"), Data: [][]byte{}},
+			}},
+			{TxHash: []byte("TX_B"), Tx: &transaction.Transaction{
+				RawData: &transaction.Transaction_Raw{Nonce: 1, Sender: []byte("addr2"), Data: [][]byte{}},
+			}},
+		})
+		forkController := commonMock.NewForkControllerStub().SetFork("FixAuditChangesV6", fixAuditChangesV6)
+		txs := createGoodPreprocessorWithFork(poolHolders, forkController)
+		txs.GetEconomicsFee().(*commonMock.FeeHandlerStub).MaxGasLimitPerBlockValue = 100
+		txProc := txs.GetTXProcessor().(*mock.TxProcessorMock)
+		txProc.PreProcessTransactionCalled = func(tx *transaction.Transaction) (state.UserAccountHandler, []byte, error) {
+			tx.GasLimit = 60
+			return nil, nil, nil
+		}
+		txProc.ProcessTransactionCalled = func(_ *block.Block, _ []byte, _ *transaction.Transaction) error {
+			return nil
+		}
+
+		blk := &block.Block{Header: &block.BlockHeader{Nonce: 42}, TxHashes: [][]byte{[]byte("TX_A"), []byte("TX_B")}}
+		processResult, err := txs.ProcessBlockTransactions(blk, func() bool { return true })
+
+		return processResult.Length(), err
+	}
+
+	t.Run("before FixAuditChangesV6", func(t *testing.T) {
+		t.Parallel()
+		numTxs, err := run(t, false)
+		require.NoError(t, err)
+		assert.Equal(t, 2, numTxs)
+	})
+	t.Run("from FixAuditChangesV6", func(t *testing.T) {
+		t.Parallel()
+		_, err := run(t, true)
+		assert.ErrorIs(t, err, process.ErrMaxGasLimitPerBlockExceeded)
+	})
+}
+
+// KLC-2806: a tx over the block gas left is skipped with its sender's next nonces, and the
+// skipped txs stay pooled with their gas, so the next slot's selection still counts it.
+func TestTransactions_CreateAndProcessBlockSkipsTxOverGasBound(t *testing.T) {
+	t.Parallel()
+
+	first := &transaction.Transaction{RawData: &transaction.Transaction_Raw{Nonce: 1, Sender: []byte("addr1"), Data: [][]byte{}}, GasLimit: 7}
+	second := &transaction.Transaction{RawData: &transaction.Transaction_Raw{Nonce: 2, Sender: []byte("addr1"), Data: [][]byte{}}, GasLimit: 7}
+	poolHolders := createCacheWithTransactions(t, []*txcache.WrappedTransaction{
+		{TxHash: []byte("TX_1"), Tx: first},
+		{TxHash: []byte("TX_2"), Tx: second},
+	})
+	forkController := commonMock.NewForkControllerStub().SetFork("FixAuditChangesV6", true)
+	txs := createGoodPreprocessorWithFork(poolHolders, forkController)
+	txs.GetEconomicsFee().(*commonMock.FeeHandlerStub).MaxGasLimitPerBlockValue = 100
+
+	preProcessed := 0
+	txs.GetTXProcessor().(*mock.TxProcessorMock).PreProcessTransactionCalled = func(tx *transaction.Transaction) (state.UserAccountHandler, []byte, error) {
+		preProcessed++
+		tx.GasLimit = 150
+		return nil, nil, nil
+	}
+
+	processResult, err := txs.CreateAndProcessBlockTransactions(&block.Block{Header: &block.BlockHeader{Nonce: 42}}, func() bool { return true })
+	require.NoError(t, err)
+	assert.Equal(t, 0, processResult.Length())
+	assert.Equal(t, 1, preProcessed, "the sender's next nonce must not run")
+
+	cache := poolHolders.Transactions().ShardDataStore("0").(*txcache.TxCache)
+	assert.Equal(t, uint64(2), cache.CountTx())
+	assert.Equal(t, uint64(7), first.GasLimit)
+	assert.Equal(t, uint64(7), second.GasLimit)
 }

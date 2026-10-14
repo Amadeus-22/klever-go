@@ -130,7 +130,8 @@ func (tlp *txLogProcessor) Clean() {
 	tlp.mut.Unlock()
 }
 
-// SaveLog takes the VM logs and saves them into the correct format in storage
+// SaveLog converts the VM logs and stages them in the RAM cache for the current block:
+// SaveLogsToStorage persists them from CommitBlock, and Clean discards a rejected block's logs
 func (tlp *txLogProcessor) SaveLog(txHash []byte, acntSender []byte, tc data.SmartContractHandler, contractID int, logEntries []*vmcommon.LogEntry) error {
 	if len(txHash) == 0 {
 		return process.ErrNilTxHash
@@ -160,14 +161,28 @@ func (tlp *txLogProcessor) SaveLog(txHash []byte, acntSender []byte, tc data.Sma
 		})
 	}
 
+	// Cache only; SaveLogsToStorage persists after the block passes validation.
 	tlp.saveLogToCache(txHash, txLog)
 
-	buff, err := tlp.marshalizer.Marshal(txLog)
-	if err != nil {
-		return err
+	return nil
+}
+
+// SaveLogsToStorage persists the logs cached for the current block. CommitBlock calls
+// it once the block has passed validation. A failed log does not stop the rest; the
+// first error is returned.
+func (tlp *txLogProcessor) SaveLogsToStorage() error {
+	var firstErr error
+	for _, logData := range tlp.GetAllCurrentLogs() {
+		buff, err := tlp.marshalizer.Marshal(logData.LogHandler)
+		if err == nil {
+			err = tlp.storer.Put([]byte(logData.TxHash), buff)
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 
-	return tlp.storer.Put(txHash, buff)
+	return firstErr
 }
 
 func (tlp *txLogProcessor) saveLogToCache(txHash []byte, log *transaction.Log) {

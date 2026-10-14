@@ -26,16 +26,22 @@ const maxEncodedAddressLength = 62
 // GetTransaction gets the transaction based on the given hash. It will search in the cache and the storage and
 // will return the transaction in a format which can be respected by all types of transactions (normal, reward or unsigned)
 func (n *ProcessorNode) GetTransaction(txHash []byte, withResults bool) (*api.Transaction, error) {
+	// Committed storage first, as in Node.GetTransaction.
+	stx, errStorage := n.getTransactionFromStorage(txHash)
+	if errStorage == nil {
+		return stx, nil
+	}
+
 	tx, err := n.optionallyGetTransactionFromPool(txHash)
 	if err != nil {
 		return nil, err
 	}
 
-	if tx != nil {
-		return n.prepareNormalTx(tx)
+	if tx == nil {
+		return nil, errStorage
 	}
 
-	return n.getTransactionFromStorage(txHash)
+	return n.prepareNormalTx(tx, api.TRANSACTION_STATUS_PENDING)
 }
 
 func (n *ProcessorNode) validateCreateTransactionInputs(
@@ -201,10 +207,10 @@ func (n *ProcessorNode) unmarshalTransaction(txBytes []byte) (*api.Transaction, 
 	if err != nil {
 		return nil, err
 	}
-	return n.prepareNormalTx(&tx)
+	return n.prepareNormalTx(&tx, api.TRANSACTION_STATUS_ON_CHAIN)
 }
 
-func (n *ProcessorNode) prepareNormalTx(tx *transaction.Transaction) (*api.Transaction, error) {
+func (n *ProcessorNode) prepareNormalTx(tx *transaction.Transaction, status string) (*api.Transaction, error) {
 
 	hash, err := tools.CalculateHash(n.InternalMarshalizer, n.Hasher, tx.RawData)
 	if err != nil {
@@ -214,11 +220,6 @@ func (n *ProcessorNode) prepareNormalTx(tx *transaction.Transaction) (*api.Trans
 	signature := make([]string, 0)
 	for _, s := range tx.Signature {
 		signature = append(signature, hex.EncodeToString(s))
-	}
-
-	status := api.TRANSACTION_STATUS_PENDING
-	if tx.Block > 0 {
-		status = api.TRANSACTION_STATUS_ON_CHAIN
 	}
 
 	return &api.Transaction{

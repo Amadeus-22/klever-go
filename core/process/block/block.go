@@ -782,6 +782,13 @@ func (mp *metaProcessor) CommitBlock(
 
 	mp.saveBody(header)
 
+	// SC logs are cached during execution and persisted only once the block has
+	// passed validation. Not critical: a missing log costs an API detail, never state.
+	errNotCriticalLogs := mp.txCoordinator.SaveLogsToStorage()
+	if errNotCriticalLogs != nil {
+		log.Debug("txCoordinator.SaveLogsToStorage", "error", errNotCriticalLogs.Error())
+	}
+
 	err = mp.commitAll()
 	if err != nil {
 		return err

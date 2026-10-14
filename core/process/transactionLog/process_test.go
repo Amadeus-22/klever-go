@@ -89,8 +89,8 @@ func TestTxLogProcessor_SaveLogsMarshalErr(t *testing.T) {
 	logs := []*vmcommon.LogEntry{
 		{Address: []byte("first log")},
 	}
-	err := txLogProcessor.SaveLog([]byte("txhash"), []byte{}, &transaction.SmartContract{}, 0, logs)
-	require.Equal(t, retErr, err)
+	require.Nil(t, txLogProcessor.SaveLog([]byte("txhash"), []byte{}, &transaction.SmartContract{}, 0, logs))
+	require.Equal(t, retErr, txLogProcessor.SaveLogsToStorage())
 }
 
 func TestTxLogProcessor_SaveLogsStoreErr(t *testing.T) {
@@ -112,8 +112,8 @@ func TestTxLogProcessor_SaveLogsStoreErr(t *testing.T) {
 	logs := []*vmcommon.LogEntry{
 		{Address: []byte("first log")},
 	}
-	err := txLogProcessor.SaveLog([]byte("txhash"), []byte{}, &transaction.SmartContract{}, 0, logs)
-	require.Equal(t, retErr, err)
+	require.Nil(t, txLogProcessor.SaveLog([]byte("txhash"), []byte{}, &transaction.SmartContract{}, 0, logs))
+	require.Equal(t, retErr, txLogProcessor.SaveLogsToStorage())
 }
 
 func TestTxLogProcessor_SaveLogsCallsPutWithMarshalBuff(t *testing.T) {
@@ -138,8 +138,87 @@ func TestTxLogProcessor_SaveLogsCallsPutWithMarshalBuff(t *testing.T) {
 		{Address: []byte("first log")},
 	}
 	_ = txLogProcessor.SaveLog([]byte("txhash"), []byte{}, &transaction.SmartContract{}, 0, logs)
+	require.Nil(t, txLogProcessor.SaveLogsToStorage())
 
 	require.Equal(t, buffExpected, buffActual)
+}
+
+// SaveLog runs during VM execution, before the checks that can still reject the block.
+// It must leave the storer alone until CommitBlock flushes (KLR-69).
+func TestTxLogProcessor_SaveLogDoesNotReachStorageBeforeFlush(t *testing.T) {
+	putCalls := 0
+	txLogProcessor, _ := transactionLog.NewTxLogProcessor(transactionLog.ArgTxLogProcessor{
+		Storer: &mock.StorerStub{
+			PutCalled: func(key, data []byte) error {
+				putCalls++
+				return nil
+			},
+		},
+		Marshalizer:          &mock.MarshalizerMock{},
+		SaveInStorageEnabled: true,
+	})
+
+	logs := []*vmcommon.LogEntry{
+		{Address: []byte("first log")},
+	}
+	require.Nil(t, txLogProcessor.SaveLog([]byte("txhash"), []byte{}, &transaction.SmartContract{}, 0, logs))
+	require.Equal(t, 0, putCalls)
+	require.Len(t, txLogProcessor.GetAllCurrentLogs(), 1)
+
+	require.Nil(t, txLogProcessor.SaveLogsToStorage())
+	require.Equal(t, 1, putCalls)
+}
+
+// A rejected block is followed by CreateBlockStarted -> Clean, with no flush in
+// between, so its logs must never be persisted (KLR-69).
+func TestTxLogProcessor_CleanBeforeFlushDiscardsLogs(t *testing.T) {
+	putCalls := 0
+	txLogProcessor, _ := transactionLog.NewTxLogProcessor(transactionLog.ArgTxLogProcessor{
+		Storer: &mock.StorerStub{
+			PutCalled: func(key, data []byte) error {
+				putCalls++
+				return nil
+			},
+		},
+		Marshalizer:          &mock.MarshalizerMock{},
+		SaveInStorageEnabled: true,
+	})
+
+	logs := []*vmcommon.LogEntry{
+		{Address: []byte("rejected log")},
+	}
+	require.Nil(t, txLogProcessor.SaveLog([]byte("txhash"), []byte{}, &transaction.SmartContract{}, 0, logs))
+
+	txLogProcessor.Clean()
+
+	require.Nil(t, txLogProcessor.SaveLogsToStorage())
+	require.Equal(t, 0, putCalls)
+}
+
+// One failed Put must not drop the rest of the block's logs.
+func TestTxLogProcessor_SaveLogsToStorageContinuesAfterError(t *testing.T) {
+	retErr := errors.New("put error")
+	stored := make(map[string]bool)
+	txLogProcessor, _ := transactionLog.NewTxLogProcessor(transactionLog.ArgTxLogProcessor{
+		Storer: &mock.StorerStub{
+			PutCalled: func(key, data []byte) error {
+				if string(key) == "txhash1" {
+					return retErr
+				}
+				stored[string(key)] = true
+				return nil
+			},
+		},
+		Marshalizer:          &mock.MarshalizerMock{},
+		SaveInStorageEnabled: true,
+	})
+
+	logs := []*vmcommon.LogEntry{{Address: []byte("log")}}
+	require.Nil(t, txLogProcessor.SaveLog([]byte("txhash1"), []byte{}, &transaction.SmartContract{}, 0, logs))
+	require.Nil(t, txLogProcessor.SaveLog([]byte("txhash2"), []byte{}, &transaction.SmartContract{}, 0, logs))
+
+	require.Equal(t, retErr, txLogProcessor.SaveLogsToStorage())
+	require.True(t, stored["txhash2"])
 }
 
 func TestTxLogProcessor_GetLogErrNotFound(t *testing.T) {

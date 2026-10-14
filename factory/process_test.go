@@ -2,6 +2,7 @@ package factory_test
 
 import (
 	"encoding/hex"
+	"os"
 	"testing"
 
 	"github.com/klever-io/klever-go/common/mock"
@@ -9,9 +10,12 @@ import (
 	"github.com/klever-io/klever-go/core"
 	consensusMock "github.com/klever-io/klever-go/core/consensus/mock"
 	"github.com/klever-io/klever-go/core/fork"
+	"github.com/klever-io/klever-go/core/process"
 	"github.com/klever-io/klever-go/core/process/economics"
 	"github.com/klever-io/klever-go/core/process/transactionLog"
 	"github.com/klever-io/klever-go/core/statistics"
+	"github.com/klever-io/klever-go/data/block"
+	"github.com/klever-io/klever-go/data/transaction"
 	"github.com/klever-io/klever-go/factory"
 	"github.com/klever-io/klever-go/genesis/parsing"
 	"github.com/klever-io/klever-go/kapps"
@@ -20,6 +24,8 @@ import (
 	"github.com/klever-io/klever-go/sharding"
 	libp2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 func createP2pPrivateKey() libp2pCrypto.PrivKey {
@@ -133,6 +139,11 @@ func getStateComponents(forkController core.ForkController) *factory.StateCompon
 }
 
 func createMockArguments() *factory.ProcessComponentsFactoryArgs {
+	args, _, _ := createMockArgumentsWithLogs()
+	return args
+}
+
+func createMockArgumentsWithLogs() (*factory.ProcessComponentsFactoryArgs, process.TransactionLogProcessor, *factory.DataComponents) {
 	cfg := getConfig()
 
 	coreArgs := factory.CoreComponentsFactoryArgs{
@@ -178,6 +189,7 @@ func createMockArguments() *factory.ProcessComponentsFactoryArgs {
 	args := getCryptoArgs()
 	ccf, _ := factory.NewCryptoComponentsFactory(args, false)
 	cc, _ := ccf.Create()
+	dc := getDataComponents()
 
 	return factory.NewProcessComponentsFactoryArgs(
 		&coreArgs,
@@ -185,7 +197,7 @@ func createMockArguments() *factory.ProcessComponentsFactoryArgs {
 		economicsData,
 		&sharding.NodesSetup{ChainID: "12345", MinTransactionVersion: 1},
 		&mock.NodesCoordinatorMock{},
-		getDataComponents(),
+		dc,
 		getCoreComponents(),
 		cc,
 		getStateComponents(forkController),
@@ -216,8 +228,7 @@ func createMockArguments() *factory.ProcessComponentsFactoryArgs {
 		forkController,
 		txLogsProcessor,
 		core.Normal,
-	)
-
+	), txLogsProcessor, dc
 }
 
 func TestProcessComponentsFactory_ShouldWork(t *testing.T) {
@@ -225,4 +236,29 @@ func TestProcessComponentsFactory_ShouldWork(t *testing.T) {
 	processComponentsFactory, err := factory.ProcessComponentsFactory(processComponentsFactoryArgs)
 	assert.Nil(t, err)
 	assert.NotNil(t, processComponentsFactory)
+}
+
+// A simulation must not reach the block's log cache: CommitBlock persists whatever is
+// in it under the transaction hash, which a simulated copy of a real tx shares.
+func TestProcessComponentsFactory_SimulationDoesNotWriteBlockLogs(t *testing.T) {
+	args, txLogsProcessor, dataComponents := createMockArgumentsWithLogs()
+	pc, err := factory.ProcessComponentsFactory(args)
+	require.Nil(t, err)
+	require.Nil(t, dataComponents.Blkc.SetCurrentBlockHeader(&block.Block{Header: &block.BlockHeader{Nonce: 1}}))
+
+	// a failing init still makes the SC processor save the VM's error log
+	code, err := os.ReadFile("../kvm/test/contracts/init-wrong/output/init-wrong.wasm")
+	require.Nil(t, err)
+	deploy, err := anypb.New(&transaction.SmartContract{Type: transaction.SmartContract_SCDeploy})
+	require.Nil(t, err)
+	tx := &transaction.Transaction{RawData: &transaction.Transaction_Raw{
+		Sender:   make([]byte, 32),
+		Data:     [][]byte{[]byte(hex.EncodeToString(code) + "@0500@0000")},
+		Contract: []*transaction.TXContract{{Type: transaction.TXContract_SmartContractType, Parameter: deploy}},
+	}}
+
+	res, err := pc.TXSimulatorProcessor.ProcessTx(tx)
+	require.Nil(t, err)
+	require.NotNil(t, res.VMOutput, "the simulation must have reached the VM")
+	require.Empty(t, txLogsProcessor.GetAllCurrentLogs())
 }

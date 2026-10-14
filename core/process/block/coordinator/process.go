@@ -338,6 +338,11 @@ func (tc *transactionCoordinator) GetAllCurrentLogs() []*data.LogData {
 	return tc.transactionsLogProcessor.GetAllCurrentLogs()
 }
 
+// SaveLogsToStorage persists the logs cached for the current block, once it passed validation
+func (tc *transactionCoordinator) SaveLogsToStorage() error {
+	return tc.transactionsLogProcessor.SaveLogsToStorage()
+}
+
 // setVMExecutionMode sets the execution mode directly on the smart contract processor
 func (tc *transactionCoordinator) setVMExecutionMode(mode vmcommon.ExecutionMode) {
 	tc.scProcessor.SetVMExecutionMode(mode)

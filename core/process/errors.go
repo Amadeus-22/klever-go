@@ -660,6 +660,9 @@ var ErrSystemBusy = errors.New("system busy")
 // ErrInvalidMaxGasLimitPerTx signals that an invalid max gas limit per tx has been read from config file
 var ErrInvalidMaxGasLimitPerTx = errors.New("invalid max gas limit per tx")
 
+// ErrMaxGasLimitPerBlockExceeded signals that a transaction does not fit the block gas limit
+var ErrMaxGasLimitPerBlockExceeded = errors.New("max gas limit per block exceeded")
+
 // ErrInvalidNonceRequest signals that invalid nonce was requested
 var ErrInvalidNonceRequest = errors.New("invalid nonce request")
 

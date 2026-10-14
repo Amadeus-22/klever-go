@@ -74,11 +74,23 @@ func TestTransaction_PrepareForProcessing(t *testing.T) {
 		Receipts: []*transaction.Transaction_Receipt{{
 			Data: [][]byte{{1, 2, 3, 4}},
 		}},
+		Result:        transaction.Transaction_FAILED,
+		ResultCode:    transaction.Transaction_FeeInvalid,
+		Block:         42,
+		GasLimit:      50000,
+		GasMultiplier: 2,
 	}
 
 	tx.PrepareForProcessing()
 
+	// every field block processing writes must be cleared - a leftover Block made the
+	// API report a pending transaction as on-chain (KLR-69)
 	assert.Empty(t, tx.Receipts)
+	assert.Equal(t, transaction.Transaction_SUCCESS, tx.Result)
+	assert.Equal(t, transaction.Transaction_Ok, tx.ResultCode)
+	assert.Equal(t, uint64(0), tx.Block)
+	assert.Equal(t, uint64(0), tx.GasLimit)
+	assert.Equal(t, uint64(0), tx.GasMultiplier)
 	assert.NotEmpty(t, tx.RawData.Contract)
 	assert.NotEmpty(t, tx.RawData.Data)
 }

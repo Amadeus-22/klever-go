@@ -456,6 +456,7 @@ type TransactionCoordinator interface {
 	ProcessBlockTransactions(blk *block.Block, haveTime func() time.Duration, isImportDB bool) (data.ProcessResults, error)
 	GetAllCurrentUsedTxs() map[string]data.TransactionHandler
 	GetAllCurrentLogs() []*data.LogData
+	SaveLogsToStorage() error
 
 	RestoreBlockDataFromStorage(body *block.Block) (int, error)
 	RemoveBlockDataFromPool(body *block.Block) error
@@ -718,6 +719,7 @@ type TransactionLogProcessor interface {
 	GetAllCurrentLogs() []*data.LogData
 	GetLog(txHash []byte) (data.LogHandler, error)
 	SaveLog(txHash []byte, acntSender []byte, tc data.SmartContractHandler, contractID int, vmLogs []*vmcommon.LogEntry) error
+	SaveLogsToStorage() error
 	Clean()
 	IsInterfaceNil() bool
 }

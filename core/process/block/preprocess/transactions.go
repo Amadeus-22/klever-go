@@ -205,8 +205,10 @@ func (txs *transactions) RestoreBlockDataIntoPools(blk *block.Block) (int, error
 			return 0, err
 		}
 
-		// reset TX processed fields
+		// reset TX processed fields, keeping the gas the proposer's tx selection reads
+		gasLimit, gasMultiplier := tx.GasLimit, tx.GasMultiplier
 		tx.PrepareForProcessing()
+		tx.GasLimit, tx.GasMultiplier = gasLimit, gasMultiplier
 
 		txs.txPool.AddData([]byte(txHash), &tx, tx.GetSize(), "0")
 		// remove from storage
@@ -502,6 +504,18 @@ func (txs *transactions) computeExistingAndRequestMissingTxs(blk *block.Block) i
 	return numMissingTxsForShard
 }
 
+// forProcessing returns a candidate-local copy of a pooled tx, so execution
+// metadata from a rejected candidate never reaches the shared pool object.
+// RawData and Signature are read-only during processing and are shared.
+// The validator path uses it only from FixAuditChangesV6: before that, a hash
+// repeated in one block shared the pooled pointer and counted differently.
+func forProcessing(tx *transaction.Transaction) *transaction.Transaction {
+	return &transaction.Transaction{
+		RawData:   tx.RawData,
+		Signature: tx.Signature,
+	}
+}
+
 // getAllTxsFromMiniBlock gets all the transactions from a miniblock into a new structure
 func (txs *transactions) getAllTxsFromBlock(
 	blk *block.Block,
@@ -510,6 +524,8 @@ func (txs *transactions) getAllTxsFromBlock(
 	if txCache == nil {
 		return nil, nil, process.ErrNilTransactionPool
 	}
+
+	copyTxs := txs.forkProcessor.FixAuditChangesV6()
 
 	// verify if all transaction exists
 	txsSlice := make([]*transaction.Transaction, 0, len(blk.TxHashes))
@@ -523,6 +539,9 @@ func (txs *transactions) getAllTxsFromBlock(
 		tx, ok := tmp.(*transaction.Transaction)
 		if !ok {
 			return nil, nil, process.ErrWrongTypeAssertion
+		}
+		if copyTxs {
+			tx = forProcessing(tx)
 		}
 		txHashes = append(txHashes, txHash)
 		txsSlice = append(txsSlice, tx)
@@ -561,6 +580,7 @@ func (txs *transactions) ProcessBlockTransactions(
 		return result, err
 	}
 
+	gasUsed := uint64(0)
 	for index := range blockTxs {
 		// TODO: check if have been processed (its in storer??)
 		// execute transaction to change the trie root hash
@@ -569,21 +589,24 @@ func (txs *transactions) ProcessBlockTransactions(
 			blk,
 			blockTxHashes[index],
 			blockTxs[index],
+			&gasUsed,
 		)
 		elapsedTime := time.Since(startTime)
 		totalTimeUsedForProcess += elapsedTime
 
 		// Check for consensus mismatch first - this must reject the entire block
-		if err != nil && errors.Is(err, process.ErrTransactionResultMismatch) {
-			log.Error("transaction result mismatch detected",
+		if err != nil && (errors.Is(err, process.ErrTransactionResultMismatch) || errors.Is(err, process.ErrMaxGasLimitPerBlockExceeded)) {
+			log.Error("transaction rejects the block",
 				"hash", blockTxHashes[index],
+				"error", err.Error(),
 			)
 			return result, err
 		}
 
 		// if transaction have not been pre-processed successfully,
 		// or BW fee is not enough, Result is not set to FAILED
-		// then remove from pool as nothing can be done
+		// then remove from pool as nothing can be done.
+		// From FixAuditChangesV6 Result is candidate-local, so a precheck rejection leaves it at SUCCESS.
 		if err != nil && blockTxs[index].Result != transaction.Transaction_FAILED {
 			numTxsBad++
 			log.Trace("bad tx",
@@ -690,6 +713,7 @@ func (txs *transactions) createAndProcessBlock(
 	txsSize := int64(0)
 
 	senderAddressToSkip := []byte("")
+	gasUsed := uint64(0)
 
 	for index := range sortedTxs {
 		if !haveTime() {
@@ -697,24 +721,25 @@ func (txs *transactions) createAndProcessBlock(
 			break
 		}
 
-		tx, ok := sortedTxs[index].Tx.(*transaction.Transaction)
+		pooledTx, ok := sortedTxs[index].Tx.(*transaction.Transaction)
 		if !ok {
 			log.Debug("wrong type assertion", "hash", sortedTxs[index].TxHash)
 			continue
 		}
 
-		// clear any TX previous processing status
-		tx.PrepareForProcessing()
+		tx := forProcessing(pooledTx)
 
 		// Consensus account freeze: never propose a tx from a frozen sender — it would be
 		// rejected on verify and invalidate the block. Fork gating lives inside
-		// IsAccountFrozen, per-account.
+		// IsAccountFrozen, per-account. Dropped from the pool, so its gas stops
+		// taking the selection budget every slot.
+		txHash := sortedTxs[index].TxHash
 		if common.IsAccountFrozen(tx.GetSender(), txs.forkProcessor) {
+			txs.txPool.RemoveData(txHash, "0")
 			numTxsSkipped++
 			continue
 		}
 
-		txHash := sortedTxs[index].TxHash
 		if len(senderAddressToSkip) > 0 && bytes.Equal(senderAddressToSkip, tx.GetSender()) {
 			numTxsSkipped++
 			continue
@@ -726,6 +751,7 @@ func (txs *transactions) createAndProcessBlock(
 			blk,
 			txHash,
 			tx,
+			&gasUsed,
 		)
 		elapsedTime := time.Since(startTime)
 		totalTimeUsedForProcess += elapsedTime
@@ -791,8 +817,10 @@ func (txs *transactions) updateBlockTxRootHash(blk *block.Block, txHashes [][]by
 	return blk.UpdateTxRootHash(txs.hasher)
 }
 
+// a tx left in the pool for a later block also holds back its sender's next nonces,
+// which would otherwise be evicted as higher-nonce
 func senderToSkipAfterBadTx(err error, tx *transaction.Transaction, currentSkip []byte) []byte {
-	if errors.Is(err, process.ErrHigherNonceInTransaction) {
+	if errors.Is(err, process.ErrHigherNonceInTransaction) || errors.Is(err, process.ErrMaxGasLimitPerBlockExceeded) {
 		return tx.GetSender()
 	}
 
@@ -804,6 +832,7 @@ func (txs *transactions) processAndRemoveBadTransaction(
 	block *block.Block,
 	txHash []byte,
 	tx *transaction.Transaction,
+	gasUsed *uint64,
 ) error {
 	if check.IfNil(tx) {
 		return process.ErrNilTransaction
@@ -817,6 +846,12 @@ func (txs *transactions) processAndRemoveBadTransaction(
 		return err
 	}
 
+	// From FixAuditChangesV6 proposer and verifier bound the block's declared gas.
+	// Checked before any fee is charged, so the tx stays in the pool for a later block.
+	if txs.forkProcessor.FixAuditChangesV6() && *gasUsed+tx.GasLimit > txs.economicsFee.MaxGasLimitPerBlock() {
+		return process.ErrMaxGasLimitPerBlockExceeded
+	}
+
 	_, err = txs.txProcessor.ProcessBandwidthFee(txHash, tx, ownerAcc)
 	if err != nil {
 		// remove any transactions that cannot pay for BW fee
@@ -824,6 +859,9 @@ func (txs *transactions) processAndRemoveBadTransaction(
 		txs.txPool.RemoveData(txHash, "0")
 		return err
 	}
+
+	// the tx is in the block from here, whether it succeeds or fails
+	*gasUsed += tx.GasLimit
 
 	accsSnapshot := txs.accounts.JournalLen()
 	kappsSnapshot := txs.kapps.JournalLen()

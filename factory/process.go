@@ -1201,6 +1201,9 @@ func createMetaTxSimulatorProcessor(
 
 	scProcArgs.TxFeeHandler = &disabled.TXFeeHandler{}
 
+	// simulations must not write into the block's log cache, which CommitBlock persists
+	scProcArgs.TxLogsProcessor = &disabled.TxLogProcessor{}
+
 	readOnlyAccountsCacher, err := state.NewReadOnlyAccountsCacher(
 		state.ArgsAcccountCacher{
 			Accounts: processArgs.state.AccountsAdapter,

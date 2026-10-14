@@ -26,6 +26,7 @@ import (
 	"github.com/klever-io/klever-go/storage/storageUnit"
 	"github.com/klever-io/klever-go/vmcommon"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const MaxGasLimitPerBlock = uint64(100000)
@@ -369,6 +370,52 @@ func TestTransactionCoordinator_CreateBlockStarted(t *testing.T) {
 
 	txs := tc.GetAllCurrentUsedTxs()
 	assert.Equal(t, 0, len(txs))
+}
+
+// A rejected candidate's logs are dropped by the next CreateBlockStarted, so only the
+// committed block's logs are persisted.
+func TestTransactionCoordinator_SaveLogsToStorageOnlyPersistsCommittedBlock(t *testing.T) {
+	t.Parallel()
+
+	stored := make([]string, 0)
+	txLogsProcessor, _ := transactionLog.NewTxLogProcessor(transactionLog.ArgTxLogProcessor{
+		Storer: &commonMock.StorerStub{
+			PutCalled: func(key, data []byte) error {
+				stored = append(stored, string(key))
+				return nil
+			},
+		},
+		Marshalizer:          &commonMock.MarshalizerMock{},
+		SaveInStorageEnabled: true,
+	})
+
+	tc, err := coordinator.NewTransactionCoordinator(
+		&commonMock.HasherMock{},
+		&commonMock.MarshalizerMock{},
+		&commonMock.AccountsStub{},
+		&commonMock.AccountsStub{},
+		&commonMock.RequestHandlerStub{},
+		&commonMock.PreProcessorMock{},
+		&commonMock.FeeAccumulatorStub{},
+		&commonMock.FeeHandlerStub{},
+		txLogsProcessor,
+		newForkController(),
+		&commonMock.SCProcessorMock{},
+	)
+	require.Nil(t, err)
+
+	logs := []*vmcommon.LogEntry{{Address: []byte("addr")}}
+	tc.CreateBlockStarted()
+	// candidate A executes an SC tx and is rejected
+	require.Nil(t, txLogsProcessor.SaveLog([]byte("txA"), nil, &transaction.SmartContract{}, 0, logs))
+
+	tc.CreateBlockStarted()
+	// candidate B executes an SC tx and is committed
+	require.Nil(t, txLogsProcessor.SaveLog([]byte("txB"), nil, &transaction.SmartContract{}, 0, logs))
+	require.Empty(t, stored)
+
+	require.Nil(t, tc.SaveLogsToStorage())
+	require.Equal(t, []string{"txB"}, stored)
 }
 
 func TestTransactionCoordinator_CreateMarshalizedDataNilBody(t *testing.T) {

@@ -1900,6 +1900,26 @@ func TestMetaProcessor_CommitBlockStorageFailsForHeaderShouldErr(t *testing.T) {
 func TestMetaProcessor_CommitBlockOkValsShouldWork(t *testing.T) {
 	t.Parallel()
 
+	commitBlockOkVals(t, &mock.TransactionCoordinatorMock{})
+}
+
+// SC logs reach storage only through CommitBlock, and a flush failure must not fail it.
+func TestMetaProcessor_CommitBlockFlushesLogsOnce(t *testing.T) {
+	t.Parallel()
+
+	for _, flushErr := range []error{nil, errors.New("log flush failure")} {
+		flushCalls := 0
+		commitBlockOkVals(t, &mock.TransactionCoordinatorMock{
+			SaveLogsToStorageCalled: func() error {
+				flushCalls++
+				return flushErr
+			},
+		})
+		assert.Equal(t, 1, flushCalls)
+	}
+}
+
+func commitBlockOkVals(t *testing.T, txCoordinator process.TransactionCoordinator) {
 	mdp := initDataPool([]byte("tx_hash"))
 	rootHash := []byte("rootHash")
 	hdr := createMetaBlockHeader()
@@ -1942,6 +1962,7 @@ func TestMetaProcessor_CommitBlockOkValsShouldWork(t *testing.T) {
 	arguments.DataPool = mdp
 	arguments.AccountsDB[state.UserAccountsState] = accounts
 	arguments.AccountsDB[state.PeerAccountsState] = accounts
+	arguments.TxCoordinator = txCoordinator
 	arguments.ForkDetector = fd
 	arguments.Store = store
 	arguments.Hasher = &mock.HasherStub{
