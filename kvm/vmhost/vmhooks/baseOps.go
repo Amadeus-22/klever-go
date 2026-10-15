@@ -1152,12 +1152,17 @@ func (context *VMHooksImpl) StorageLoadLength(keyOffset executor.MemPtr, keyLeng
 	storage := context.GetStorageContext()
 	metering := context.GetMeteringContext()
 
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, _, err := context.memLoadCharged(context.GetVMHost(), keyOffset, keyLength)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
 
-	data, trieDepth, usedCache, err := storage.GetStorageUnmetered(key)
+	getStorage := storage.GetStorageUnmetered
+	if context.host.ForkController().FixAuditChangesV6() {
+		getStorage = storage.GetStorage
+	}
+
+	data, trieDepth, usedCache, err := getStorage(key)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
@@ -1202,7 +1207,7 @@ func (context *VMHooksImpl) StorageLoadFromAddressWithHost(
 
 	runtime := host.Runtime()
 
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, _, err := context.memLoadCharged(host, keyOffset, keyLength)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
@@ -1212,7 +1217,12 @@ func (context *VMHooksImpl) StorageLoadFromAddressWithHost(
 		return -1
 	}
 
-	data, err := StorageLoadFromAddressWithTypedArgs(host, address, key)
+	data, usedCache, err := storageLoadFromAddress(host, address, key)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
+
+	err = useGasForCachedStorageValue(host, data, usedCache)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
@@ -1227,11 +1237,16 @@ func (context *VMHooksImpl) StorageLoadFromAddressWithHost(
 
 // StorageLoadFromAddressWithTypedArgs - storageLoadFromAddress with args already read from memory
 func StorageLoadFromAddressWithTypedArgs(host vmhost.VMHost, address []byte, key []byte) ([]byte, error) {
+	data, _, err := storageLoadFromAddress(host, address, key)
+	return data, err
+}
+
+func storageLoadFromAddress(host vmhost.VMHost, address []byte, key []byte) ([]byte, bool, error) {
 	storage := host.Storage()
 	metering := host.Metering()
 	data, trieDepth, usedCache, err := storage.GetStorageFromAddress(address, key)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	err = storage.UseGasForStorageLoad(
 		storageLoadFromAddressName,
@@ -1239,10 +1254,10 @@ func StorageLoadFromAddressWithTypedArgs(host vmhost.VMHost, address []byte, key
 		metering.GasSchedule().BaseOpsAPICost.StorageLoad,
 		usedCache)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return data, nil
+	return data, usedCache, nil
 }
 
 // StorageLoad VMHooks implementation.
@@ -1261,12 +1276,17 @@ func (context *VMHooksImpl) StorageLoad(keyOffset executor.MemPtr, keyLength exe
 func (context *VMHooksImpl) StorageLoadWithHost(host vmhost.VMHost, keyOffset executor.MemPtr, keyLength executor.MemLength, dataOffset executor.MemPtr) int32 {
 	runtime := host.Runtime()
 
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, _, err := context.memLoadCharged(host, keyOffset, keyLength)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
 
-	data, err := StorageLoadWithWithTypedArgs(host, key)
+	data, usedCache, err := storageLoad(host, key)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
+
+	err = useGasForCachedStorageValue(host, data, usedCache)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
@@ -1281,11 +1301,16 @@ func (context *VMHooksImpl) StorageLoadWithHost(host vmhost.VMHost, keyOffset ex
 
 // StorageLoadWithWithTypedArgs - storageLoad with args already read from memory
 func StorageLoadWithWithTypedArgs(host vmhost.VMHost, key []byte) ([]byte, error) {
+	data, _, err := storageLoad(host, key)
+	return data, err
+}
+
+func storageLoad(host vmhost.VMHost, key []byte) ([]byte, bool, error) {
 	storage := host.Storage()
 	metering := host.Metering()
 	data, trieDepth, usedCache, err := storage.GetStorage(key)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	err = storage.UseGasForStorageLoad(
@@ -1294,10 +1319,18 @@ func StorageLoadWithWithTypedArgs(host vmhost.VMHost, key []byte) ([]byte, error
 		metering.GasSchedule().BaseOpsAPICost.StorageLoad,
 		usedCache)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return data, nil
+	return data, usedCache, nil
+}
+
+func useGasForCachedStorageValue(host vmhost.VMHost, value []byte, usedCache bool) error {
+	if !usedCache || !host.ForkController().FixAuditChangesV6() {
+		return nil
+	}
+
+	return host.ManagedTypes().ConsumeGasForByteLenBounded(uint64(len(value)))
 }
 
 // SetStorageLock VMHooks implementation.
@@ -1348,9 +1381,7 @@ func (context *VMHooksImpl) GetStorageLock(keyOffset executor.MemPtr, keyLength 
 	storage := context.GetStorageContext()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.StorageLoad
-	metering.UseGasAndAddTracedGas(getStorageLockName, gasToUse)
-
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, err := context.chargeAndLoadKey(context.GetVMHost(), getStorageLockName, gasToUse, keyOffset, keyLength)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}

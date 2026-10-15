@@ -1494,7 +1494,7 @@ func TestExecution_ExecuteOnSameContext_OutOfGas(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnSameContext_Successful(t *testing.T) {
-	forEachFixAuditChangesV6(t, 54, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+	forEachFixAuditChangesV6(t, 277, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		executeAPICost := uint64(894313) + copyGas
 		childExecutionCost := uint64(437 - 22)
 		parentGasBeforeExecuteAPI := uint64(172 - 9)
@@ -1624,7 +1624,7 @@ func TestExecution_ExecuteOnSameContext_Successful_BigInts(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Direct(t *testing.T) {
-	forEachFixAuditChangesV6(t, 541, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+	forEachFixAuditChangesV6(t, 898, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Scenario:
 		// SC has a method "callRecursive" which takes a byte as argument (number of recursive calls)
 		// callRecursive() saves to storage "keyNNN" → "valueNNN", where NNN is the argument
@@ -1706,7 +1706,7 @@ func TestExecution_ExecuteOnSameContext_Recursive_Direct_ErrMaxInstances(t *test
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Mutual_Methods(t *testing.T) {
-	forEachFixAuditChangesV6(t, 572, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+	forEachFixAuditChangesV6(t, 929, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Scenario:
 		// SC has a method "callRecursiveMutualMethods" which takes a byte as
 		//		argument (number of recursive calls)
@@ -1786,7 +1786,7 @@ func TestExecution_ExecuteOnSameContext_Recursive_Mutual_Methods(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnSameContext_Recursive_Mutual_SCs(t *testing.T) {
-	forEachFixAuditChangesV6(t, 466, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+	forEachFixAuditChangesV6(t, 758, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Scenario:
 		// Parent has method parentCallChild()
 		// Child has method childCallParent()
@@ -1999,7 +1999,7 @@ func TestExecution_ExecuteOnDestContext_OutOfGas(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnDestContext_Successful(t *testing.T) {
-	forEachFixAuditChangesV6(t, 13, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+	forEachFixAuditChangesV6(t, 45, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		// Call parentFunctionChildCall() of the parent SC, which will call the child
 		// SC and pass some arguments using executeOnDestContext().
 
@@ -2255,7 +2255,7 @@ func TestExecution_ExecuteOnDestContext_Successful_BigInts(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnDestContext_Recursive_Direct(t *testing.T) {
-	forEachFixAuditChangesV6(t, 628, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+	forEachFixAuditChangesV6(t, 1050, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		recursiveCalls := 6
 
 		var returnData [][]byte
@@ -2306,7 +2306,7 @@ func TestExecution_ExecuteOnDestContext_Recursive_Direct(t *testing.T) {
 }
 
 func TestExecution_ExecuteOnDestContext_Recursive_Mutual_Methods(t *testing.T) {
-	forEachFixAuditChangesV6(t, 752, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+	forEachFixAuditChangesV6(t, 1239, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
 		recursiveCalls := 7
 
 		var returnData [][]byte
@@ -2372,7 +2372,7 @@ func TestExecution_ExecuteOnDestContext_Recursive_Mutual_SCs(t *testing.T) {
 		// of the function-name copy gas both of them pay
 		parentStorageCopyGas, childStorageCopyGas := uint64(0), uint64(0)
 		if fromFixAuditChangesV6(epochs) {
-			parentStorageCopyGas, childStorageCopyGas = 328, 222
+			parentStorageCopyGas, childStorageCopyGas = 555, 384
 		}
 
 		// Call parentFunctionChildCall() of the parent SC, which will call the child

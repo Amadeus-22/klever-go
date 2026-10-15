@@ -1037,6 +1037,260 @@ func TestVMHooksImpl_StorageHooks_GasSameBeforeAndFromV6(t *testing.T) {
 	}
 }
 
+const (
+	storageLoadKeyPtr     = executor.MemPtr(0)
+	storageLoadAddressPtr = executor.MemPtr(100)
+	storageLoadDataPtr    = executor.MemPtr(200)
+	storageLoadKeyLength  = executor.MemLength(8)
+	storageLoadDestHandle = int32(1)
+)
+
+var (
+	storageLoadKey     = []byte("a key123")
+	storageLoadValue   = []byte("data")
+	storageLoadAddress = bytes.Repeat([]byte{7}, vmhost.AddressLen)
+)
+
+func newStorageLoadHost(
+	t *testing.T,
+	fixAuditChangesV6 bool,
+	gasProvided uint64,
+	cached bool,
+) (*contextmock.VMHostMock, vmhost.MeteringContext, *int) {
+	t.Helper()
+
+	host, metering := newMockVMHostWithRealMetering(t, fixAuditChangesV6, config.MakeGasMapForTests(), gasProvided)
+	host.ForkControllerContext.(*commonMock.ForkControllerStub).FixAuditChangesV5Value = true
+	blockchainHook, err := addStorageContextWithHook(host)
+	require.NoError(t, err)
+	trieReads := 0
+	blockchainHook.GetStorageDataCalled = func(_ []byte, _ []byte) ([]byte, uint32, error) {
+		trieReads++
+		return storageLoadValue, 0, nil
+	}
+	host.StorageContext.SetAddress(storageLoadAddress)
+
+	if cached {
+		account, _ := host.Output().GetOutputAccount(storageLoadAddress)
+		account.StorageUpdates[string(storageLoadKey)] = &vmcommon.StorageUpdate{
+			Offset: storageLoadKey,
+			Data:   storageLoadValue,
+		}
+	}
+
+	require.NoError(t, host.MemStoreToMock(storageLoadKeyPtr, storageLoadKey))
+	require.NoError(t, host.MemStoreToMock(storageLoadAddressPtr, storageLoadAddress))
+
+	return host, metering, &trieReads
+}
+
+func storageLoadValueInMemory(host *contextmock.VMHostMock) bool {
+	data, err := host.MemLoadFromMock(storageLoadDataPtr, len(storageLoadValue))
+	return err == nil && bytes.Equal(data, storageLoadValue)
+}
+
+func TestVMHooksImpl_StorageLoadHooks_GasBeforeAndFromV6(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                string
+		cachedPreForkGas    uint64
+		cachedPostForkGas   uint64
+		uncachedPreForkGas  uint64
+		uncachedPostForkGas uint64
+		call                func(hooks *vmhooks.VMHooksImpl)
+	}{
+		{"StorageLoad", 1, 13, 15291, 15299, func(hooks *vmhooks.VMHooksImpl) {
+			hooks.StorageLoad(storageLoadKeyPtr, storageLoadKeyLength, storageLoadDataPtr)
+		}},
+		{"StorageLoadFromAddress", 1, 13, 15291, 15299, func(hooks *vmhooks.VMHooksImpl) {
+			hooks.StorageLoadFromAddress(storageLoadAddressPtr, storageLoadKeyPtr, storageLoadKeyLength, storageLoadDataPtr)
+		}},
+		{"BigIntStorageLoadUnsigned", 1, 13, 15291, 15299, func(hooks *vmhooks.VMHooksImpl) {
+			hooks.BigIntStorageLoadUnsigned(storageLoadKeyPtr, storageLoadKeyLength, storageLoadDestHandle)
+		}},
+		{"SmallIntStorageLoadUnsigned", 1, 13, 15291, 15299, func(hooks *vmhooks.VMHooksImpl) {
+			hooks.SmallIntStorageLoadUnsigned(storageLoadKeyPtr, storageLoadKeyLength)
+		}},
+		{"SmallIntStorageLoadSigned", 1, 13, 15291, 15299, func(hooks *vmhooks.VMHooksImpl) {
+			hooks.SmallIntStorageLoadSigned(storageLoadKeyPtr, storageLoadKeyLength)
+		}},
+		{"StorageLoadLength", 1, 9, 15287, 15299, func(hooks *vmhooks.VMHooksImpl) {
+			hooks.StorageLoadLength(storageLoadKeyPtr, storageLoadKeyLength)
+		}},
+		{"MBufferStorageLoad", 13, 13, 15303, 15303, func(hooks *vmhooks.VMHooksImpl) {
+			managedType := hooks.GetManagedTypesContext()
+			keyHandle := managedType.NewManagedBufferFromBytes(storageLoadKey)
+			hooks.MBufferStorageLoad(keyHandle, managedType.NewManagedBuffer())
+		}},
+		{"MBufferStorageLoadFromAddress", 45, 45, 15335, 15335, func(hooks *vmhooks.VMHooksImpl) {
+			managedType := hooks.GetManagedTypesContext()
+			addressHandle := managedType.NewManagedBufferFromBytes(storageLoadAddress)
+			keyHandle := managedType.NewManagedBufferFromBytes(storageLoadKey)
+			hooks.MBufferStorageLoadFromAddress(addressHandle, keyHandle, managedType.NewManagedBuffer())
+		}},
+	}
+
+	for _, tt := range tests {
+		for _, cached := range []bool{false, true} {
+			for _, fixAuditChangesV6 := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/cached=%v/FixAuditChangesV6=%v", tt.name, cached, fixAuditChangesV6), func(t *testing.T) {
+					t.Parallel()
+
+					const gasProvided = uint64(100_000)
+					host, metering, _ := newStorageLoadHost(t, fixAuditChangesV6, gasProvided, cached)
+
+					tt.call(vmhooks.NewVMHooksImpl(host))
+					require.Nil(t, host.RuntimeContext.(*contextmock.RuntimeContextMock).FailExecutionErr)
+
+					expectedGas := tt.uncachedPreForkGas
+					switch {
+					case cached && fixAuditChangesV6:
+						expectedGas = tt.cachedPostForkGas
+					case cached:
+						expectedGas = tt.cachedPreForkGas
+					case fixAuditChangesV6:
+						expectedGas = tt.uncachedPostForkGas
+					}
+					assert.Equal(t, expectedGas, gasProvided-metering.GasLeft())
+				})
+			}
+		}
+	}
+}
+
+func TestVMHooksImpl_StorageLoadHooks_CachedValueChargedBeforeTheCopy(t *testing.T) {
+	t.Parallel()
+
+	storedNumber := big.NewInt(0).SetBytes(storageLoadValue).Int64()
+
+	tests := []struct {
+		name string
+		call func(hooks *vmhooks.VMHooksImpl, host *contextmock.VMHostMock) bool
+	}{
+		{"StorageLoad", func(hooks *vmhooks.VMHooksImpl, host *contextmock.VMHostMock) bool {
+			hooks.StorageLoad(storageLoadKeyPtr, storageLoadKeyLength, storageLoadDataPtr)
+			return storageLoadValueInMemory(host)
+		}},
+		{"StorageLoadFromAddress", func(hooks *vmhooks.VMHooksImpl, host *contextmock.VMHostMock) bool {
+			hooks.StorageLoadFromAddress(storageLoadAddressPtr, storageLoadKeyPtr, storageLoadKeyLength, storageLoadDataPtr)
+			return storageLoadValueInMemory(host)
+		}},
+		{"BigIntStorageLoadUnsigned", func(hooks *vmhooks.VMHooksImpl, host *contextmock.VMHostMock) bool {
+			hooks.BigIntStorageLoadUnsigned(storageLoadKeyPtr, storageLoadKeyLength, storageLoadDestHandle)
+			return host.ManagedTypesContext.GetBigIntOrCreate(storageLoadDestHandle).Int64() == storedNumber
+		}},
+		{"SmallIntStorageLoadUnsigned", func(hooks *vmhooks.VMHooksImpl, _ *contextmock.VMHostMock) bool {
+			return hooks.SmallIntStorageLoadUnsigned(storageLoadKeyPtr, storageLoadKeyLength) == storedNumber
+		}},
+		{"SmallIntStorageLoadSigned", func(hooks *vmhooks.VMHooksImpl, _ *contextmock.VMHostMock) bool {
+			return hooks.SmallIntStorageLoadSigned(storageLoadKeyPtr, storageLoadKeyLength) == storedNumber
+		}},
+	}
+
+	for _, tt := range tests {
+		for _, fixAuditChangesV6 := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/FixAuditChangesV6=%v", tt.name, fixAuditChangesV6), func(t *testing.T) {
+				t.Parallel()
+
+				gasMap := config.MakeGasMapForTests()
+				cachedLoadGas := gasMap["BaseOpsAPICost"]["CachedStorageLoad"]
+				gasProvided := cachedLoadGas + gasMap["BaseOperationCost"]["DataCopyPerByte"]*uint64(len(storageLoadKey))
+				host, metering, _ := newStorageLoadHost(t, fixAuditChangesV6, gasProvided, true)
+
+				landed := tt.call(vmhooks.NewVMHooksImpl(host), host)
+
+				failErr := host.RuntimeContext.(*contextmock.RuntimeContextMock).FailExecutionErr
+				if fixAuditChangesV6 {
+					require.ErrorIs(t, failErr, vmhost.ErrNotEnoughGas)
+					assert.False(t, landed)
+					return
+				}
+
+				require.NoError(t, failErr)
+				assert.True(t, landed)
+				assert.Equal(t, cachedLoadGas, gasProvided-metering.GasLeft())
+			})
+		}
+	}
+}
+
+func TestVMHooksImpl_StorageLoadHooks_KeyChargedBeforeTheLoad(t *testing.T) {
+	t.Parallel()
+
+	const unaffordableKeyLength = executor.MemLength(200_000)
+
+	tests := []struct {
+		name string
+		call func(hooks *vmhooks.VMHooksImpl)
+	}{
+		{"StorageLoad", func(hooks *vmhooks.VMHooksImpl) {
+			hooks.StorageLoad(storageLoadKeyPtr, unaffordableKeyLength, storageLoadDataPtr)
+		}},
+		{"StorageLoadFromAddress", func(hooks *vmhooks.VMHooksImpl) {
+			hooks.StorageLoadFromAddress(storageLoadAddressPtr, storageLoadKeyPtr, unaffordableKeyLength, storageLoadDataPtr)
+		}},
+		{"StorageLoadLength", func(hooks *vmhooks.VMHooksImpl) {
+			hooks.StorageLoadLength(storageLoadKeyPtr, unaffordableKeyLength)
+		}},
+		{"GetStorageLock", func(hooks *vmhooks.VMHooksImpl) {
+			hooks.GetStorageLock(storageLoadKeyPtr, unaffordableKeyLength)
+		}},
+		{"BigIntStorageLoadUnsigned", func(hooks *vmhooks.VMHooksImpl) {
+			hooks.BigIntStorageLoadUnsigned(storageLoadKeyPtr, unaffordableKeyLength, storageLoadDestHandle)
+		}},
+		{"SmallIntStorageLoadUnsigned", func(hooks *vmhooks.VMHooksImpl) {
+			hooks.SmallIntStorageLoadUnsigned(storageLoadKeyPtr, unaffordableKeyLength)
+		}},
+		{"SmallIntStorageLoadSigned", func(hooks *vmhooks.VMHooksImpl) {
+			hooks.SmallIntStorageLoadSigned(storageLoadKeyPtr, unaffordableKeyLength)
+		}},
+	}
+
+	for _, tt := range tests {
+		for _, fixAuditChangesV6 := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/FixAuditChangesV6=%v", tt.name, fixAuditChangesV6), func(t *testing.T) {
+				t.Parallel()
+
+				host, _, trieReads := newStorageLoadHost(t, fixAuditChangesV6, 100_000, false)
+
+				tt.call(vmhooks.NewVMHooksImpl(host))
+
+				if fixAuditChangesV6 {
+					require.ErrorIs(t, host.RuntimeContext.(*contextmock.RuntimeContextMock).FailExecutionErr, vmhost.ErrNotEnoughGas)
+					assert.Zero(t, *trieReads)
+					return
+				}
+
+				assert.Positive(t, *trieReads)
+			})
+		}
+	}
+}
+
+func TestVMHooksImpl_GetStorageLock_FixedCostChargedBeforeTheLoad(t *testing.T) {
+	t.Parallel()
+
+	for _, fixAuditChangesV6 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("FixAuditChangesV6=%v", fixAuditChangesV6), func(t *testing.T) {
+			t.Parallel()
+
+			host, _, trieReads := newStorageLoadHost(t, fixAuditChangesV6, 0, false)
+
+			vmhooks.NewVMHooksImpl(host).GetStorageLock(storageLoadKeyPtr, 0)
+
+			require.ErrorIs(t, host.RuntimeContext.(*contextmock.RuntimeContextMock).FailExecutionErr, vmhost.ErrNotEnoughGas)
+			if fixAuditChangesV6 {
+				assert.Zero(t, *trieReads)
+				assert.Zero(t, host.Runtime().GetPointsUsed())
+				return
+			}
+
+			assert.Positive(t, *trieReads)
+		})
+	}
+}
+
 // StorageStore charges its fixed cost before it copies, and the key and the value separately, so
 // each shortfall must leave the trie untouched. StorageStoreWithTypedArgs has no copies to make but
 // charges the same fixed cost for its own callers, so it owns that branch too.

@@ -148,7 +148,7 @@ func (context *VMHooksImpl) BigIntStorageLoadUnsigned(keyOffset executor.MemPtr,
 	storage := context.GetStorageContext()
 	metering := context.GetMeteringContext()
 
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, _, err := context.memLoadCharged(context.GetVMHost(), keyOffset, keyLength)
 	if context.WithFault(err, runtime.BigIntAPIErrorShouldFailExecution()) {
 		return -1
 	}
@@ -162,6 +162,11 @@ func (context *VMHooksImpl) BigIntStorageLoadUnsigned(keyOffset executor.MemPtr,
 		int64(trieDepth),
 		metering.GasSchedule().BigIntAPICost.BigIntStorageLoadUnsigned,
 		usedCache)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
+
+	err = useGasForCachedStorageValue(context.GetVMHost(), bytes, usedCache)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}

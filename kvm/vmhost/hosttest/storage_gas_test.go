@@ -139,6 +139,85 @@ func computeExpectedGasForGetStorage(key []byte, value []byte) uint64 {
 	return expectedUsedGas
 }
 
+const (
+	rereadKeyPtr     = executor.MemPtr(0)
+	rereadAddressPtr = executor.MemPtr(32)
+	rereadDataPtr    = executor.MemPtr(64)
+)
+
+var storageRereadHooks = map[string]func(instance *mock.InstanceMock, key []byte, iteration int){
+	"storageLoad": func(instance *mock.InstanceMock, key []byte, _ int) {
+		vmhooks.NewVMHooksImpl(instance.Host).StorageLoad(rereadKeyPtr, executor.MemLength(len(key)), rereadDataPtr)
+	},
+	"storageLoadFromAddress": func(instance *mock.InstanceMock, key []byte, _ int) {
+		vmhooks.NewVMHooksImpl(instance.Host).StorageLoadFromAddress(rereadAddressPtr, rereadKeyPtr, executor.MemLength(len(key)), rereadDataPtr)
+	},
+	"bigIntStorageLoadUnsigned": func(instance *mock.InstanceMock, key []byte, iteration int) {
+		vmhooks.NewVMHooksImpl(instance.Host).BigIntStorageLoadUnsigned(rereadKeyPtr, executor.MemLength(len(key)), int32(100+iteration)) // #nosec G115
+	},
+	"smallIntStorageLoadUnsigned": func(instance *mock.InstanceMock, key []byte, _ int) {
+		vmhooks.NewVMHooksImpl(instance.Host).SmallIntStorageLoadUnsigned(rereadKeyPtr, executor.MemLength(len(key)))
+	},
+	"smallIntStorageLoadSigned": func(instance *mock.InstanceMock, key []byte, _ int) {
+		vmhooks.NewVMHooksImpl(instance.Host).SmallIntStorageLoadSigned(rereadKeyPtr, executor.MemLength(len(key)))
+	},
+}
+
+func TestGasUsed_CachedRereads_ChargedPerByteFromFixAuditChangesV6(t *testing.T) {
+	const numberOfReads = 10
+	key := []byte("cachedRereadKey.................")
+	value := make([]byte, 20_000)
+	value[len(value)-1] = 7
+
+	for hookName, load := range storageRereadHooks {
+		t.Run(hookName, func(t *testing.T) {
+			forEachFixAuditChangesV6(t, uint64(len(key)+len(value))*dataCopyGas, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+				readGas := make([]uint64, 0, numberOfReads)
+
+				_, err := test.BuildMockInstanceCallTest(t).
+					WithEnableEpochs(epochs).
+					WithContracts(
+						test.CreateMockContract(test.ParentAddress).
+							WithMethods(func(parentInstance *mock.InstanceMock, _ any) {
+								parentInstance.AddMockMethod("rereadStorage", func() *mock.InstanceMock {
+									_ = parentInstance.MemStore(rereadKeyPtr, key)
+									_ = parentInstance.MemStore(rereadAddressPtr, test.ParentAddress)
+									metering := parentInstance.Host.Metering()
+									for i := 0; i < numberOfReads; i++ {
+										gasLeft := metering.GasLeft()
+										load(parentInstance, key, i)
+										readGas = append(readGas, gasLeft-metering.GasLeft())
+									}
+									return parentInstance
+								})
+							})).
+					WithInput(test.CreateTestContractCallInputBuilder().
+						WithRecipientAddr(test.ParentAddress).
+						WithGasProvided(10_000_000).
+						WithFunction("rereadStorage").
+						Build()).
+					WithSetup(func(host vmhost.VMHost, world *worldmock.MockWorld) {
+						setZeroCodeCosts(host)
+						host.Metering().GasSchedule().BaseOpsAPICost.CachedStorageLoad = cachedStorageLoadGas
+						host.Metering().GasSchedule().BaseOperationCost.DataCopyPerByte = dataCopyGas
+
+						accountHandler, _ := world.GetUserAccount(test.ParentAddress)
+						_ = accountHandler.DataTrieTracker().SaveKeyValue(key, value)
+						_ = world.AccountsCacher.SaveAll()
+					}).
+					AndAssertResults(func(_ *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+						verify.Ok()
+						require.Len(t, readGas, numberOfReads)
+						for _, rereadGas := range readGas[1:] {
+							require.Equal(t, cachedStorageLoadGas+copyGas, rereadGas)
+						}
+					})
+				require.NoError(t, err)
+			})
+		})
+	}
+}
+
 func TestGasUsed_SetStorage_FlagEnabled(t *testing.T) {
 	setStorage(t, smallKey, 29)
 }
