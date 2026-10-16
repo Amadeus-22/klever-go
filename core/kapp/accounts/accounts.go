@@ -862,6 +862,19 @@ func (a *accountsKapp) Freeze(sender []byte, tc *transaction.FreezeContract) (tr
 		return resultCode, errPaused
 	}
 
+	var bucketID = assetID
+	if bytes.Equal(assetID, kdautils.KLVIdentifier) || bytes.Equal(assetID, kdautils.KFIIdentifier) {
+		bucketID = kdautils.ToBucketID(a.hasher, ctx.Block().GetRandSeed(), sender, assetID, ctx.TxNonce(), ctx.ContractID(), tc.GetAmount())
+
+		// Inside a contract call the ID ignores the outer sender and tx, so equal freezes in one tx, or by
+		// two users at the same nonce in one block, collide. Merging into a delegated bucket would drop
+		// its delegation while the validator still books it.
+		if a.forkController.FixAuditChangesV6() && len(userKDA.GetBuckets()[hex.EncodeToString(bucketID)].GetDelegation()) > 0 {
+			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBucketID, common.ErrBucketAlreadyDelegated.Error())
+			return transaction.Transaction_BucketIDInvalid, common.ErrBucketAlreadyDelegated
+		}
+	}
+
 	gains, err := a.ClaimBalance(transaction.ClaimContract_StakingClaim, assetID, ctx.Block(), ownerAcc, staking, kda, userKDA)
 	if err != nil && !errors.Is(err, state.ErrClaimNotAvailable) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldClaimError, err.Error())
@@ -878,11 +891,6 @@ func (a *accountsKapp) Freeze(sender []byte, tc *transaction.FreezeContract) (tr
 	if err != nil {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBalanceError, err.Error())
 		return transaction.Transaction_BalanceError, err
-	}
-
-	var bucketID = assetID
-	if bytes.Equal(assetID, kdautils.KLVIdentifier) || bytes.Equal(assetID, kdautils.KFIIdentifier) {
-		bucketID = kdautils.ToBucketID(a.hasher, ctx.Block().GetRandSeed(), sender, assetID, ctx.TxNonce(), ctx.ContractID(), tc.GetAmount())
 	}
 
 	err = ownerAcc.Freeze(assetID, bucketID, value, staking, userKDA, state.FreezeOptions{

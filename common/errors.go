@@ -861,6 +861,9 @@ var ErrAPRAboveMaximum = errors.New("apr above maximum")
 // ErrMaxBucketsExceeded max buckets exceeded for the asset
 var ErrMaxBucketsExceeded = errors.New("max bucket exceeded")
 
+// ErrBucketAlreadyDelegated signals a freeze that would merge into a bucket with an active delegation
+var ErrBucketAlreadyDelegated = errors.New("bucket already delegated")
+
 // ErrITONotActive signals that ITO is not active
 var ErrITONotActive = errors.New("ito not active")
 

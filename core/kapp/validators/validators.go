@@ -601,35 +601,79 @@ func (v *validatorsKApp) undelegate(
 		return err
 	}
 
-	val.TotalStake -= b.Value
-	if bytes.Equal(validator, sender) || bytes.Equal(val.OwnerAddress, sender) {
-		val.SelfStake -= b.Value
-	}
+	addStake(val, validator, sender, -b.Value)
 
 	return v.setValidator(app, validator, val)
 }
 
+// addStake moves the validator's stake totals by delta for a bucket owned by staker.
+func addStake(val *ValidatorData, validator, staker []byte, delta int64) {
+	val.TotalStake += delta
+	if bytes.Equal(validator, staker) || bytes.Equal(val.OwnerAddress, staker) {
+		val.SelfStake += delta
+	}
+}
+
+// replacedBooking loads the target validator's buckets and its active booking of the bucket, which a
+// delegation replaces rather than adds to. Before FixAuditChangesV6 it loads nothing.
+func (v *validatorsKApp) replacedBooking(
+	app state.KAppAccountHandler,
+	validator []byte,
+	encodedBucketID string,
+) (*PeerData, *PeerBucket, error) {
+	if !v.forkController.FixAuditChangesV6() {
+		return nil, nil, nil
+	}
+
+	pd, err := v.getValidatorBuckets(app, validator)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	booking := pd.GetBuckets()[encodedBucketID]
+	if booking == nil || booking.GetUndelegatedEpoch() != core.DefaultUndelegatedEpoch {
+		return pd, nil, nil
+	}
+
+	return pd, booking, nil
+}
+
+// acceptsDelegation reports whether the validator takes amount from sender. Its owner always can;
+// anyone else needs CanDelegate and room under MaxDelegation once the replaced booking is taken out.
+func acceptsDelegation(val *ValidatorData, validator, sender []byte, amount int64, replaced *PeerBucket) bool {
+	if bytes.Equal(sender, validator) || bytes.Equal(sender, val.GetOwnerAddress()) {
+		return true
+	}
+
+	if !val.GetCanDelegate() {
+		return false
+	}
+
+	// only check if MaxDelegationAmount > 0
+	return val.GetMaxDelegation() == 0 || val.GetTotalStake()-replaced.GetValue()+amount <= val.GetMaxDelegation()
+}
+
+// delegate books the bucket on the validator, replacing the active booking pd and replaced come
+// from (both nil before FixAuditChangesV6).
 func (v *validatorsKApp) delegate(
 	app state.KAppAccountHandler,
-	blockTime int64,
-	blockEpoch uint32,
 	validator []byte,
-	sender []byte,
-	bucketID []byte,
-	amountDelegation int64,
+	encodedBucketID string,
+	booking *PeerBucket,
+	pd *PeerData,
+	replaced *PeerBucket,
 ) error {
 	val, err := v.getValidator(app, validator)
 	if err != nil {
 		return err
 	}
 
-	pd, err := v.getValidatorBuckets(app, validator)
-	if err != nil {
-		return err
+	if pd == nil {
+		pd, err = v.getValidatorBuckets(app, validator)
+		if err != nil {
+			return err
+		}
 	}
-
-	// must use string to marshal proto map due UTF8 issue
-	encodedBucketID := hex.EncodeToString(bucketID)
 
 	// Check if adding a new bucket would exceed the maximum limit
 	// (skip check if bucket already exists - it's a re-delegation)
@@ -640,23 +684,20 @@ func (v *validatorsKApp) delegate(
 		}
 	}
 
-	pd.Buckets[encodedBucketID] = &PeerBucket{
-		DelegatedAt:      blockTime,
-		DelegatedEpoch:   blockEpoch,
-		UndelegatedEpoch: core.DefaultUndelegatedEpoch,
-		Value:            amountDelegation,
-		Address:          sender,
+	// An active bucket being overwritten is still counted in the stake totals; take it out first so
+	// they keep matching the sum of the buckets.
+	if replaced != nil {
+		addStake(val, validator, replaced.Address, -replaced.Value)
 	}
+
+	pd.Buckets[encodedBucketID] = booking
 
 	err = v.setValidatorBuckets(app, validator, pd)
 	if err != nil {
 		return err
 	}
 
-	val.TotalStake += amountDelegation
-	if bytes.Equal(validator, sender) || bytes.Equal(val.OwnerAddress, sender) {
-		val.SelfStake += amountDelegation
-	}
+	addStake(val, validator, booking.Address, booking.Value)
 
 	return v.setValidator(app, validator, val)
 }
@@ -708,23 +749,19 @@ func (v *validatorsKApp) Delegate(
 		return transaction.Transaction_BucketIDInvalid, update, common.ErrInvalidValue
 	}
 
-	currentDelegation := make([]byte, len(bucket.Delegation))
-	if len(bucket.Delegation) > 0 {
-		copy(currentDelegation, bucket.Delegation)
-	}
+	currentDelegation := bytes.Clone(bucket.Delegation)
 
 	amountDelegation := bucket.Value
 
-	// if account is delegating to another peer, must check the for max delegation
-	if !bytes.Equal(sender, tc.GetToAddress()) &&
-		!bytes.Equal(sender, val.GetOwnerAddress()) {
+	// An active booking of this bucket on the target is replaced, not added to: the cap check and
+	// delegate both take it out of the totals.
+	pd, replaced, err := v.replacedBooking(app, tc.GetToAddress(), encodedBucketID)
+	if err != nil {
+		return transaction.Transaction_AccountError, update, err
+	}
 
-		// check if allow delegation
-		if !val.GetCanDelegate() ||
-			// only check if MaxDelegationAmount > 0
-			(val.GetMaxDelegation() != 0 && val.GetTotalStake()+amountDelegation > val.GetMaxDelegation()) {
-			return transaction.Transaction_MaxDelegationAmount, update, common.ErrInvalidValue
-		}
+	if !acceptsDelegation(val, tc.GetToAddress(), sender, amountDelegation, replaced) {
+		return transaction.Transaction_MaxDelegationAmount, update, common.ErrInvalidValue
 	}
 
 	// REMOVE previous delegation
@@ -737,7 +774,14 @@ func (v *validatorsKApp) Delegate(
 	}
 
 	// DELEGATE
-	err = v.delegate(app, blockTime, blockEpoch, tc.GetToAddress(), sender, tc.BucketID, amountDelegation)
+	booking := &PeerBucket{
+		DelegatedAt:      blockTime,
+		DelegatedEpoch:   blockEpoch,
+		UndelegatedEpoch: core.DefaultUndelegatedEpoch,
+		Value:            amountDelegation,
+		Address:          sender,
+	}
+	err = v.delegate(app, tc.GetToAddress(), encodedBucketID, booking, pd, replaced)
 	if err != nil {
 		return transaction.Transaction_AccountError, update, err
 	}
