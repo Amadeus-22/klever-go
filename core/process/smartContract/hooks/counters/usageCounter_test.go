@@ -2,6 +2,7 @@ package counters_test
 
 import (
 	"errors"
+	"math/big"
 	"testing"
 
 	"github.com/klever-io/klever-go/common/mock"
@@ -9,7 +10,9 @@ import (
 	"github.com/klever-io/klever-go/core/process"
 	"github.com/klever-io/klever-go/core/process/smartContract/hooks/counters"
 	"github.com/klever-io/klever-go/tools/check"
+	"github.com/klever-io/klever-go/tools/marshal"
 	"github.com/klever-io/klever-go/vmcommon"
+	"github.com/klever-io/klever-go/vmcommon/parsers"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -286,6 +289,35 @@ func TestBeforeForkMultiTransferStillCounted(t *testing.T) {
 	expectedMap := map[string]uint64{
 		crtBuiltinCalls: 4,
 		crtTransfers:    8,
+		crtTrieReads:    0,
+	}
+	assert.Equal(t, expectedMap, countersMap)
+}
+
+func TestBeforeForkTransferCountBeyondArgumentsIsNotCounted(t *testing.T) {
+	t.Parallel()
+
+	parser, err := parsers.NewKDATransferParser(&marshal.ProtoMarshalizer{})
+	assert.Nil(t, err)
+	counter, _ := counters.NewUsageCounter(parser, mock.NewForkControllerStub().SetFork("FixAuditChangesV3", false))
+	counter.SetMaximumValues(generateMapsOfValues(100))
+
+	vmInput := &vmcommon.ContractCallInput{
+		VMInput: vmcommon.VMInput{
+			Arguments: [][]byte{
+				big.NewInt(0).SetUint64(0x5555555555555556).Bytes(),
+				[]byte("KLV"), {}, {1},
+			},
+		},
+		Function: core.BuiltInFunctionFreeze,
+	}
+
+	assert.Nil(t, counter.ProcessMaxBuiltInCounters(vmInput))
+
+	countersMap := counter.GetCounterValues()
+	expectedMap := map[string]uint64{
+		crtBuiltinCalls: 1,
+		crtTransfers:    0,
 		crtTrieReads:    0,
 	}
 	assert.Equal(t, expectedMap, countersMap)

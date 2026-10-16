@@ -31,5 +31,8 @@ var ErrNotKDATransferInput = errors.New("not an KDA transfer input")
 // ErrNotEnoughArguments signals not enough arguments error
 var ErrNotEnoughArguments = errors.New("not enough arguments")
 
+// ErrNonceOutOfRange signals that a transfer nonce does not fit in 64 bits
+var ErrNonceOutOfRange = errors.New("nonce out of range")
+
 // ErrNilMarshalizer signals that marshaller is nil
 var ErrNilMarshalizer = errors.New("nil marshaller")
