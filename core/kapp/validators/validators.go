@@ -288,7 +288,7 @@ func (v *validatorsKApp) Register(sender []byte, tc *transaction.CreateValidator
 		return transaction.Transaction_AccountError, common.ErrAccountValidatorSet
 	}
 
-	peerAcc, resultCode, err := v.claimPeerAccount(ctx, tc.GetOwnerAddress(), tc.GetConfig().GetBLSPublicKey())
+	peerAcc, resultCode, err := v.claimPeerAccount(ctx, tc.GetOwnerAddress(), tc.GetConfig().GetBLSPublicKey(), tc.GetConfig().GetBLSSignature())
 	if err != nil {
 		return resultCode, err
 	}
@@ -341,7 +341,8 @@ func (v *validatorsKApp) Register(sender []byte, tc *transaction.CreateValidator
 }
 
 // validateRegisterContract runs Register's stateless checks, in order: owner address and
-// sender, reward address, commission and delegation cap, metadata, BLS key and its proof
+// sender, reward address, commission and delegation cap, metadata, BLS key. The proof of the
+// key is checked in claimPeerAccount, after the cheaper state lookups
 func (v *validatorsKApp) validateRegisterContract(ctx kapp.KappContext, sender []byte, tc *transaction.CreateValidatorContract) (transaction.Transaction_TXResultCode, error) {
 	if len(tc.GetOwnerAddress()) != v.addressLen {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidOwnerAddress, process.ErrInvalidRcvAddr.Error())
@@ -373,16 +374,12 @@ func (v *validatorsKApp) validateRegisterContract(ctx kapp.KappContext, sender [
 		return transaction.Transaction_ParameterInvalid, err
 	}
 
-	if err := v.verifyBLSKeyProof(ctx, tc.GetOwnerAddress(), tc.GetConfig().GetBLSPublicKey(), tc.GetConfig().GetBLSSignature()); err != nil {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBLSKeyProof, err.Error())
-		return transaction.Transaction_AccountError, err
-	}
-
 	return transaction.Transaction_Ok, nil
 }
 
-// claimPeerAccount binds an unused, unrevoked BLS key to owner on registration
-func (v *validatorsKApp) claimPeerAccount(ctx kapp.KappContext, owner, blsPubKey []byte) (state.PeerAccountHandler, transaction.Transaction_TXResultCode, error) {
+// claimPeerAccount binds an unused, unrevoked BLS key to owner on registration, once its
+// proof of possession for owner verifies
+func (v *validatorsKApp) claimPeerAccount(ctx kapp.KappContext, owner, blsPubKey, proof []byte) (state.PeerAccountHandler, transaction.Transaction_TXResultCode, error) {
 	peerAcc, err := v.loadPeerAccount(blsPubKey)
 	if err != nil {
 		return nil, transaction.Transaction_AccountError, err
@@ -398,6 +395,12 @@ func (v *validatorsKApp) claimPeerAccount(ctx kapp.KappContext, owner, blsPubKey
 	if v.forkController.FixStakingBuckets() && peerAcc.GetRevoked() {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBLSKeyRevoked, common.ErrAccountValidatorSet.Error())
 		return nil, transaction.Transaction_AccountError, common.ErrAccountValidatorSet
+	}
+
+	// the pairing runs after the lookups that refuse a registration cheaply, and before any write
+	if err = v.verifyBLSKeyProof(ctx, owner, blsPubKey, proof); err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBLSKeyProof, err.Error())
+		return nil, transaction.Transaction_AccountError, err
 	}
 
 	err = peerAcc.SetOwnerAddress(owner)
@@ -491,17 +494,7 @@ func (v *validatorsKApp) UpdateValidator(sender []byte, tc *transaction.Validato
 		return transaction.Transaction_AccountError, err
 	}
 
-	// check if BLS Key matchs current
-	if len(tc.GetConfig().GetBLSPublicKey()) > 0 &&
-		!bytes.Equal(val.BlsPubKey, tc.GetConfig().GetBLSPublicKey()) {
-		if resultCode, err := v.rotateBLSKey(ctx, sender, val, tc.GetConfig()); err != nil {
-			return resultCode, err
-		}
-	}
-
-	// the metadata is checked after the key rotation, as it always was, so the
-	// result of a transaction that fails both stays the same
-	if resultCode, err := validateValidatorMetadata(ctx, tc.GetConfig()); err != nil {
+	if resultCode, err := v.rotateKeyAndCheckMetadata(ctx, sender, val, tc.GetConfig()); err != nil {
 		return resultCode, err
 	}
 
@@ -526,6 +519,32 @@ func (v *validatorsKApp) UpdateValidator(sender []byte, tc *transaction.Validato
 	return transaction.Transaction_Ok, nil
 }
 
+// rotateKeyAndCheckMetadata rotates the BLS key when cfg changes it and checks cfg's metadata.
+// From FixAuditChangesV6 on the metadata is checked first, so a refused update writes nothing.
+// Before it the metadata is checked after the rotation, as it always was, so the result of a
+// transaction that fails both stays the same
+func (v *validatorsKApp) rotateKeyAndCheckMetadata(ctx kapp.KappContext, sender []byte, val *ValidatorData, cfg *transaction.ValidatorConfig) (transaction.Transaction_TXResultCode, error) {
+	metadataFirst := v.forkController.FixAuditChangesV6()
+	if metadataFirst {
+		if resultCode, err := validateValidatorMetadata(ctx, cfg); err != nil {
+			return resultCode, err
+		}
+	}
+
+	// check if BLS Key matchs current
+	if len(cfg.GetBLSPublicKey()) > 0 && !bytes.Equal(val.BlsPubKey, cfg.GetBLSPublicKey()) {
+		if resultCode, err := v.rotateBLSKey(ctx, sender, val, cfg); err != nil {
+			return resultCode, err
+		}
+	}
+
+	if metadataFirst {
+		return transaction.Transaction_Ok, nil
+	}
+
+	return validateValidatorMetadata(ctx, cfg)
+}
+
 // rotateBLSKey moves sender's validator from val.BlsPubKey to cfg's BLS key: it revokes
 // the current key, binds the new one to sender and updates val.BlsPubKey
 func (v *validatorsKApp) rotateBLSKey(ctx kapp.KappContext, sender []byte, val *ValidatorData, cfg *transaction.ValidatorConfig) (transaction.Transaction_TXResultCode, error) {
@@ -536,11 +555,6 @@ func (v *validatorsKApp) rotateBLSKey(ctx kapp.KappContext, sender []byte, val *
 		return transaction.Transaction_InvalidPeerKey, err
 	}
 
-	if err := v.verifyBLSKeyProof(ctx, sender, newKey, cfg.GetBLSSignature()); err != nil {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBLSKeyProof, err.Error())
-		return transaction.Transaction_InvalidPeerKey, err
-	}
-
 	// from FixAuditChangesV6 on the new key is checked before the current one is revoked, so a
 	// refused rotation leaves the current key untouched even where its writes are kept
 	checkTargetFirst := v.forkController.FixAuditChangesV6()
@@ -548,6 +562,12 @@ func (v *validatorsKApp) rotateBLSKey(ctx kapp.KappContext, sender []byte, val *
 		if resultCode, err := v.loadAndCheckRotationTarget(ctx, sender, newKey); err != nil {
 			return resultCode, err
 		}
+	}
+
+	// the proof is only checked from FixAuditChangesV6 on, after the cheaper target check
+	if err := v.verifyBLSKeyProof(ctx, sender, newKey, cfg.GetBLSSignature()); err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBLSKeyProof, err.Error())
+		return transaction.Transaction_InvalidPeerKey, err
 	}
 
 	// Reset old peer

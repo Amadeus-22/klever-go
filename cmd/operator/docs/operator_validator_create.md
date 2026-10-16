@@ -2,6 +2,9 @@
 
 create a validator
 
+From fork FixAuditChangesV6 on, the owner must send the transaction: with --bls-proof, a --fromAddress
+other than OWNER_ADDRESS is refused before anything is sent.
+
 ```
 operator validator create [OWNER_ADDRESS] [flags]
 ```
@@ -10,6 +13,7 @@ operator validator create [OWNER_ADDRESS] [flags]
 
 ```
       --bls string            set node BLS PublicKey
+      --bls-proof string      hex BLS key proof of possession, produced on the node host with keygenerator bls-proof; required from fork FixAuditChangesV6 on for registration and for key rotation
       --canDelegate           set if validator can delegate (default true)
       --commission float      set validator commission (default 10)
   -h, --help                  help for create

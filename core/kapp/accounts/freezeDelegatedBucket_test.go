@@ -15,6 +15,9 @@ import (
 	"github.com/klever-io/klever-go/core/kapp/validators"
 	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	"github.com/klever-io/klever-go/crypto/hashing/blake2b"
+	"github.com/klever-io/klever-go/crypto/signing"
+	"github.com/klever-io/klever-go/crypto/signing/mcl"
+	"github.com/klever-io/klever-go/crypto/signing/mcl/singlesig"
 	"github.com/klever-io/klever-go/data/block"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
@@ -174,11 +177,20 @@ func (h *delegatedBucketHarness) registerValidator(t *testing.T, owner []byte) {
 
 func (h *delegatedBucketHarness) registerValidatorWithCap(t *testing.T, owner []byte, maxDelegation int64) {
 	t.Helper()
-	code, err := h.vk.Register(&transaction.CreateValidatorContract{
+
+	// from FixAuditChangesV6 on a registration needs a real BLS key and its proof for the owner
+	sk, pk := signing.NewKeyGenerator(mcl.NewSuiteBLS12()).GeneratePair()
+	blsKey, err := pk.ToByteArray()
+	require.NoError(t, err)
+	proof, err := singlesig.NewBlsSigner().Sign(sk, transaction.BLSKeyProofMessage(owner, blsKey))
+	require.NoError(t, err)
+
+	code, err := h.vk.Register(owner, &transaction.CreateValidatorContract{
 		OwnerAddress: owner,
 		Config: &transaction.ValidatorConfig{
 			RewardAddress:       owner,
-			BLSPublicKey:        append([]byte("bls-"), owner...),
+			BLSPublicKey:        blsKey,
+			BLSSignature:        proof,
 			CanDelegate:         true,
 			Commission:          1000,
 			MaxDelegationAmount: maxDelegation,

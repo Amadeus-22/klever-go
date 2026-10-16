@@ -178,23 +178,39 @@ func TestUpdateValidator_RefusalResults(t *testing.T) {
 		requireLastErrorReceipt(t, v, common.ErrFieldInvalidName, common.ErrInvalidValue)
 	})
 
-	t.Run("rotation to a revoked key, with invalid metadata too, reports the key", func(t *testing.T) {
+	// rotateToRevokedWithBadLogo rotates owner's validator to a second key, then sends a rotation back
+	// to the revoked first key with an invalid logo, and returns the second key
+	rotateToRevokedWithBadLogo := func(t *testing.T, v6 bool) (*validatorsKApp, testBLSKey, transaction.Transaction_TXResultCode, error) {
 		v, firstKey := setup(t)
 		secondKey := newTestBLSKey(t)
 		resultCode, err := v.UpdateValidator(owner, newRotateContract(secondKey.pub, secondKey.proof(t, owner)))
 		require.Equal(t, transaction.Transaction_Ok, resultCode)
 		require.NoError(t, err)
+		setFixAuditChangesV6(v, v6)
 
 		tc := newRotateContract(firstKey.pub, firstKey.proof(t, owner))
 		tc.Config.Logo = invalidUTF8
 
 		resultCode, err = v.UpdateValidator(owner, tc)
+		return v, secondKey, resultCode, err
+	}
+
+	t.Run("rotation to a revoked key, with invalid metadata too, reports the metadata", func(t *testing.T) {
+		v, secondKey, resultCode, err := rotateToRevokedWithBadLogo(t, true)
+
+		assert.Equal(t, transaction.Transaction_ParameterInvalid, resultCode)
+		assert.Equal(t, common.ErrInvalidValue, err)
+		requireLastErrorReceipt(t, v, common.ErrFieldInvalidLogo, common.ErrInvalidValue)
+		// the metadata is checked before the rotation, which never starts
+		requireBound(t, v, owner, secondKey.pub)
+	})
+
+	t.Run("V6 off: rotation to a revoked key, with invalid metadata too, reports the key", func(t *testing.T) {
+		v, _, resultCode, err := rotateToRevokedWithBadLogo(t, false)
 
 		assert.Equal(t, transaction.Transaction_InvalidPeerKey, resultCode)
 		assert.Equal(t, common.ErrBLSKeyRevoked, err)
 		requireLastErrorReceipt(t, v, common.ErrFieldBLSKeyRevoked, common.ErrBLSKeyRevoked)
-		// the new key is checked before the current one is revoked
-		requireBound(t, v, owner, secondKey.pub)
 	})
 
 	t.Run("rotation to a key bound to another validator", func(t *testing.T) {

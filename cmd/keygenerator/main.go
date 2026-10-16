@@ -108,7 +108,7 @@ This binary will generate a validatorKey.pem, walletKey.pem or p2pKey.pem, each 
 %s`, g("type 'keygenerator --help' for details")),
 }
 
-func main() {
+func init() {
 	// numKeys defines a flag for setting how many keys should generate
 	rootCmd.Flags().IntVarP(&argsConfig.numKeys, "num-keys", "n", 1, "How many keys should generate. Example: 1")
 	// keyType defines a flag for setting what keys should generate
@@ -127,6 +127,15 @@ func main() {
 	rootCmd.Flags().Lookup("password").NoOptDefVal = "*"
 	rootCmd.PersistentFlags().StringVar(&pwdFilePath, "password-file", "", "path to a file containing the password")
 
+	// with a subcommand and no Args, cobra refuses combined short flags such as -sn 2, which the root
+	// accepted before. NoArgs keeps them, as it checks after flag parsing, and refuses a mistyped
+	// subcommand instead of generating keys, which would replace the validatorKey.pem in the directory
+	rootCmd.Args = cobra.NoArgs
+	rootCmd.CompletionOptions.DisableDefaultCmd = true
+	rootCmd.AddCommand(newBLSProofCmd())
+}
+
+func main() {
 	Execute()
 }
 

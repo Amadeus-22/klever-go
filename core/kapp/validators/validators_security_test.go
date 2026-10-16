@@ -610,9 +610,10 @@ func TestBLSKeyProof_KLC2740_TicketReproduction(t *testing.T) {
 	require.Equal(t, transaction.Transaction_Ok, resultCode)
 	require.NoError(t, err)
 
+	// K is bound to the victim, so the rotation is refused before its proof is even checked
 	resultCode, err = v.UpdateValidator(attacker, newRotateContract(victimKey.pub, victimProof))
 	require.Equal(t, transaction.Transaction_InvalidPeerKey, resultCode)
-	require.Equal(t, common.ErrInvalidBLSKeyProof, err)
+	require.Equal(t, common.ErrAccountValidatorNotOwner, err)
 	requireBound(t, v, victim, victimKey.pub)
 	requireBound(t, v, attacker, attackerKey.pub)
 }
@@ -669,6 +670,96 @@ func TestRegister_OwnerMustBeSender_KLC2740(t *testing.T) {
 
 		require.Equal(t, transaction.Transaction_Ok, resultCode)
 		require.NoError(t, err)
+		requireBound(t, v, owner, key.pub)
+	})
+}
+
+// countingBLSVerifier counts the proof pairings it runs
+type countingBLSVerifier struct {
+	inner blsSignatureVerifier
+	calls int
+}
+
+func (c *countingBLSVerifier) VerifyBLS(key []byte, msg []byte, sig []byte) error {
+	c.calls++
+	return c.inner.VerifyBLS(key, msg, sig)
+}
+
+// TestBLSKeyProof_PairingRunsAfterTheCheaperChecks_KLC2740 pins that a registration or a rotation
+// refused by a state lookup or by its metadata never runs the proof pairing.
+func TestBLSKeyProof_PairingRunsAfterTheCheaperChecks_KLC2740(t *testing.T) {
+	t.Parallel()
+
+	owner := makeAddress("owner")
+	other := makeAddress("other")
+
+	// setup registers owner and other, each with a fresh key, and starts counting after that
+	setup := func(t *testing.T) (*validatorsKApp, *countingBLSVerifier, testBLSKey, testBLSKey) {
+		v := newProofTestKApp(t, true)
+		ownerKey, otherKey := newTestBLSKey(t), newTestBLSKey(t)
+		for _, reg := range []struct {
+			addr []byte
+			key  testBLSKey
+		}{{owner, ownerKey}, {other, otherKey}} {
+			resultCode, err := v.Register(reg.addr, newRegisterContractWithProof(reg.addr, reg.key.pub, reg.key.proof(t, reg.addr)))
+			require.Equal(t, transaction.Transaction_Ok, resultCode)
+			require.NoError(t, err)
+		}
+
+		counter := &countingBLSVerifier{inner: v.blsVerifier}
+		v.blsVerifier = counter
+		return v, counter, ownerKey, otherKey
+	}
+
+	t.Run("registering an owner that already has a validator", func(t *testing.T) {
+		v, counter, _, _ := setup(t)
+		key := newTestBLSKey(t)
+
+		_, err := v.Register(owner, newRegisterContractWithProof(owner, key.pub, key.proof(t, owner)))
+		assert.Equal(t, common.ErrAccountValidatorSet, err)
+		requireLastErrorReceipt(t, v, common.ErrFieldValidatorAlreadySet, common.ErrAccountValidatorSet)
+		assert.Zero(t, counter.calls)
+	})
+
+	t.Run("registering a key bound to another validator", func(t *testing.T) {
+		v, counter, _, otherKey := setup(t)
+		third := makeAddress("third")
+
+		_, err := v.Register(third, newRegisterContractWithProof(third, otherKey.pub, otherKey.proof(t, third)))
+		assert.Equal(t, common.ErrAccountValidatorSet, err)
+		requireLastErrorReceipt(t, v, common.ErrFieldBLSKeyAlreadyUsed, common.ErrAccountValidatorSet)
+		assert.Zero(t, counter.calls)
+	})
+
+	t.Run("rotating to a key bound to another validator", func(t *testing.T) {
+		v, counter, ownerKey, otherKey := setup(t)
+
+		_, err := v.UpdateValidator(owner, newRotateContract(otherKey.pub, otherKey.proof(t, owner)))
+		assert.Equal(t, common.ErrAccountValidatorNotOwner, err)
+		assert.Zero(t, counter.calls)
+		requireBound(t, v, owner, ownerKey.pub)
+	})
+
+	t.Run("rotating with invalid metadata", func(t *testing.T) {
+		v, counter, ownerKey, _ := setup(t)
+		key := newTestBLSKey(t)
+		tc := newRotateContract(key.pub, key.proof(t, owner))
+		tc.Config.Name = invalidUTF8
+
+		_, err := v.UpdateValidator(owner, tc)
+		assert.Equal(t, common.ErrInvalidValue, err)
+		assert.Zero(t, counter.calls)
+		requireBound(t, v, owner, ownerKey.pub)
+	})
+
+	t.Run("an accepted rotation runs one pairing", func(t *testing.T) {
+		v, counter, _, _ := setup(t)
+		key := newTestBLSKey(t)
+
+		resultCode, err := v.UpdateValidator(owner, newRotateContract(key.pub, key.proof(t, owner)))
+		require.Equal(t, transaction.Transaction_Ok, resultCode)
+		require.NoError(t, err)
+		assert.Equal(t, 1, counter.calls)
 		requireBound(t, v, owner, key.pub)
 	})
 }
