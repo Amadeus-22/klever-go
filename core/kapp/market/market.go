@@ -12,6 +12,7 @@ import (
 
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/common"
+	"github.com/klever-io/klever-go/common/types"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
 	"github.com/klever-io/klever-go/core/process"
@@ -358,6 +359,10 @@ func (m *marketKapp) Buy(sender []byte, tc *transaction.BuyContract) (transactio
 		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
 	}
 
+	if status, err := m.checkBidControls(ctx, marketOrder, currencyID, sender, tc.GetAmount()); err != nil {
+		return status, err
+	}
+
 	if len(marketOrder.CurrentBidder) > 0 {
 		lastBidderAcc, err := m.GetExistingUserAccount(marketOrder.CurrentBidder)
 		if err != nil {
@@ -520,13 +525,9 @@ func (m *marketKapp) computeSplitRoyalties(ctx kapp.KappContext, address string,
 		return transaction.Transaction_LoadAccountError, err
 	}
 
-	splitToPay, err := tools.ComputePercentageI64(value, percentage, m.forkController.EnableSmartContracts())
+	splitToPay, status, err := m.splitRoyaltyAmount(ctx, value, percentage, *royaltiesToPay)
 	if err != nil {
-		return transaction.Transaction_ParameterInvalid, err
-	}
-	if m.forkController.FixMarketBuyOverflow() && splitToPay > *royaltiesToPay {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, common.ErrInvalidValue.Error())
-		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
+		return status, err
 	}
 	*royaltiesToPay -= splitToPay
 
@@ -555,13 +556,32 @@ func (m *marketKapp) computeSplitRoyalties(ctx kapp.KappContext, address string,
 	return transaction.Transaction_Ok, nil
 }
 
+// splitRoyaltyAmount returns the share of value a royalty split of percentage receives. Under
+// FixMarketBuyOverflow a share above remaining, what the earlier splits left of value, is
+// refused. Settlement and checkSettlementControls both take a split's amount from here.
+func (m *marketKapp) splitRoyaltyAmount(ctx kapp.KappContext, value int64, percentage int64, remaining int64) (int64, transaction.Transaction_TXResultCode, error) {
+	splitToPay, err := tools.ComputePercentageI64(value, percentage, m.forkController.EnableSmartContracts())
+	if err != nil {
+		return 0, transaction.Transaction_ParameterInvalid, err
+	}
+	if m.forkController.FixMarketBuyOverflow() && splitToPay > remaining {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, common.ErrInvalidValue.Error())
+		return 0, transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
+	}
+
+	return splitToPay, transaction.Transaction_Ok, nil
+}
+
 func (m *marketKapp) computeRoyaltiesFixedDeposit(ctx kapp.KappContext, marketOrder *kapps.MarketOrderData, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	if marketOrder.RoyaltiesFixedDeposit <= 0 {
 		return transaction.Transaction_Ok, nil
 	}
 
+	// Each split adds a Transfer receipt that a calling contract reads back as a transfer, so
+	// under FixAuditChangesV6 the splits are paid in key order, the same on every node.
 	royaltiesMarketFixedToPay := marketOrder.RoyaltiesFixedDeposit
-	for key, value := range asset.Royalties.SplitRoyalties {
+	for _, key := range types.OrderedKeys(asset.Royalties.SplitRoyalties, m.forkController.FixAuditChangesV6()) {
+		value := asset.Royalties.SplitRoyalties[key]
 		status, err := m.computeSplitRoyalties(ctx, key, marketOrder, kdautils.KLVIdentifier, marketOrder.RoyaltiesFixedDeposit, int64(value.PercentMarketFixed), &royaltiesMarketFixedToPay)
 		if err != nil {
 			return status, err
@@ -607,8 +627,10 @@ func (m *marketKapp) computeRoyaltiesAmount(ctx kapp.KappContext, marketOrder *k
 		return transaction.Transaction_Ok, nil
 	}
 
+	// Paid in key order under FixAuditChangesV6, as in computeRoyaltiesFixedDeposit.
 	royaltiesMarketPercentageToPay := royaltiesAmount
-	for key, value := range asset.Royalties.SplitRoyalties {
+	for _, key := range types.OrderedKeys(asset.Royalties.SplitRoyalties, m.forkController.FixAuditChangesV6()) {
+		value := asset.Royalties.SplitRoyalties[key]
 		status, err := m.computeSplitRoyalties(ctx, key, marketOrder, currencyID, royaltiesAmount, int64(value.PercentMarketPercentage), &royaltiesMarketPercentageToPay)
 		if err != nil {
 			return status, err
@@ -696,17 +718,23 @@ func (m *marketKapp) computeMarketOwnerAmount(ctx kapp.KappContext, marketOrder 
 	return transaction.Transaction_Ok, nil
 }
 
-func (m *marketKapp) executeBuyMarket(bidderAcc state.UserAccountHandler, marketKapp state.KAppAccountHandler, marketOrder *kapps.MarketOrderData, currencyID []byte) (transaction.Transaction_TXResultCode, error) {
-	ctx := m.KAppController.GetCurrentKAppContext()
+// settlementAmounts is how a sale at a given bid splits in the order currency: the referral
+// share and who receives it, the percentage royalty (split and remainder) and what is left to
+// the order owner. Settlement pays it and checkSettlementControls checks the same legs, so both
+// take it from computeSettlementAmounts.
+type settlementAmounts struct {
+	referralAddress []byte
+	referral        int64
+	royalties       int64
+	marketOwner     int64
+}
 
-	_, asset, err := m.KAppController.GetKDAKApp().GetKDA(marketOrder.CollectionID)
+// computeSettlementAmounts splits bid for marketOrder under the asset's live royalties. It only
+// reads state; a failure adds the same receipt and returns the same code settlement always has.
+func (m *marketKapp) computeSettlementAmounts(ctx kapp.KappContext, marketOrder *kapps.MarketOrderData, royalties *kapps.RoyaltiesData, bid int64) (settlementAmounts, transaction.Transaction_TXResultCode, error) {
+	referralAmount, err := tools.ComputePercentageI64(bid, int64(marketOrder.ReferralPercentage), m.forkController.EnableSmartContracts())
 	if err != nil {
-		return transaction.Transaction_KAPPError, err
-	}
-
-	referralAmount, err := tools.ComputePercentageI64(marketOrder.CurrentBid, int64(marketOrder.ReferralPercentage), m.forkController.EnableSmartContracts())
-	if err != nil {
-		return transaction.Transaction_ParameterInvalid, err
+		return settlementAmounts{}, transaction.Transaction_ParameterInvalid, err
 	}
 
 	// Marketplaces whose referral address was cleared before the fork still carry orders that
@@ -734,7 +762,7 @@ func (m *marketKapp) executeBuyMarket(bidderAcc state.UserAccountHandler, market
 	if referralAmount > 0 {
 		referralAddress, err = m.referralBeneficiary(marketOrder)
 		if err != nil {
-			return transaction.Transaction_ParameterInvalid, err
+			return settlementAmounts{}, transaction.Transaction_ParameterInvalid, err
 		}
 	}
 
@@ -746,22 +774,87 @@ func (m *marketKapp) executeBuyMarket(bidderAcc state.UserAccountHandler, market
 	// economics are fixed at list time and a later UpdateRoyalties cannot change the payout
 	// (KLC-2457 / GHSA-p7gw-2pcp-5pf8). Orders listed before the fork carry no snapshot and
 	// keep using the live asset royalty.
-	royaltyPercentage := asset.Royalties.MarketPercentage
+	royaltyPercentage := royalties.MarketPercentage
 	if marketOrder.RoyaltySnapshotted {
 		royaltyPercentage = marketOrder.RoyaltyPercentage
 	}
-	royaltiesAmount, err := tools.ComputePercentageI64(marketOrder.CurrentBid, int64(royaltyPercentage), m.forkController.EnableSmartContracts())
+	royaltiesAmount, err := tools.ComputePercentageI64(bid, int64(royaltyPercentage), m.forkController.EnableSmartContracts())
 	if err != nil {
-		return transaction.Transaction_ParameterInvalid, err
+		return settlementAmounts{}, transaction.Transaction_ParameterInvalid, err
 	}
-	marketOwnerAmount := marketOrder.CurrentBid - referralAmount - royaltiesAmount
+	marketOwnerAmount := bid - referralAmount - royaltiesAmount
 
 	if m.forkController.FixMarketBuyOverflow() && marketOwnerAmount < 0 {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRoyalties, common.ErrInvalidValue.Error())
-		return transaction.Transaction_AmountInvalid, common.ErrInvalidValue
+		return settlementAmounts{}, transaction.Transaction_AmountInvalid, common.ErrInvalidValue
 	}
 
-	status, err := m.computeReferralAmount(ctx, marketOrder, referralAddress, referralAmount, currencyID)
+	return settlementAmounts{
+		referralAddress: referralAddress,
+		referral:        referralAmount,
+		royalties:       royaltiesAmount,
+		marketOwner:     marketOwnerAmount,
+	}, transaction.Transaction_Ok, nil
+}
+
+// prepareSettlement loads marketOrder's collection and splits its current bid, the sale to
+// buyer that settlement pays. It only reads state.
+//
+// Under FixAuditChangesV6 the sale is a transfer of both assets and follows their controls: a
+// paused collection or currency refuses it with AssetPaused, and a leg a direct transfer would
+// refuse with KDATransferNotAllowed (see checkSettlementControls). The pause is checked first.
+// Either refusal returns without a receipt, so the expired Claim can unwind the order instead;
+// a caller that fails on it adds the receipt with addControlRefusedReceipt. Before the fork
+// neither asset's controls are read.
+func (m *marketKapp) prepareSettlement(ctx kapp.KappContext, marketOrder *kapps.MarketOrderData, currencyID []byte, buyer []byte) (*kapps.KDAData, settlementAmounts, transaction.Transaction_TXResultCode, error) {
+	_, asset, err := m.KAppController.GetKDAKApp().GetKDA(marketOrder.CollectionID)
+	if err != nil {
+		return nil, settlementAmounts{}, transaction.Transaction_KAPPError, err
+	}
+
+	var currency *kapps.KDAData
+	if m.forkController.FixAuditChangesV6() {
+		status, errPause := checkNotPaused(asset)
+		if errPause != nil {
+			return nil, settlementAmounts{}, status, errPause
+		}
+
+		currency, status, errPause = m.loadUnpausedKDA(ctx, currencyID)
+		if errPause != nil {
+			return nil, settlementAmounts{}, status, errPause
+		}
+	}
+
+	amounts, status, err := m.computeSettlementAmounts(ctx, marketOrder, asset.Royalties, marketOrder.CurrentBid)
+	if err != nil {
+		return nil, settlementAmounts{}, status, err
+	}
+
+	if m.forkController.FixAuditChangesV6() {
+		status, err = m.checkSettlementControls(ctx, marketOrder, asset, asset.Royalties, currency, buyer, amounts)
+		if err != nil {
+			return nil, settlementAmounts{}, status, err
+		}
+	}
+
+	return asset, amounts, transaction.Transaction_Ok, nil
+}
+
+func (m *marketKapp) executeBuyMarket(bidderAcc state.UserAccountHandler, marketKapp state.KAppAccountHandler, marketOrder *kapps.MarketOrderData, currencyID []byte) (transaction.Transaction_TXResultCode, error) {
+	ctx := m.KAppController.GetCurrentKAppContext()
+
+	// This is reached from Buy and from both settling branches of Claim, so under
+	// FixAuditChangesV6 a pause or a role change after the listing or the bid refuses
+	// settlement too. CancelOrder and a Claim below the reserve still return the NFT and the
+	// bid to their owners, and so does an expired Claim that a pause or a refused leg stops
+	// from settling (see Claim).
+	asset, amounts, status, err := m.prepareSettlement(ctx, marketOrder, currencyID, bidderAcc.AddressBytes())
+	if err != nil {
+		addControlRefusedReceipt(ctx, status)
+		return status, err
+	}
+
+	status, err = m.computeReferralAmount(ctx, marketOrder, amounts.referralAddress, amounts.referral, currencyID)
 	if err != nil {
 		return status, err
 	}
@@ -771,12 +864,12 @@ func (m *marketKapp) executeBuyMarket(bidderAcc state.UserAccountHandler, market
 		return status, err
 	}
 
-	status, err = m.computeRoyaltiesAmount(ctx, marketOrder, asset, currencyID, royaltiesAmount)
+	status, err = m.computeRoyaltiesAmount(ctx, marketOrder, asset, currencyID, amounts.royalties)
 	if err != nil {
 		return status, err
 	}
 
-	status, err = m.computeMarketOwnerAmount(ctx, marketOrder, currencyID, marketOwnerAmount)
+	status, err = m.computeMarketOwnerAmount(ctx, marketOrder, currencyID, amounts.marketOwner)
 	if err != nil {
 		return status, err
 	}
@@ -818,6 +911,150 @@ func (m *marketKapp) executeBuyMarket(bidderAcc state.UserAccountHandler, market
 	}
 
 	return transaction.Transaction_Ok, nil
+}
+
+// checkBidControls checks a bid of bid by buyer as if the order settled now. Under
+// FixAuditChangesV6 the currency's and the collection's pause and transfer restriction apply to
+// every bid, executing or not, before the previous bid is refunded or this one escrowed: an
+// ineligible bid refused only at settlement would hold the order until it expires and then only
+// unwind it (see Claim), outbidding an eligible buyer for nothing. Before the fork a bid reads
+// neither asset.
+func (m *marketKapp) checkBidControls(ctx kapp.KappContext, marketOrder *kapps.MarketOrderData, currencyID []byte, buyer []byte, bid int64) (transaction.Transaction_TXResultCode, error) {
+	if !m.forkController.FixAuditChangesV6() {
+		return transaction.Transaction_Ok, nil
+	}
+
+	currency, status, err := m.loadUnpausedKDA(ctx, currencyID)
+	if err != nil {
+		addControlRefusedReceipt(ctx, status)
+		return status, err
+	}
+
+	collection, status, err := m.loadUnpausedKDA(ctx, marketOrder.CollectionID)
+	if err != nil {
+		addControlRefusedReceipt(ctx, status)
+		return status, err
+	}
+
+	royalties := collection.GetRoyalties()
+	if royalties == nil {
+		royalties = &kapps.RoyaltiesData{}
+	}
+
+	amounts, status, err := m.computeSettlementAmounts(ctx, marketOrder, royalties, bid)
+	if err != nil {
+		return status, err
+	}
+
+	status, err = m.checkSettlementControls(ctx, marketOrder, collection, royalties, currency, buyer, amounts)
+	addControlRefusedReceipt(ctx, status)
+	return status, err
+}
+
+// checkSettlementControls refuses a sale a direct transfer from its real origin would refuse:
+// the NFT moves from the order owner to buyer (the escrow is only an intermediary), and each
+// currency leg paid a positive amount moves from buyer to its receiver: the referral, each
+// royalty split, the percentage royalty remainder (royalties.Address, as settled under
+// FixAuditChangesV6) and the order owner. The legs come from computeSettlementAmounts and the
+// split shares from splitRoyaltyAmount, so the check sees exactly what settlement pays. Splits
+// are visited in key order so the check is deterministic; every refusal returns the same code,
+// KDATransferNotAllowed, without a receipt (see checkTransferAllowed).
+// The RoyaltiesFixedDeposit legs are paid in KLV and are not checked.
+func (m *marketKapp) checkSettlementControls(ctx kapp.KappContext, marketOrder *kapps.MarketOrderData, collection *kapps.KDAData, royalties *kapps.RoyaltiesData, currency *kapps.KDAData, buyer []byte, amounts settlementAmounts) (transaction.Transaction_TXResultCode, error) {
+	status, err := checkTransferAllowed(collection, marketOrder.OwnerAddress, buyer, 1)
+	if err != nil {
+		return status, err
+	}
+
+	status, err = checkTransferAllowed(currency, buyer, amounts.referralAddress, amounts.referral)
+	if err != nil {
+		return status, err
+	}
+
+	if amounts.royalties > 0 {
+		remaining := amounts.royalties
+		for _, key := range types.OrderedKeys(royalties.SplitRoyalties, true) {
+			splitAddress, errDecode := hex.DecodeString(key)
+			if errDecode != nil {
+				return transaction.Transaction_LoadAccountError, errDecode
+			}
+
+			splitToPay, status, err := m.splitRoyaltyAmount(ctx, amounts.royalties, int64(royalties.SplitRoyalties[key].GetPercentMarketPercentage()), remaining)
+			if err != nil {
+				return status, err
+			}
+			remaining -= splitToPay
+
+			status, err = checkTransferAllowed(currency, buyer, splitAddress, splitToPay)
+			if err != nil {
+				return status, err
+			}
+		}
+
+		status, err = checkTransferAllowed(currency, buyer, royalties.Address, remaining)
+		if err != nil {
+			return status, err
+		}
+	}
+
+	return checkTransferAllowed(currency, buyer, marketOrder.OwnerAddress, amounts.marketOwner)
+}
+
+// loadUnpausedKDA loads id for the FixAuditChangesV6 asset controls, refusing while it is paused
+// (see checkNotPaused).
+func (m *marketKapp) loadUnpausedKDA(ctx kapp.KappContext, id []byte) (*kapps.KDAData, transaction.Transaction_TXResultCode, error) {
+	_, asset, err := m.KAppController.GetKDAKApp().GetKDA(id)
+	if err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetNotFound, err.Error())
+		return nil, transaction.Transaction_KAPPError, err
+	}
+
+	status, err := checkNotPaused(asset)
+	if err != nil {
+		return nil, status, err
+	}
+
+	return asset, transaction.Transaction_Ok, nil
+}
+
+// checkNotPaused refuses moving asset while it is paused, as a direct transfer does. The refusal
+// adds no receipt: the expired Claim does not fail on it but unwinds the order, and every other
+// caller fails and adds it with addControlRefusedReceipt.
+func checkNotPaused(asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
+	if !asset.GetAttributes().GetIsPaused() {
+		return transaction.Transaction_Ok, nil
+	}
+
+	return transaction.Transaction_AssetPaused, process.ErrAssetIsPaused
+}
+
+// checkTransferAllowed refuses moving amount of asset from sender to destination when a direct
+// transfer would be refused. An amount of zero moves nothing and is never refused. The refusal
+// adds no receipt, as in checkNotPaused.
+func checkTransferAllowed(asset *kapps.KDAData, sender []byte, destination []byte, amount int64) (transaction.Transaction_TXResultCode, error) {
+	if amount <= 0 || asset.IsTransferAllowed(sender, destination) {
+		return transaction.Transaction_Ok, nil
+	}
+
+	return transaction.Transaction_KDATransferNotAllowed, process.ErrKDATransferNotAllowed
+}
+
+// addControlRefusedReceipt adds the receipt of an asset control refusal, a pause or a refused
+// transfer, when status is one, for a caller that fails on it. The failure undoes anything
+// already moved.
+func addControlRefusedReceipt(ctx kapp.KappContext, status transaction.Transaction_TXResultCode) {
+	switch status {
+	case transaction.Transaction_AssetPaused:
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetPaused, process.ErrAssetIsPaused.Error())
+	case transaction.Transaction_KDATransferNotAllowed:
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldTransferNotAllowed, process.ErrKDATransferNotAllowed.Error())
+	}
+}
+
+// isControlRefusal reports whether status is an asset control refusal, a pause or a refused
+// transfer.
+func isControlRefusal(status transaction.Transaction_TXResultCode) bool {
+	return status == transaction.Transaction_AssetPaused || status == transaction.Transaction_KDATransferNotAllowed
 }
 
 func (m *marketKapp) Claim(sender []byte, tc *transaction.ClaimContract) (transaction.Transaction_TXResultCode, error) {
@@ -894,110 +1131,56 @@ func (m *marketKapp) Claim(sender []byte, tc *transaction.ClaimContract) (transa
 			return transaction.Transaction_LoadAccountError, err
 		}
 
-		resultCode, err := m.executeBuyMarket(bidderAcc, marketKapp, marketOrder, marketOrder.CurrencyID)
-		if err != nil {
-			return resultCode, err
+		// Under FixAuditChangesV6 a sale of a paused asset, or one a direct transfer would
+		// refuse, cannot settle, and an expired order can be neither bid on nor cancelled, so
+		// failing here would leave the NFT and the bid in escrow until an asset owner, or a
+		// marketplace owner, reverses a change: a pause on either asset would hold the other
+		// party's asset, a bid escrowed before the fork was never checked, and a later role
+		// change or, for an order without a referral snapshot, a repointed marketplace referral
+		// address can refuse a bid that passed. Returning both sides to their owners, as below
+		// the reserve, is never refused, so the order unwinds instead, without an error
+		// receipt. An asset owner or admin who is also the seller or the bidder can use this,
+		// by pausing or changing a role or the royalties, to leave an expired auction, and
+		// while any issuer's pause lasts, even a short one, either party can claim to unwind
+		// instead of settling; the seller could already cancel before the end time, and no
+		// value moves to anyone else.
+		// The controls run here, before anything moves, as executeBuyMarket runs them. Any
+		// other error fails the Claim as settlement would.
+		settle := true
+		if m.forkController.FixAuditChangesV6() {
+			_, _, status, errControls := m.prepareSettlement(ctx, marketOrder, marketOrder.CurrencyID, bidderAcc.AddressBytes())
+			switch {
+			case isControlRefusal(status):
+				settle = false
+			case errControls != nil:
+				return status, errControls
+			}
 		}
 
-		ctx.Receipts().Add(txProcess.NewReceipt(
-			txProcess.Buy,
-			ctx.ContractID(),
-			marketOrder.ID,
-			marketOrder.MarketplaceID,
-			[]byte(strconv.FormatInt(txProcess.OrderExecuted, 10)),
-			bidderAcc.AddressBytes(),
-			[]byte(strconv.FormatInt(marketOrder.CurrentBid, 10)),
-			marketOrder.CurrencyID,
-		))
-
-		return transaction.Transaction_Ok, nil
-	} else {
-		marketOwnerAcc, err := m.GetExistingUserAccount(marketOrder.OwnerAddress)
-		if err != nil {
-			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidAddress, err.Error())
-			return transaction.Transaction_LoadAccountError, err
-		}
-
-		data, err := marketKapp.SubInternalKDA(marketOrder.CollectionID, marketOrder.AssetID)
-		if err != nil {
-			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldMarketplaceError, err.Error())
-			return transaction.Transaction_BalanceError, err
-		}
-
-		err = marketOwnerAcc.AddInternalKDA(marketOrder.CollectionID, marketOrder.AssetID, data)
-		if err != nil {
-			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldMarketplaceError, err.Error())
-			return transaction.Transaction_AssetError, err
-		}
-
-		ctx.Receipts().Add(txProcess.NewReceipt(
-			txProcess.Transfer,
-			ctx.ContractID(),
-			marketKapp.AddressBytes(),
-			marketOwnerAcc.AddressBytes(),
-			[]byte("1"),
-			marketOrder.CollectionID,
-			marketOrder.AssetID,
-			[]byte{byte(kapps.KDAData_NonFungible)},
-			marketOrder.MarketplaceID,
-			marketOrder.ID,
-		))
-
-		if marketOrder.RoyaltiesFixedDeposit > 0 {
-			err = marketOwnerAcc.AddToBalance(marketOrder.RoyaltiesFixedDeposit, kdautils.KLVIdentifier, m.forkController.EnableSmartContracts())
+		if settle {
+			resultCode, err := m.executeBuyMarket(bidderAcc, marketKapp, marketOrder, marketOrder.CurrencyID)
 			if err != nil {
-				ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldMarketplaceError, err.Error())
-				return transaction.Transaction_BalanceError, err
+				return resultCode, err
 			}
 
 			ctx.Receipts().Add(txProcess.NewReceipt(
-				txProcess.Transfer,
+				txProcess.Buy,
 				ctx.ContractID(),
-				marketKapp.AddressBytes(),
-				marketOwnerAcc.AddressBytes(),
-				[]byte(strconv.FormatInt(marketOrder.RoyaltiesFixedDeposit, 10)),
-				kdautils.KLVIdentifier,
-				nil,
-				[]byte{byte(kapps.KDAData_Fungible)},
-				marketOrder.MarketplaceID,
 				marketOrder.ID,
-			))
-		}
-
-		if err := m.accountsCacher.UpdateUser(marketOwnerAcc); err != nil {
-			return transaction.Transaction_SaveAccountError, err
-		}
-
-		if len(marketOrder.CurrentBidder) > 0 {
-			bidderAcc, err := m.GetExistingUserAccount(marketOrder.CurrentBidder)
-			if err != nil {
-				ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidAddress, err.Error())
-				return transaction.Transaction_LoadAccountError, err
-			}
-
-			err = bidderAcc.AddToBalance(marketOrder.CurrentBid, marketOrder.CurrencyID, m.forkController.EnableSmartContracts())
-			if err != nil {
-				ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldMarketplaceError, err.Error())
-				return transaction.Transaction_BalanceError, err
-			}
-
-			ctx.Receipts().Add(txProcess.NewReceipt(
-				txProcess.Transfer,
-				ctx.ContractID(),
-				marketKapp.AddressBytes(),
+				marketOrder.MarketplaceID,
+				[]byte(strconv.FormatInt(txProcess.OrderExecuted, 10)),
 				bidderAcc.AddressBytes(),
 				[]byte(strconv.FormatInt(marketOrder.CurrentBid, 10)),
 				marketOrder.CurrencyID,
-				nil,
-				[]byte{byte(kapps.KDAData_Fungible)},
-				marketOrder.MarketplaceID,
-				marketOrder.ID,
 			))
 
-			if err := m.accountsCacher.UpdateUser(bidderAcc); err != nil {
-				return transaction.Transaction_SaveAccountError, err
-			}
+			return transaction.Transaction_Ok, nil
 		}
+	}
+
+	status, err := m.returnOrderToOwners(ctx, marketKapp, marketOrder)
+	if err != nil {
+		return status, err
 	}
 
 	err = m.SetMarketOrder(marketKapp, marketOrder)
@@ -1008,6 +1191,102 @@ func (m *marketKapp) Claim(sender []byte, tc *transaction.ClaimContract) (transa
 
 	if err := m.accountsCacher.UpdateKapp(marketKapp); err != nil {
 		return transaction.Transaction_SaveAccountError, err
+	}
+
+	return transaction.Transaction_Ok, nil
+}
+
+// returnOrderToOwners closes an expired marketOrder without a sale: the NFT and the
+// RoyaltiesFixedDeposit return to the order owner and the current bid, if any, to its bidder.
+// It moves only what the escrow holds back to whoever put it there, so no asset control can
+// refuse it. Claim takes it when the reserve was not met and, under FixAuditChangesV6, when a
+// pause or a refused transfer stops the sale; the caller stores the order.
+func (m *marketKapp) returnOrderToOwners(ctx kapp.KappContext, marketKapp state.KAppAccountHandler, marketOrder *kapps.MarketOrderData) (transaction.Transaction_TXResultCode, error) {
+	marketOwnerAcc, err := m.GetExistingUserAccount(marketOrder.OwnerAddress)
+	if err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidAddress, err.Error())
+		return transaction.Transaction_LoadAccountError, err
+	}
+
+	data, err := marketKapp.SubInternalKDA(marketOrder.CollectionID, marketOrder.AssetID)
+	if err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldMarketplaceError, err.Error())
+		return transaction.Transaction_BalanceError, err
+	}
+
+	err = marketOwnerAcc.AddInternalKDA(marketOrder.CollectionID, marketOrder.AssetID, data)
+	if err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldMarketplaceError, err.Error())
+		return transaction.Transaction_AssetError, err
+	}
+
+	ctx.Receipts().Add(txProcess.NewReceipt(
+		txProcess.Transfer,
+		ctx.ContractID(),
+		marketKapp.AddressBytes(),
+		marketOwnerAcc.AddressBytes(),
+		[]byte("1"),
+		marketOrder.CollectionID,
+		marketOrder.AssetID,
+		[]byte{byte(kapps.KDAData_NonFungible)},
+		marketOrder.MarketplaceID,
+		marketOrder.ID,
+	))
+
+	if marketOrder.RoyaltiesFixedDeposit > 0 {
+		err = marketOwnerAcc.AddToBalance(marketOrder.RoyaltiesFixedDeposit, kdautils.KLVIdentifier, m.forkController.EnableSmartContracts())
+		if err != nil {
+			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldMarketplaceError, err.Error())
+			return transaction.Transaction_BalanceError, err
+		}
+
+		ctx.Receipts().Add(txProcess.NewReceipt(
+			txProcess.Transfer,
+			ctx.ContractID(),
+			marketKapp.AddressBytes(),
+			marketOwnerAcc.AddressBytes(),
+			[]byte(strconv.FormatInt(marketOrder.RoyaltiesFixedDeposit, 10)),
+			kdautils.KLVIdentifier,
+			nil,
+			[]byte{byte(kapps.KDAData_Fungible)},
+			marketOrder.MarketplaceID,
+			marketOrder.ID,
+		))
+	}
+
+	if err := m.accountsCacher.UpdateUser(marketOwnerAcc); err != nil {
+		return transaction.Transaction_SaveAccountError, err
+	}
+
+	if len(marketOrder.CurrentBidder) > 0 {
+		bidderAcc, err := m.GetExistingUserAccount(marketOrder.CurrentBidder)
+		if err != nil {
+			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidAddress, err.Error())
+			return transaction.Transaction_LoadAccountError, err
+		}
+
+		err = bidderAcc.AddToBalance(marketOrder.CurrentBid, marketOrder.CurrencyID, m.forkController.EnableSmartContracts())
+		if err != nil {
+			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldMarketplaceError, err.Error())
+			return transaction.Transaction_BalanceError, err
+		}
+
+		ctx.Receipts().Add(txProcess.NewReceipt(
+			txProcess.Transfer,
+			ctx.ContractID(),
+			marketKapp.AddressBytes(),
+			bidderAcc.AddressBytes(),
+			[]byte(strconv.FormatInt(marketOrder.CurrentBid, 10)),
+			marketOrder.CurrencyID,
+			nil,
+			[]byte{byte(kapps.KDAData_Fungible)},
+			marketOrder.MarketplaceID,
+			marketOrder.ID,
+		))
+
+		if err := m.accountsCacher.UpdateUser(bidderAcc); err != nil {
+			return transaction.Transaction_SaveAccountError, err
+		}
 	}
 
 	return transaction.Transaction_Ok, nil
@@ -1063,6 +1342,17 @@ func (m *marketKapp) Sell(sender []byte, tc *transaction.SellContract) (transact
 	if asset.AssetType != kapps.KDAData_NonFungible {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidAssetType, common.ErrInvalidValue.Error())
 		return transaction.Transaction_AssetTypeInvalid, common.ErrInvalidValue
+	}
+
+	// Under FixAuditChangesV6 a paused collection cannot be listed, as it cannot be
+	// transferred. Its transfer restriction is not checked here: the buyer is unknown until a
+	// bid, and Buy and settlement check the move from the seller to the buyer then.
+	if m.forkController.FixAuditChangesV6() {
+		status, err := checkNotPaused(asset)
+		if err != nil {
+			addControlRefusedReceipt(ctx, status)
+			return status, err
+		}
 	}
 
 	_, marketplace, err := m.GetMarketplace(tc.GetMarketplaceID())

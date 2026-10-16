@@ -329,6 +329,13 @@ func (i *itoKapp) ValidateBuyContract(ctx kapp.KappContext, sender []byte, asset
 		return nil, nil, nil, transaction.Transaction_KAPPError, err
 	}
 
+	// a paused asset cannot be minted to a buyer (see the KDA Mint); refused here, before the whitelist
+	// limit, the ITO minted amount or the payment are touched
+	if i.forkController.FixAuditChangesV6() && asset.GetAttributes().GetIsPaused() {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetPaused, process.ErrAssetIsPaused.Error())
+		return nil, nil, nil, transaction.Transaction_AssetPaused, process.ErrAssetIsPaused
+	}
+
 	if !i.ValidAssetType(asset.AssetType) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidAssetType, common.ErrInvalidValue.Error())
 		return nil, nil, nil, transaction.Transaction_AssetTypeInvalid, common.ErrInvalidValue

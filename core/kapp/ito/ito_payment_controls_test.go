@@ -4,10 +4,13 @@ import (
 	"encoding/hex"
 	"testing"
 
+	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/core/kapp"
 	"github.com/klever-io/klever-go/core/process"
+	"github.com/klever-io/klever-go/core/process/kda/kdautils"
+	txProcess "github.com/klever-io/klever-go/core/process/transaction"
 	"github.com/klever-io/klever-go/data/block"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
@@ -293,5 +296,176 @@ func TestBuy_PaymentCurrencyControls(t *testing.T) {
 	t.Run("before the fork a limit-transfer currency still pays every destination", func(t *testing.T) {
 		t.Parallel()
 		requirePaidInFull(t, runPaymentControlsBuy(t, false, 10_00, 50_00, controlsCurrency(false, true)))
+	})
+}
+
+// KLC-2739: paused sold asset
+
+// pausedSoldAssetBuy is one whitelisted buy of 1,000,000 of a sold asset, paid in an unrestricted currency.
+type pausedSoldAssetBuy struct {
+	status        transaction.Transaction_TXResultCode
+	err           error
+	debited       int64
+	mintCalls     int
+	saved         map[string][]byte
+	errorReceipts []*transaction.Transaction_Receipt
+}
+
+func runPausedSoldAssetBuy(t *testing.T, fixOn bool, paused bool) pausedSoldAssetBuy {
+	t.Helper()
+
+	enableEpochs := config.EnableEpochs{}
+	if !fixOn {
+		enableEpochs.FixAuditChangesV6 = 1_000
+	}
+
+	itoKapp := setupITOKapp(t, enableEpochs)
+	soldAssetID := []byte("ITO-1234")
+
+	ito := &kapps.ITOData{
+		IsActive:          true,
+		StartTime:         1,
+		EndTime:           100_00,
+		ReceiverAddress:   controlsReceiver,
+		IsWhitelistActive: true,
+		PackData: map[string]*kapps.PackData{
+			string(controlsCurrencyID): {Packs: []*kapps.Pack{{Amount: 1_000_000, Price: 1_000_000}}},
+		},
+	}
+	itoData, err := itoKapp.marshalizer.Marshal(ito)
+	require.NoError(t, err)
+
+	whitelistData, err := itoKapp.marshalizer.Marshal(&kapps.WhitelistData{Limit: 2_000_000})
+	require.NoError(t, err)
+
+	stored := map[string][]byte{
+		string(kdautils.ToITOKey(soldAssetID)):                                             itoData,
+		string(kdautils.ToITOWhitelistKey(soldAssetID, hex.EncodeToString(controlsBuyer))): whitelistData,
+	}
+
+	asset := &kapps.KDAData{
+		ID:         soldAssetID,
+		Precision:  6,
+		AssetType:  kapps.KDAData_Fungible,
+		Attributes: &kapps.AttributesData{IsPaused: paused},
+	}
+	currency := controlsCurrency(false, false)
+
+	result := pausedSoldAssetBuy{saved: make(map[string][]byte)}
+	account := func(address []byte) state.UserAccountHandler {
+		return &mock.UserAccountHandlerStub{
+			AddressBytesCalled: func() []byte { return address },
+			SubFromBalanceCalled: func(value int64, assetID []byte, _ bool, _ ...*kapps.UserKDA) error {
+				result.debited += value
+				return nil
+			},
+			AddToBalanceCalled: func(value int64, assetID []byte, _ bool, _ ...*kapps.UserKDA) error { return nil },
+		}
+	}
+	itoAccount := &mock.KAppAccountHandlerStub{
+		DataTrieTrackerCalled: func() state.DataTrieTracker {
+			return &mock.DataTrieTrackerStub{
+				RetrieveValueCalled: func(key []byte) ([]byte, error) { return stored[string(key)], nil },
+				SaveKeyValueCalled: func(key, value []byte) error {
+					result.saved[string(key)] = value
+					return nil
+				},
+			}
+		},
+	}
+
+	require.NoError(t, itoKapp.SetAccountsCacher(&mock.AccountsCacherStub{
+		GetExistingUserCalled: func(address []byte) (state.UserAccountHandler, error) { return account(address), nil },
+		LoadUserCalled:        func(address []byte) (state.UserAccountHandler, error) { return account(address), nil },
+		LoadKAppCalled:        func(address []byte) (state.KAppAccountHandler, error) { return itoAccount, nil },
+		GetExistingKappCalled: func(address []byte) (state.KAppAccountHandler, error) { return itoAccount, nil },
+		UpdateUserCalled:      func(account state.AccountHandler) error { return nil },
+		UpdateKappCalled:      func(account state.AccountHandler) error { return nil },
+	}))
+
+	// one context for the whole buy, so the receipts it writes can be read afterwards
+	ctx := kapp.NewKappContext(kapp.ArgsNewKAppContext{
+		Block: &block.Block{Header: &block.BlockHeader{Timestamp: 100}},
+	})
+	require.NoError(t, itoKapp.SetKAppController(&vmStub.KAppControllerStub{
+		GetCurrentKAppContextCalled: func() kapp.KappContext { return ctx },
+		GetKDAKAppCalled: func() kapp.KDAKapp {
+			return &vmStub.KDAKappStub{
+				GetKDACalled: func(assetID []byte) (state.KAppAccountHandler, *kapps.KDAData, error) {
+					if string(assetID) == string(controlsCurrencyID) {
+						return nil, currency, nil
+					}
+					return nil, asset, nil
+				},
+				// stubbed to succeed, so any refusal comes from Buy itself
+				MintCalled: func(sender []byte, tc *transaction.AssetTriggerContract) (transaction.Transaction_TXResultCode, error) {
+					result.mintCalls++
+					return transaction.Transaction_Ok, nil
+				},
+			}
+		},
+	}))
+
+	result.status, result.err = itoKapp.Buy(controlsBuyer, &transaction.BuyContract{
+		Amount:         1_000_000,
+		CurrencyAmount: 1_000_000,
+		ID:             soldAssetID,
+		CurrencyID:     controlsCurrencyID,
+	})
+	result.errorReceipts = ctx.Receipts().GetByType(int8(txProcess.Error))
+
+	return result
+}
+
+func TestBuy_PausedSoldAsset(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a paused sold asset refuses the buy before the whitelist, the payment or the mint", func(t *testing.T) {
+		t.Parallel()
+
+		buy := runPausedSoldAssetBuy(t, true, true)
+		require.ErrorIs(t, buy.err, process.ErrAssetIsPaused)
+		assert.Equal(t, transaction.Transaction_AssetPaused, buy.status)
+		assert.Zero(t, buy.debited)
+		assert.Zero(t, buy.mintCalls)
+		assert.Empty(t, buy.saved, "neither the whitelist limit nor the ITO minted amount is written")
+		require.Len(t, buy.errorReceipts, 1)
+		assert.Equal(t, common.ErrFieldAssetPaused, string(buy.errorReceipts[0].Data[1]))
+	})
+
+	t.Run("a sold asset that is not paused is bought", func(t *testing.T) {
+		t.Parallel()
+
+		buy := runPausedSoldAssetBuy(t, true, false)
+		require.NoError(t, buy.err)
+		assert.Equal(t, transaction.Transaction_Ok, buy.status)
+		assert.Equal(t, int64(1_000_000), buy.debited)
+		assert.Equal(t, 1, buy.mintCalls)
+		assert.Empty(t, buy.errorReceipts)
+	})
+
+	t.Run("before the fork a sold asset that is not paused is bought", func(t *testing.T) {
+		t.Parallel()
+
+		buy := runPausedSoldAssetBuy(t, false, false)
+		require.NoError(t, buy.err)
+		assert.Equal(t, transaction.Transaction_Ok, buy.status)
+		assert.Equal(t, int64(1_000_000), buy.debited)
+		assert.Equal(t, 1, buy.mintCalls)
+		assert.Len(t, buy.saved, 2, "the whitelist limit and the ITO minted amount are written")
+		assert.Empty(t, buy.errorReceipts)
+	})
+
+	t.Run("before the fork a paused sold asset is still bought", func(t *testing.T) {
+		t.Parallel()
+
+		// pre-fork: legacy behaviour, kept for replay
+		buy := runPausedSoldAssetBuy(t, false, true)
+		require.NoError(t, buy.err)
+		assert.Equal(t, transaction.Transaction_Ok, buy.status)
+		assert.Equal(t, int64(1_000_000), buy.debited)
+		assert.Equal(t, 1, buy.mintCalls)
+		assert.Len(t, buy.saved, 2, "the whitelist limit and the ITO minted amount are written")
+		assert.Empty(t, buy.errorReceipts)
 	})
 }

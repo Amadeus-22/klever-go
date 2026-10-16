@@ -1980,6 +1980,10 @@ func TestMarketKApp_ExecuteBuyMarket_MultiRecipientGuardMidLoop(t *testing.T) {
 
 	marketKApp, accCacher, fc := createTestMarketKApp(t)
 	fc.FixMarketBuyOverflowValue = true
+	// The guard fires inside the settlement loop only before FixAuditChangesV6; after it,
+	// checkSettlementControls refuses the same overflow before any credit (see
+	// TestMarketAssetControls_SplitOverflowRefusedBeforeAnyCredit).
+	fc.FixAuditChangesV6Value = false
 
 	seller := defaultAddr
 	bidder := defaultOther

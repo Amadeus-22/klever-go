@@ -55,6 +55,10 @@ func (k *kdaKapp) Mint(sender []byte, tc *transaction.AssetTriggerContract) (tra
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
 
+	if resultCode, err := k.checkMintNotPaused(kda); err != nil {
+		return resultCode, err
+	}
+
 	if k.forkController.EnableSmartContracts() {
 		// if asset is not SFT, internalID must be empty
 		if kda.AssetType != kapps.KDAData_SemiFungible && len(internalID) > 0 {
@@ -325,4 +329,22 @@ func (k *kdaKapp) processFungibleMint(tc *transaction.AssetTriggerContract, asse
 	}
 
 	return transaction.Transaction_Ok, nil
+}
+
+// checkMintNotPaused refuses, once FixAuditChangesV6 is active, every mint of a paused asset,
+// whether through a Mint trigger or an ITO buy and whoever the recipient is, the minter
+// included. A pause freezes the asset for everyone, its owner too, so its supply is frozen as
+// well: a mint role holder, the usual reason to pause, cannot keep minting during the pause, and
+// an owner who needs to mint can lift the pause first.
+//
+// LimitTransfer is not checked: a mint creates a balance, it does not move one, and a minter
+// without the transfer role minting a LimitTransfer asset straight to its holders is a valid use.
+func (k *kdaKapp) checkMintNotPaused(kda *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
+	if !k.forkController.FixAuditChangesV6() || !kda.GetAttributes().GetIsPaused() {
+		return transaction.Transaction_Ok, nil
+	}
+
+	ctx := k.KAppController.GetCurrentKAppContext()
+	ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetPaused, process.ErrAssetIsPaused.Error())
+	return transaction.Transaction_AssetPaused, process.ErrAssetIsPaused
 }
