@@ -62,6 +62,13 @@ type observedCallValue struct {
 	calledBy     []byte
 	numTransfers int
 	value        int64
+	transfers    []observedTransfer
+}
+
+// observedTransfer identifies one transfer the callee was told it received.
+type observedTransfer struct {
+	token []byte
+	nonce uint64
 }
 
 // recordCallValueMock gives a contract a "deposit" endpoint that publishes its observed call value
@@ -73,6 +80,13 @@ func recordCallValueMock(observed *observedCallValue) func(*mock.InstanceMock, i
 			observed.calledBy = instance.Host.Runtime().GetContextAddress()
 			observed.numTransfers = len(vmInput.KDATransfers)
 			observed.value = vmInput.GetKDACallValue(test.KDATestTokenName).Int64()
+			observed.transfers = nil
+			for _, transfer := range vmInput.KDATransfers {
+				observed.transfers = append(observed.transfers, observedTransfer{
+					token: transfer.KDATokenName,
+					nonce: transfer.KDATokenNonce,
+				})
+			}
 
 			return instance
 		})
@@ -122,11 +136,12 @@ func callBuiltinDirectly(dest []byte, args [][]byte) func(vmhost.VMHost) {
 
 // runPostTransferCall wires caller -> dest -> retargeted, all three mock contracts, and runs one
 // callerBody. Both dest and the retargeted address expose "deposit", so whichever one the parser
-// settles on is the one that reports.
+// settles on is the one that reports. Each seed runs on the world after the caller is funded.
 func runPostTransferCall(
 	t *testing.T,
 	callerBody func(vmhost.VMHost),
 	epochs blockchainConfig.EnableEpochs,
+	seeds ...func(*worldmock.MockWorld),
 ) (*observedCallValue, *worldmock.MockWorld) {
 	testConfig := makeTestConfig()
 	observed := &observedCallValue{}
@@ -165,6 +180,10 @@ func runPostTransferCall(
 
 			caller, _ := mockWorld.AccountsCacher.LoadUser(test.ParentAddress)
 			require.NoError(t, caller.AddToBalance(retargetInitialBalance, test.KDATestTokenName, true))
+
+			for _, seed := range seeds {
+				seed(mockWorld)
+			}
 		}).
 		WithEnableEpochs(epochs).
 		AndAssertResults(func(_ *worldmock.MockWorld, verify *test.VMOutputVerifier) {

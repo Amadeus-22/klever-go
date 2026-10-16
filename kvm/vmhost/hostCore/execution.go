@@ -1171,6 +1171,13 @@ func (host *vmHost) callBuiltinFunction(input *vmcommon.ContractCallInput) (*vmc
 				"carried", len(transfersOwedToRecipient), "of", len(input.KDATransfers))
 		}
 
+		// A zero-value transfer is settled without moving anything, whatever asset id or nonce it
+		// names, so from FixAuditChangesV6 it is not the recipient's call value either (KLC-2830).
+		// The helper returns a new slice: transfersOwedToRecipient may still alias input.KDATransfers.
+		if host.ForkController().FixAuditChangesV6() {
+			transfersOwedToRecipient = vmhost.WithoutZeroValueTransfers(transfersOwedToRecipient)
+		}
+
 		// recipient may be updated by the parser
 		input.RecipientAddr = parsedTransfer.RcvAddr
 	}

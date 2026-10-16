@@ -177,41 +177,60 @@ func (e *kdaTransfer) ProcessBuiltinFunction(vmInput *vmcommon.ContractCallInput
 			continue
 		}
 
-		tokenIdentifier := GetTokenIdentifier(kdaTransfer)
-		value, err := e.extractTransferValue(kdaTransfer)
-		if err != nil {
+		if err := e.settleTransfer(vmInput, vmOutput, kdaTransfer); err != nil {
 			return nil, err
 		}
-
-		contract := &transaction.TransferContract{
-			ToAddress:    vmInput.RecipientAddr,
-			AssetID:      tokenIdentifier,
-			Amount:       value,
-			KDARoyalties: 0, // No royalties for SC transfers
-			KLVRoyalties: 0, // No royalties for SC transfers
-		}
-
-		if value > 0 {
-			if err := e.performKDATransfer(vmInput.CallerAddr, contract); err != nil {
-				return nil, err
-			}
-		}
-
-		// mark as executed to avoid double spending
-		kdaTransfer.SetExecuted()
-
-		addKDAEntryInVMOutput(
-			vmOutput,
-			[]byte(core.BuiltInFunctionTransfer),
-			contract.AssetID,
-			0,
-			big.NewInt(contract.Amount),
-			vmInput.CallerAddr,
-			contract.ToAddress,
-		)
 	}
 
 	return vmOutput, nil
+}
+
+// settleTransfer settles one pending transfer from the caller to the recipient, marks it executed
+// and logs it in vmOutput.
+func (e *kdaTransfer) settleTransfer(
+	vmInput *vmcommon.ContractCallInput,
+	vmOutput *vmcommon.VMOutput,
+	kdaTransfer *vmcommon.KDATransfer,
+) error {
+	value, err := e.extractTransferValue(kdaTransfer)
+	if err != nil {
+		return err
+	}
+
+	contract := &transaction.TransferContract{
+		ToAddress:    vmInput.RecipientAddr,
+		AssetID:      GetTokenIdentifier(kdaTransfer),
+		Amount:       value,
+		KDARoyalties: 0, // No royalties for SC transfers
+		KLVRoyalties: 0, // No royalties for SC transfers
+	}
+
+	if value > 0 {
+		if err := e.performKDATransfer(vmInput.CallerAddr, contract); err != nil {
+			return err
+		}
+	}
+
+	// mark as executed to avoid double spending
+	kdaTransfer.SetExecuted()
+
+	// From FixAuditChangesV6 a zero-value transfer leaves no transfer log: it moved nothing, and
+	// the log would name any asset id or NFT nonce as transferred, held or not (KLC-2830).
+	if value == 0 && e.forkController.FixAuditChangesV6() {
+		return nil
+	}
+
+	addKDAEntryInVMOutput(
+		vmOutput,
+		[]byte(core.BuiltInFunctionTransfer),
+		contract.AssetID,
+		0,
+		big.NewInt(contract.Amount),
+		vmInput.CallerAddr,
+		contract.ToAddress,
+	)
+
+	return nil
 }
 
 // SetPayableChecker will set the payableCheck handler to the function

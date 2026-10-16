@@ -680,7 +680,14 @@ func TransferKDANFTExecuteWithTypedArgs(
 			return 1
 		}
 
-		contractCallInput.KDATransfers = append(contractCallInput.KDATransfers, transfers...)
+		// From FixAuditChangesV6 a zero-value transfer is still settled below, but it moved nothing and
+		// is not the callee's call value (KLC-2830). The kept transfers are the ones settled below, so
+		// the callee still sees them executed.
+		callValueTransfers := transfers
+		if host.ForkController().FixAuditChangesV6() {
+			callValueTransfers = vmhost.WithoutZeroValueTransfers(transfers)
+		}
+		contractCallInput.KDATransfers = append(contractCallInput.KDATransfers, callValueTransfers...)
 
 	}
 
