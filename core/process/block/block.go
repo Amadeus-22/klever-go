@@ -155,8 +155,10 @@ func (mp *metaProcessor) ProcessBlock(
 	defer func() {
 		if err != nil {
 			log.Error("ProcessBlock revert: ", "error", err.Error())
-			mp.RevertStateToSnapshot(header)
+			// fork flags first: the revert reloads the proposal parameters and backfills
+			// the defaults of every fork active at the restored epoch, not the rejected one
 			mp.restoreEpochState(prevEpoch, prevCurrentHeader, restoreEpochTrigger)
+			mp.RevertStateToSnapshot(header)
 
 			if restoreProposalParameters != nil {
 				restoreProposalParameters()
@@ -990,6 +992,44 @@ func (mp *metaProcessor) RevertStateToBlock(header data.HeaderHandler) error {
 		return err
 	}
 
+	return mp.reloadProposalParameters()
+}
+
+// RevertStateToSnapshot reverts the accounts, then reloads the proposal parameters from
+// the reverted KApp trie.
+func (mp *metaProcessor) RevertStateToSnapshot(header data.HeaderHandler) {
+	mp.baseProcessor.RevertStateToSnapshot(header)
+
+	err := mp.reloadProposalParameters()
+	if err != nil {
+		// the live set no longer matches the committed state, and fees are computed from it
+		log.Error("RevertStateToSnapshot: reload proposal parameters", "error", err.Error())
+	}
+}
+
+// reloadProposalParameters replaces the live parameter set with the one in the KApp trie,
+// which no accounts snapshot covers. It merges the defaults of the active forks, so restore
+// the fork flags first (KLC-2814).
+func (mp *metaProcessor) reloadProposalParameters() error {
+	live := mp.proposalController.Get()
+	if check.IfNil(live) {
+		// storage bootstrap reverts before the node publishes the controller
+		return nil
+	}
+
+	_, current, err := mp.loadProposalController()
+	if errors.Is(err, common.ErrNilTrie) {
+		// genesis holds no proposal KApp: startup writes it and block 1 commits it, so a
+		// revert to genesis starts from the defaults, as StartProposalsKApp does
+		current, err = &kapps.ProposalController{}, nil
+	}
+	if err != nil {
+		return err
+	}
+
+	mergeInitialParameters(current, mp.forkController)
+	live.RestoreParameters(current.ActiveParameters)
+
 	return nil
 }
 
@@ -1465,11 +1505,25 @@ func (mp *metaProcessor) processSingleProposal(proposalKApp state.KAppAccountHan
 	proposal.ProposalStatus = mp.determineProposalStatus(proposal, kfi)
 	proposal.TotalStaked = kfi.TotalStaked
 
-	// Update parameters if proposal is approved
-	if proposal.ProposalStatus == kapps.ProposalData_ApprovedProposal {
-		if err := mp.updateApprovedProposalParameters(proposal, controller); err != nil {
-			return nil, err
+	if proposal.ProposalStatus != kapps.ProposalData_ApprovedProposal {
+		return proposal, nil
+	}
+
+	// Voters approved the parameters as one set, so it lands whole or not at all. Failing
+	// here would fail the epoch start block identically on every node and every retry, so
+	// from FixAuditChangesV6 a proposal holding an invalid parameter is denied instead.
+	if mp.forkController.FixAuditChangesV6() {
+		if err := mp.validateProposalParameters(proposal, controller); err != nil {
+			log.Warn("denying approved proposal with an invalid parameter",
+				"proposal", proposalID, "error", err)
+			proposal.ProposalStatus = kapps.ProposalData_DeniedProposal
+
+			return proposal, nil
 		}
+	}
+
+	if err := mp.updateApprovedProposalParameters(proposal, controller); err != nil {
+		return nil, err
 	}
 
 	return proposal, nil
@@ -1480,6 +1534,20 @@ func (mp *metaProcessor) determineProposalStatus(proposal *kapps.ProposalData, k
 		return kapps.ProposalData_ApprovedProposal
 	}
 	return kapps.ProposalData_DeniedProposal
+}
+
+// validateProposalParameters checks every parameter of proposal without applying any. Each
+// check is against constant bounds, never against another parameter or chain state, so the
+// result does not depend on map order and the apply pass that follows cannot fail.
+func (mp *metaProcessor) validateProposalParameters(proposal *kapps.ProposalData, controller *kapps.ProposalController) error {
+	for parameter, value := range proposal.Parameters {
+		_, err := controller.ParseParamAndValidate(kapps.EnumParameter(parameter), value, mp.forkController)
+		if err != nil {
+			return fmt.Errorf("%s: %w", kapps.EnumParameter(parameter), err)
+		}
+	}
+
+	return nil
 }
 
 func (mp *metaProcessor) updateApprovedProposalParameters(proposal *kapps.ProposalData, controller *kapps.ProposalController) error {

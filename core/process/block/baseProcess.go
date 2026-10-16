@@ -819,6 +819,30 @@ func (mp *metaProcessor) UpdateKLVCirculationSupply(amountMint int64, amountBurn
 }
 
 func (mp *metaProcessor) getProposalController() (state.KAppAccountHandler, *kapps.ProposalController, error) {
+	proposalKApp, currentProposal, err := mp.loadProposalController()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if mergeInitialParameters(currentProposal, mp.forkController) {
+		proposalData, err := mp.marshalizer.Marshal(currentProposal)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		err = proposalKApp.DataTrieTracker().SaveKeyValue(kdautils.ProposalControllerKey, proposalData)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		mp.proposalController.Get().UpdateParameters(currentProposal.ActiveParameters)
+	}
+
+	return proposalKApp, currentProposal, nil
+}
+
+// loadProposalController reads the proposal controller from the KApp trie, without writing.
+func (mp *metaProcessor) loadProposalController() (state.KAppAccountHandler, *kapps.ProposalController, error) {
 	acnt, err := mp.accountsDB[state.KAppAccountsState].LoadAccount(kapps.ProposalKAppAddress)
 	if err != nil {
 		return nil, nil, err
@@ -840,28 +864,23 @@ func (mp *metaProcessor) getProposalController() (state.KAppAccountHandler, *kap
 		return nil, nil, err
 	}
 
-	initialProposal := kapps.NewInitialProposalController(mp.forkController)
-	if len(initialProposal.ActiveParameters) > len(currentProposal.ActiveParameters) {
-		for key, v := range currentProposal.ActiveParameters {
-			initialProposal.ActiveParameters[key] = v
-		}
+	return proposalKApp, currentProposal, nil
+}
 
-		currentProposal.ActiveParameters = initialProposal.ActiveParameters
-
-		proposalData, err := mp.marshalizer.Marshal(currentProposal)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		err = proposalKApp.DataTrieTracker().SaveKeyValue(kdautils.ProposalControllerKey, proposalData)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		mp.proposalController.Get().UpdateParameters(currentProposal.ActiveParameters)
+// mergeInitialParameters backfills the parameters a fork added that pc does not hold yet,
+// keeping every stored value, and reports whether it changed anything.
+func mergeInitialParameters(pc *kapps.ProposalController, forks core.ForkController) bool {
+	initialParameters := kapps.InitialProposalParameters(forks)
+	if len(initialParameters) <= len(pc.ActiveParameters) {
+		return false
 	}
 
-	return proposalKApp, currentProposal, nil
+	for key, v := range pc.ActiveParameters {
+		initialParameters[key] = v
+	}
+	pc.ActiveParameters = initialParameters
+
+	return true
 }
 
 func (mp *metaProcessor) getProposalKApp(proposalKApp state.KAppAccountHandler, proposalID uint64) (*kapps.ProposalData, error) {

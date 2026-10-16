@@ -388,7 +388,146 @@ func (p *ProposalController) ParseParamAndValidate(parameter EnumParameter, valu
 	return result, p.validateConstraints(parameter, result, fc)
 }
 
+// Ceilings derived from existing limits, so the arithmetic downstream cannot overflow.
+const (
+	// a block holds at most MaxKappIterator transactions at the per-tx gas ceiling
+	maxGasPerBlock = int64(core.MaxGasLimitPerTx) * core.MaxKappIterator
+)
+
+// Policy ceilings, orders of magnitude above every live value, so one proposal cannot
+// brick the chain.
+const (
+	// the multiplier scales every tx's gas budget; the live value is 1
+	maxGasMultiplier = 10_000
+
+	// proposalKapp.finalizeProposal computes EpochEnd = Epoch + EpochsDuration as uint32,
+	// and a wrapped EpochEnd never settles
+	maxProposalEpochsDuration = 1_000
+
+	// BlockRewards and StakingRewards are each minted on every block, unchecked against
+	// MaxSupply. 1000 KLV is ~66x the live 15 KLV; both at the ceiling take ~4.6e9 blocks
+	// to overflow the int64 supply accounting, rather than ~460 at MaxKLVSupply.
+	maxEmissionPerBlock = 1_000_000_000
+
+	// Every KApp fee shares one ceiling, 20x the dearest genesis fee (50K KLV). Proposing,
+	// voting and freezing included: at 1M KLV they stay payable, by choice, so a captured
+	// majority cannot price out the proposal that undoes it.
+	maxKAppFee = 1_000_000_000_000 // 1M KLV
+
+	// paid per byte by every tx, the proposal that undoes it included
+	maxFeePerDataByte = 4_000_000 // a 250 byte tx costs 1000 KLV
+
+	maxKLVSupply = 10_000_000_000_000_000 // 10B KLV at precision 6
+	maxKFISupply = 21_000_000_000_000     // 21M KFI at precision 6
+)
+
+type paramLimits struct {
+	min, max int64
+}
+
+var (
+	// Fees floor at 0: zero is a legitimate choice, a negative fee inverts the cost of
+	// every transaction that pays it.
+	kappFeeLimits = paramLimits{0, maxKAppFee}
+
+	// Per-block emission, summed into the circulating supply.
+	emissionLimits = paramLimits{0, maxEmissionPerBlock}
+
+	// Compared against a balance or a stake, so at or below zero everyone meets them.
+	klvStakeLimits = paramLimits{1, maxKLVSupply}
+
+	// Both a make() capacity and a loop bound with a trie write per iteration.
+	iterationLimits = paramLimits{1, core.MaxKappIterator}
+)
+
+// paramBounds is the range a proposal may set each parameter to from FixAuditChangesV6.
+// A parameter without a row is rejected, so one cannot be added without bounds.
+var paramBounds = map[EnumParameter]paramLimits{
+	EnumParameter_FeePerDataByte: {0, maxFeePerDataByte},
+
+	EnumParameter_KAppFeeCreateValidator:         kappFeeLimits,
+	EnumParameter_KAppFeeCreateAsset:             kappFeeLimits,
+	EnumParameter_KAppFeeTransfer:                kappFeeLimits,
+	EnumParameter_KAppFeeAssetTrigger:            kappFeeLimits,
+	EnumParameter_KAppFeeValidatorConfig:         kappFeeLimits,
+	EnumParameter_KAppFeeFreeze:                  kappFeeLimits,
+	EnumParameter_KAppFeeUnfreeze:                kappFeeLimits,
+	EnumParameter_KAppFeeDelegate:                kappFeeLimits,
+	EnumParameter_KAppFeeUndelegate:              kappFeeLimits,
+	EnumParameter_KAppFeeWithdraw:                kappFeeLimits,
+	EnumParameter_KAppFeeClaim:                   kappFeeLimits,
+	EnumParameter_KAppFeeUnjail:                  kappFeeLimits,
+	EnumParameter_KAppFeeSetAccountName:          kappFeeLimits,
+	EnumParameter_KAppFeeProposal:                kappFeeLimits,
+	EnumParameter_KAppFeeVote:                    kappFeeLimits,
+	EnumParameter_KAppFeeConfigITO:               kappFeeLimits,
+	EnumParameter_KAppFeeSetITOPrices:            kappFeeLimits,
+	EnumParameter_KAppFeeBuy:                     kappFeeLimits,
+	EnumParameter_KAppFeeSell:                    kappFeeLimits,
+	EnumParameter_KAppFeeCancelMarketOrder:       kappFeeLimits,
+	EnumParameter_KAppFeeCreateMarketplace:       kappFeeLimits,
+	EnumParameter_KAppFeeConfigMarketplace:       kappFeeLimits,
+	EnumParameter_KAppFeeUpdateAccountPermission: kappFeeLimits,
+	EnumParameter_KAppFeeITOTrigger:              kappFeeLimits,
+	EnumParameter_KAppFeeDeposit:                 kappFeeLimits,
+	EnumParameter_KAppFeeSmartContract:           kappFeeLimits,
+
+	EnumParameter_BlockRewards:   emissionLimits,
+	EnumParameter_StakingRewards: emissionLimits,
+
+	EnumParameter_MinSelfDelegatedAmount:  klvStakeLimits,
+	EnumParameter_MinTotalDelegatedAmount: klvStakeLimits,
+	EnumParameter_MinKLVBucketAmount:      klvStakeLimits,
+
+	// Any value in range, even above the KFI staked or circulating: governance then pauses
+	// until enough KFI is frozen. An unreachable value needs half the stake to pass, and a
+	// fork can reset it.
+	EnumParameter_MinKFIStakedToEnableProposals: {1, maxKFISupply},
+
+	// the FPR slices keep one entry per epoch up to this, re-marshalled on every block and
+	// walked on every claim
+	EnumParameter_MaxEpochsUnclaimed: iterationLimits,
+
+	EnumParameter_MaxNFTMintBatch: iterationLimits,
+	EnumParameter_MaxBucketSize:   iterationLimits,
+
+	EnumParameter_ProposalMaxEpochsDuration:        {1, maxProposalEpochsDuration},
+	EnumParameter_LeaderValidatorRewardsPercentage: {0, int64(core.HundredPercent)},
+
+	// MaxGasPerBlock is floored at the MaxGasPerTX ceiling, so a block always fits the largest tx
+	EnumParameter_GasMultiplier:  {1, maxGasMultiplier},
+	EnumParameter_MaxGasPerBlock: {core.MaxGasLimitPerTx, maxGasPerBlock},
+	EnumParameter_MaxGasPerTX:    {core.MinGasLimit, core.MaxGasLimitPerTx},
+}
+
+func validateBounds(parameter EnumParameter, value reflect.Value) error {
+	limits, ok := paramBounds[parameter]
+	if !ok {
+		log.Error("parameter has no bounds", "parameter", parameter)
+		return common.ErrInvalidParameter
+	}
+
+	var v int64
+	if value.CanInt() {
+		v = value.Int()
+	} else {
+		// only Uint32 parameters are unsigned; a wrapped value goes negative and fails the floor
+		v = int64(value.Uint()) // #nosec G115
+	}
+
+	if v < limits.min || v > limits.max {
+		log.Error("invalid parameter", "parameter", parameter, "value", v, "min", limits.min, "max", limits.max)
+		return common.ErrInvalidParameter
+	}
+
+	return nil
+}
+
 func (p *ProposalController) validateConstraints(parameter EnumParameter, value reflect.Value, fc core.ForkController) error {
+	if fc.FixAuditChangesV6() {
+		return validateBounds(parameter, value)
+	}
+
 	switch parameter {
 	case EnumParameter_LeaderValidatorRewardsPercentage:
 		if value.Uint() > uint64(core.HundredPercent) {

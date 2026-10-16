@@ -2290,6 +2290,7 @@ func TestMetaProcessor_ProcessProposalEndOfEpoch(t *testing.T) {
 		// only fired once the block is verified
 		proposalsToIndex []string
 		err              interface{}
+		forks            core.ForkController
 	}{
 		{
 			name: "Error ProposalController",
@@ -2429,12 +2430,17 @@ func TestMetaProcessor_ProcessProposalEndOfEpoch(t *testing.T) {
 			},
 			check: map[int32][]byte{1: []byte("50000000000")},
 			err:   "strconv.ParseInt: parsing \"invalid\": invalid syntax",
+			// before FixAuditChangesV6 an invalid approved value fails the block
+			forks: mock.NewForkControllerStub().SetFork("FixAuditChangesV6", false),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			arguments := createMockMetaArguments()
+			if tt.forks != nil {
+				arguments.ForkController = tt.forks
+			}
 			mpp, err := blproc.NewMetaProcessor(arguments)
 			require.NoError(t, err)
 			mp := blproc.NewMetaProcessorForTests(mpp)
@@ -2460,6 +2466,168 @@ func TestMetaProcessor_ProcessProposalEndOfEpoch(t *testing.T) {
 			}
 		})
 	}
+}
+
+// settleApprovedProposal stores proposal 1 as approved with params and settles it at the
+// start of epoch 1.
+func settleApprovedProposal(t *testing.T, mp *blproc.MetaProcessorForTests, params map[int32][]byte) {
+	settleApprovedProposals(t, mp, 1, 1, params)
+}
+
+// settleApprovedProposals stores each params set as an approved proposal, numbered from
+// firstID, and settles them in that order at the start of epoch. The stored parameter set
+// is kept, so a later settlement builds on an earlier one.
+func settleApprovedProposals(t *testing.T, mp *blproc.MetaProcessorForTests, epoch uint32, firstID uint64, params ...map[int32][]byte) {
+	ids := make([]uint64, 0, len(params))
+	SetProposal(t, mp, func(pc *kapps.ProposalController, kApp state.KAppAccountHandler, mp *blproc.MetaProcessorForTests) ([]byte, error) {
+		for i, p := range params {
+			id := firstID + uint64(i)
+			err := mp.SetProposalKApp(kApp, id, &kapps.ProposalData{
+				Parameters: p,
+				Votes:      map[int32]int64{int32(kapps.ProposalData_VoteDetail_Yes): 10},
+			})
+			if err != nil {
+				return nil, err
+			}
+			ids = append(ids, id)
+		}
+
+		pc.ActiveProposals = map[uint32]*kapps.ActiveProposals{epoch: {ProposalIDs: ids}}
+		return mp.GetMarshalizer().Marshal(pc)
+	})
+
+	proposalsToIndex, err := mp.ProcessProposalsEndOfEpoch(&block.Block{Header: &block.BlockHeader{Nonce: 1, Slot: 1, Epoch: epoch}})
+	require.NoError(t, err)
+	require.Len(t, proposalsToIndex, len(params))
+}
+
+func storedProposal(t *testing.T, mp *blproc.MetaProcessorForTests, id uint64) *kapps.ProposalData {
+	acnt, err := mp.GetKAppAdapter().LoadAccount(kapps.ProposalKAppAddress)
+	require.NoError(t, err)
+	kApp, ok := acnt.(state.KAppAccountHandler)
+	require.True(t, ok)
+
+	proposal, err := mp.GetProposalKApp(kApp, id)
+	require.NoError(t, err)
+
+	return proposal
+}
+
+// From FixAuditChangesV6 an approved proposal holding an invalid parameter is denied whole
+// rather than applied in part, and the epoch start block still settles: failing it would
+// fail identically on every node and every retry. Proposals settle one by one, so another
+// proposal in the same epoch still lands.
+func TestMetaProcessor_ProcessProposalEndOfEpochDeniesAProposalWithAnInvalidParameter(t *testing.T) {
+	t.Parallel()
+
+	arguments := createMockMetaArguments()
+	arguments.ForkController = mock.NewForkControllerStub()
+	mpp, err := blproc.NewMetaProcessor(arguments)
+	require.NoError(t, err)
+	mp := blproc.NewMetaProcessorForTests(mpp)
+
+	before := mp.GetActiveParameters()
+	createValidator := int32(kapps.EnumParameter_KAppFeeCreateValidator)
+	transfer := int32(kapps.EnumParameter_KAppFeeTransfer)
+	threshold := int32(kapps.EnumParameter_MinKFIStakedToEnableProposals)
+
+	settleApprovedProposals(t, mp, 1, 1,
+		// a valid fee next to a negative one: neither lands
+		map[int32][]byte{createValidator: []byte("1234"), transfer: []byte("-1")},
+		// above the KFI staked, which no check compares against: an in-range threshold settles
+		map[int32][]byte{threshold: []byte("2000000000000")},
+	)
+
+	assert.Equal(t, kapps.ProposalData_DeniedProposal, storedProposal(t, mp, 1).ProposalStatus)
+	assert.Equal(t, kapps.ProposalData_ApprovedProposal, storedProposal(t, mp, 2).ProposalStatus)
+
+	params := mp.GetActiveParameters()
+	assert.Equal(t, before[createValidator].Value, params[createValidator].Value)
+	assert.Equal(t, before[transfer].Value, params[transfer].Value)
+	assert.Equal(t, []byte("2000000000000"), params[threshold].Value)
+}
+
+// The live parameter set sits outside the accounts snapshot, so both revert paths reload
+// it from the KApp trie: otherwise a slot timeout, a failed commit or a sync rollback past
+// an epoch start leaves the parameters it settled in effect.
+func TestMetaProcessor_RevertReloadsProposalParameters(t *testing.T) {
+	t.Parallel()
+
+	key := int32(kapps.EnumParameter_KAppFeeCreateValidator)
+
+	t.Run("RevertStateToSnapshot", func(t *testing.T) {
+		t.Parallel()
+
+		arguments := createMockMetaArguments()
+		mpp, err := blproc.NewMetaProcessor(arguments)
+		require.NoError(t, err)
+		mp := blproc.NewMetaProcessorForTests(mpp)
+
+		// a committed value other than the default, so only a reload from the trie restores it
+		settleApprovedProposal(t, mp, map[int32][]byte{key: []byte("1234")})
+		_, err = arguments.AccountsDB[state.KAppAccountsState].Commit()
+		require.NoError(t, err)
+
+		settleApprovedProposals(t, mp, 2, 2, map[int32][]byte{key: []byte("5678")})
+		require.Equal(t, []byte("5678"), mp.GetActiveParameters()[key].Value)
+
+		// through the interface Worker.Extend calls it on
+		var blockProcessor process.BlockProcessor = mpp
+		blockProcessor.RevertStateToSnapshot(nil)
+
+		assert.Equal(t, []byte("1234"), mp.GetActiveParameters()[key].Value)
+	})
+
+	t.Run("RevertStateToBlock", func(t *testing.T) {
+		t.Parallel()
+
+		arguments := createMockMetaArguments()
+		arguments.AccountsDB[state.UserAccountsState] = &mock.AccountsStub{
+			RecreateTrieCalled: func([]byte) error { return nil },
+		}
+		mpp, err := blproc.NewMetaProcessor(arguments)
+		require.NoError(t, err)
+		mp := blproc.NewMetaProcessorForTests(mpp)
+
+		// a committed value other than the default, so only a reload from the trie restores it
+		settleApprovedProposal(t, mp, map[int32][]byte{key: []byte("1234")})
+		kappsRoot, err := arguments.AccountsDB[state.KAppAccountsState].Commit()
+		require.NoError(t, err)
+
+		settleApprovedProposals(t, mp, 2, 2, map[int32][]byte{key: []byte("5678")})
+		_, err = arguments.AccountsDB[state.KAppAccountsState].Commit()
+		require.NoError(t, err)
+		require.Equal(t, []byte("5678"), mp.GetActiveParameters()[key].Value)
+
+		err = mpp.RevertStateToBlock(&block.Block{Header: &block.BlockHeader{KAppsTrieRoot: kappsRoot}})
+		require.NoError(t, err)
+
+		assert.Equal(t, []byte("1234"), mp.GetActiveParameters()[key].Value)
+	})
+
+	// Genesis holds no proposal KApp (startup writes it, block 1 commits it), so rolling
+	// block 1 back must fall back to the defaults instead of failing the rollback.
+	t.Run("RevertStateToBlock to genesis", func(t *testing.T) {
+		t.Parallel()
+
+		arguments := createMockMetaArguments()
+		arguments.AccountsDB[state.UserAccountsState] = &mock.AccountsStub{
+			RecreateTrieCalled: func([]byte) error { return nil },
+		}
+		mpp, err := blproc.NewMetaProcessor(arguments)
+		require.NoError(t, err)
+		mp := blproc.NewMetaProcessorForTests(mpp)
+
+		settleApprovedProposal(t, mp, map[int32][]byte{key: []byte("1234")})
+		_, err = arguments.AccountsDB[state.KAppAccountsState].Commit()
+		require.NoError(t, err)
+
+		err = mpp.RevertStateToBlock(&block.Block{Header: &block.BlockHeader{KAppsTrieRoot: trie.EmptyTrieHash}})
+		require.NoError(t, err)
+
+		defaults := kapps.InitialProposalParameters(arguments.ForkController)
+		assert.Equal(t, defaults[key].Value, mp.GetActiveParameters()[key].Value)
+	})
 }
 
 func SetProposal(

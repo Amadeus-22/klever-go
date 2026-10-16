@@ -1,6 +1,7 @@
 package kapps_test
 
 import (
+	"math"
 	"reflect"
 	strconv "strconv"
 	"sync"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/common/mock"
+	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/kapps"
 	"github.com/stretchr/testify/assert"
 )
@@ -343,6 +345,7 @@ func TestParseParamAndValidate_MaxGasPerTX_ForkAware(t *testing.T) {
 	t.Run("FixAuditChanges disabled - uses MaxGasBandwidthPerBatchPerSender", func(t *testing.T) {
 		mockForks := mock.NewForkControllerStub()
 		mockForks.FixAuditChangesValue = false
+		mockForks.FixAuditChangesV6Value = false
 
 		tests := []struct {
 			name    string
@@ -432,10 +435,10 @@ func TestValidateConstraints_AllParameters(t *testing.T) {
 			value   []byte
 			wantErr bool
 		}{
-			{"valid at min limit", []byte("50000"), false},      // core.MinGasLimit
+			{"valid at min limit", []byte("500000000"), false},  // core.MaxGasLimitPerTx
 			{"valid higher value", []byte("1500000000"), false}, // 1.5B
 			{"valid large value", []byte("10000000000"), false}, // 10B
-			{"invalid below min", []byte("49999"), true},
+			{"invalid below min", []byte("499999999"), true},
 			{"invalid zero", []byte("0"), true},
 		}
 
@@ -458,4 +461,141 @@ func TestIsInterfaceNil(t *testing.T) {
 
 	newController := NewProposalControllerForTests()
 	assert.False(t, newController.IsInterfaceNil())
+}
+
+func TestParseParamAndValidate_EveryParameterIsBoundedFromFixAuditChangesV6(t *testing.T) {
+	mockForks := mock.NewForkControllerStub()
+	controller := NewProposalControllerForTests()
+
+	params := kapps.InitialProposalParameters(mockForks)
+	assert.Equal(t, len(kapps.EnumParameter_name), len(params))
+
+	for key, param := range params {
+		name := kapps.EnumParameter(key)
+
+		// a parameter without a bounds row is rejected, so this also proves every row exists
+		_, err := controller.ParseParamAndValidate(name, param.Value, mockForks)
+		assert.NoError(t, err, "%s default %s must sit inside its bounds", name, param.Value)
+
+		_, err = controller.ParseParamAndValidate(name, []byte("-1"), mockForks)
+		assert.Error(t, err, "%s must reject -1", name)
+
+		_, err = controller.ParseParamAndValidate(name, []byte(strconv.FormatInt(math.MaxInt64, 10)), mockForks)
+		assert.Error(t, err, "%s must reject MaxInt64", name)
+	}
+}
+
+// TestParseParamAndValidate_NegativeFees is the KLC-2691 reproducer: negative fees passed
+// validation. They are rejected from FixAuditChangesV6 and still accepted before it, so
+// replaying a pre-fork block reaches the same decision the chain did.
+func TestParseParamAndValidate_NegativeFees(t *testing.T) {
+	controller := NewProposalControllerForTests()
+
+	cases := map[kapps.EnumParameter]string{
+		kapps.EnumParameter_FeePerDataByte:     "-4000",
+		kapps.EnumParameter_KAppFeeTransfer:    "-500000",
+		kapps.EnumParameter_KAppFeeCreateAsset: "-20000000000",
+		kapps.EnumParameter_KAppFeeProposal:    "-1",
+	}
+
+	afterFork := mock.NewForkControllerStub()
+	beforeFork := mock.NewForkControllerStub()
+	beforeFork.FixAuditChangesV6Value = false
+
+	for name, value := range cases {
+		_, err := controller.ParseParamAndValidate(name, []byte(value), afterFork)
+		assert.Equal(t, common.ErrInvalidParameter, err, "%s = %s after FixAuditChangesV6", name, value)
+
+		_, err = controller.ParseParamAndValidate(name, []byte(value), beforeFork)
+		assert.NoError(t, err, "%s = %s before FixAuditChangesV6", name, value)
+	}
+}
+
+// Every bound sits at its exact edge: the floor and the ceiling are accepted, one past
+// either is not. The table covers every parameter, so a row widened by mistake fails here.
+func TestParseParamAndValidate_EveryBoundAtItsEdges(t *testing.T) {
+	controller := NewProposalControllerForTests()
+	mockForks := mock.NewForkControllerStub()
+
+	const (
+		maxGasPerBlock = int64(core.MaxGasLimitPerTx) * core.MaxKappIterator
+		maxKLVSupply   = 10_000_000_000_000_000
+		maxKFISupply   = 21_000_000_000_000
+	)
+
+	kappFee := [2]int64{0, 1_000_000_000_000} // 1M KLV
+	emission := [2]int64{0, 1_000_000_000}
+	klvStake := [2]int64{1, maxKLVSupply}
+	iteration := [2]int64{1, core.MaxKappIterator}
+
+	edges := map[kapps.EnumParameter][2]int64{
+		kapps.EnumParameter_FeePerDataByte: {0, 4_000_000},
+
+		kapps.EnumParameter_KAppFeeCreateValidator:         kappFee,
+		kapps.EnumParameter_KAppFeeCreateAsset:             kappFee,
+		kapps.EnumParameter_KAppFeeTransfer:                kappFee,
+		kapps.EnumParameter_KAppFeeAssetTrigger:            kappFee,
+		kapps.EnumParameter_KAppFeeValidatorConfig:         kappFee,
+		kapps.EnumParameter_KAppFeeFreeze:                  kappFee,
+		kapps.EnumParameter_KAppFeeUnfreeze:                kappFee,
+		kapps.EnumParameter_KAppFeeDelegate:                kappFee,
+		kapps.EnumParameter_KAppFeeUndelegate:              kappFee,
+		kapps.EnumParameter_KAppFeeWithdraw:                kappFee,
+		kapps.EnumParameter_KAppFeeClaim:                   kappFee,
+		kapps.EnumParameter_KAppFeeUnjail:                  kappFee,
+		kapps.EnumParameter_KAppFeeSetAccountName:          kappFee,
+		kapps.EnumParameter_KAppFeeProposal:                kappFee,
+		kapps.EnumParameter_KAppFeeVote:                    kappFee,
+		kapps.EnumParameter_KAppFeeConfigITO:               kappFee,
+		kapps.EnumParameter_KAppFeeSetITOPrices:            kappFee,
+		kapps.EnumParameter_KAppFeeBuy:                     kappFee,
+		kapps.EnumParameter_KAppFeeSell:                    kappFee,
+		kapps.EnumParameter_KAppFeeCancelMarketOrder:       kappFee,
+		kapps.EnumParameter_KAppFeeCreateMarketplace:       kappFee,
+		kapps.EnumParameter_KAppFeeConfigMarketplace:       kappFee,
+		kapps.EnumParameter_KAppFeeUpdateAccountPermission: kappFee,
+		kapps.EnumParameter_KAppFeeITOTrigger:              kappFee,
+		kapps.EnumParameter_KAppFeeDeposit:                 kappFee,
+		kapps.EnumParameter_KAppFeeSmartContract:           kappFee,
+
+		kapps.EnumParameter_BlockRewards:   emission,
+		kapps.EnumParameter_StakingRewards: emission,
+
+		kapps.EnumParameter_MinSelfDelegatedAmount:  klvStake,
+		kapps.EnumParameter_MinTotalDelegatedAmount: klvStake,
+		kapps.EnumParameter_MinKLVBucketAmount:      klvStake,
+
+		kapps.EnumParameter_MinKFIStakedToEnableProposals: {1, maxKFISupply},
+
+		kapps.EnumParameter_MaxEpochsUnclaimed: iteration,
+		kapps.EnumParameter_MaxNFTMintBatch:    iteration,
+		kapps.EnumParameter_MaxBucketSize:      iteration,
+
+		kapps.EnumParameter_ProposalMaxEpochsDuration:        {1, 1_000},
+		kapps.EnumParameter_LeaderValidatorRewardsPercentage: {0, int64(core.HundredPercent)},
+
+		kapps.EnumParameter_GasMultiplier:  {1, 10_000},
+		kapps.EnumParameter_MaxGasPerBlock: {core.MaxGasLimitPerTx, maxGasPerBlock},
+		kapps.EnumParameter_MaxGasPerTX:    {core.MinGasLimit, core.MaxGasLimitPerTx},
+	}
+	assert.Equal(t, len(kapps.EnumParameter_name), len(edges), "every parameter needs a row")
+
+	for name, edge := range edges {
+		floor, ceiling := edge[0], edge[1]
+
+		for _, accepted := range []int64{floor, ceiling} {
+			_, err := controller.ParseParamAndValidate(name, []byte(strconv.FormatInt(accepted, 10)), mockForks)
+			assert.NoError(t, err, "%s at %d", name, accepted)
+		}
+
+		for _, rejected := range []int64{floor - 1, ceiling + 1} {
+			_, err := controller.ParseParamAndValidate(name, []byte(strconv.FormatInt(rejected, 10)), mockForks)
+			if rejected < 0 && name == kapps.EnumParameter_LeaderValidatorRewardsPercentage {
+				// a uint32: the parser rejects -1 before the bounds see it
+				assert.Error(t, err, "%s at %d", name, rejected)
+				continue
+			}
+			assert.ErrorIs(t, err, common.ErrInvalidParameter, "%s at %d", name, rejected)
+		}
+	}
 }
