@@ -21,6 +21,7 @@ import (
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
 	"github.com/klever-io/klever-go/kapps"
+	"github.com/klever-io/klever-go/kvm/crypto/signing/bls"
 	"github.com/klever-io/klever-go/sharding"
 	"github.com/klever-io/klever-go/tools"
 	"github.com/klever-io/klever-go/tools/check"
@@ -60,6 +61,11 @@ type blsPublicKeyValidator interface {
 	CheckPublicKeyValid(b []byte) error
 }
 
+// blsSignatureVerifier verifies a BLS signature by a public key over a message
+type blsSignatureVerifier interface {
+	VerifyBLS(key []byte, msg []byte, sig []byte) error
+}
+
 type validatorsKApp struct {
 	marshalizer     marshal.Marshalizer
 	pubkeyConv      core.PubkeyConverter
@@ -68,6 +74,7 @@ type validatorsKApp struct {
 	ratingsData     process.RatingsInfoHandler
 	rater           sharding.PeerAccountListAndRatingHandler
 	blsKeyValidator blsPublicKeyValidator
+	blsVerifier     blsSignatureVerifier
 	addressLen      int
 	KAppController  kapp.KAppController
 }
@@ -112,6 +119,7 @@ func NewValidatorKApp(
 		pubkeyConv:      args.PubkeyConv,
 		forkController:  args.ForkController,
 		blsKeyValidator: blsKeyValidator,
+		blsVerifier:     bls.NewBLS(),
 	}
 
 	return v, nil
@@ -128,6 +136,32 @@ func (v *validatorsKApp) validateBLSPublicKey(blsPubKey []byte) error {
 
 	if err := v.blsKeyValidator.CheckPublicKeyValid(blsPubKey); err != nil {
 		return common.ErrInvalidBLSPublicKey
+	}
+
+	return nil
+}
+
+// verifyBLSKeyProof checks that sig is a BLS signature by blsPubKey over
+// transaction.BLSKeyProofMessage(owner, blsPubKey), which proves the owner holds the
+// private key and stops a copied key (or a copied proof) being bound to another
+// owner. Callers validate owner and blsPubKey first. Gated behind FixAuditChangesV6;
+// skipped at genesis (nonce 0), where validators are registered with public keys only.
+func (v *validatorsKApp) verifyBLSKeyProof(ctx kapp.KappContext, owner, blsPubKey, sig []byte) error {
+	if !v.forkController.FixAuditChangesV6() {
+		return nil
+	}
+
+	if ctx.Block().GetNonce() == 0 {
+		return nil
+	}
+
+	if len(sig) == 0 {
+		return common.ErrInvalidBLSKeyProof
+	}
+
+	err := v.blsVerifier.VerifyBLS(blsPubKey, transaction.BLSKeyProofMessage(owner, blsPubKey), sig)
+	if err != nil {
+		return common.ErrInvalidBLSKeyProof
 	}
 
 	return nil
@@ -232,62 +266,12 @@ func (v *validatorsKApp) setValidator(app state.KAppAccountHandler, address []by
 	return app.SetStorage(vKey, data)
 }
 
-// Register
-func (v *validatorsKApp) Register(tc *transaction.CreateValidatorContract) (transaction.Transaction_TXResultCode, error) {
+// Register registers the validator of tc's owner, sent by sender
+func (v *validatorsKApp) Register(sender []byte, tc *transaction.CreateValidatorContract) (transaction.Transaction_TXResultCode, error) {
 	ctx := v.KAppController.GetCurrentKAppContext()
 
-	// Check validator info
-	if len(tc.GetOwnerAddress()) != v.addressLen {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidOwnerAddress, process.ErrInvalidRcvAddr.Error())
-		return transaction.Transaction_AccountError, process.ErrInvalidRcvAddr
-	}
-
-	if len(tc.GetConfig().GetRewardAddress()) != v.addressLen {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRewardAddress, process.ErrInvalidRcvAddr.Error())
-		return transaction.Transaction_AccountError, process.ErrInvalidRcvAddr
-	}
-
-	commission := tc.GetConfig().GetCommission()
-	if commission > core.HundredPercent {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidCommission, common.ErrInvalidValue.Error())
-		return transaction.Transaction_CommissionTooHigh, common.ErrInvalidValue
-	}
-
-	maxDelegationAmount := tc.GetConfig().GetMaxDelegationAmount()
-	if maxDelegationAmount < 0 {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidDelegation, common.ErrInvalidValue.Error())
-		return transaction.Transaction_DelegationAmountInvalid, common.ErrInvalidValue
-	}
-
-	if !utf8.ValidString(tc.GetConfig().GetLogo()) || len(tc.GetConfig().GetLogo()) > core.MaxLogoURISize {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidLogo, common.ErrInvalidValue.Error())
-		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
-	}
-
-	if len(tc.GetConfig().GetURIs()) > core.MaxURIMapSize {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldURICountExceeded, common.ErrInvalidValue.Error())
-		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
-	}
-
-	for key, uri := range tc.GetConfig().GetURIs() {
-		if !utf8.ValidString(key) ||
-			!utf8.ValidString(uri) ||
-			len(key) > core.MaxURIKeySize ||
-			len(uri) > core.MaxURIValueSize {
-			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidURI, common.ErrInvalidValue.Error())
-			return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
-		}
-	}
-
-	if !utf8.ValidString(tc.GetConfig().GetName()) ||
-		len(tc.GetConfig().GetName()) > core.MaxNameSize {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidName, common.ErrInvalidValue.Error())
-		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
-	}
-
-	if err := v.validateBLSPublicKey(tc.GetConfig().GetBLSPublicKey()); err != nil {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBLSKey, err.Error())
-		return transaction.Transaction_ParameterInvalid, err
+	if resultCode, err := v.validateRegisterContract(ctx, sender, tc); err != nil {
+		return resultCode, err
 	}
 
 	// load Kapp Accoount
@@ -304,36 +288,9 @@ func (v *validatorsKApp) Register(tc *transaction.CreateValidatorContract) (tran
 		return transaction.Transaction_AccountError, common.ErrAccountValidatorSet
 	}
 
-	peerAcc, err := v.loadPeerAccount(tc.GetConfig().GetBLSPublicKey())
+	peerAcc, resultCode, err := v.claimPeerAccount(ctx, tc.GetOwnerAddress(), tc.GetConfig().GetBLSPublicKey())
 	if err != nil {
-		return transaction.Transaction_AccountError, err
-	}
-
-	// verify if BLS key is been used as validator...
-	if len(peerAcc.GetOwnerAddress()) > 0 {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBLSKeyAlreadyUsed, common.ErrAccountValidatorSet.Error())
-		return transaction.Transaction_AccountError, common.ErrAccountValidatorSet
-	}
-
-	// check if bls has been revoked
-	if v.forkController.FixStakingBuckets() && peerAcc.GetRevoked() {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBLSKeyRevoked, common.ErrAccountValidatorSet.Error())
-		return transaction.Transaction_AccountError, common.ErrAccountValidatorSet
-	}
-
-	err = peerAcc.SetOwnerAddress(tc.GetOwnerAddress())
-	if err != nil {
-		return transaction.Transaction_AccountError, err
-	}
-
-	err = peerAcc.SetBLSPublicKey(tc.GetConfig().GetBLSPublicKey())
-	if err != nil {
-		return transaction.Transaction_AccountError, err
-	}
-
-	err = v.accountsCacher.UpdatePeer(peerAcc)
-	if err != nil {
-		return transaction.Transaction_Fail, err
+		return resultCode, err
 	}
 
 	val := &ValidatorData{
@@ -383,6 +340,130 @@ func (v *validatorsKApp) Register(tc *transaction.CreateValidatorContract) (tran
 	return transaction.Transaction_Ok, nil
 }
 
+// validateRegisterContract runs Register's stateless checks, in order: owner address and
+// sender, reward address, commission and delegation cap, metadata, BLS key and its proof
+func (v *validatorsKApp) validateRegisterContract(ctx kapp.KappContext, sender []byte, tc *transaction.CreateValidatorContract) (transaction.Transaction_TXResultCode, error) {
+	if len(tc.GetOwnerAddress()) != v.addressLen {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidOwnerAddress, process.ErrInvalidRcvAddr.Error())
+		return transaction.Transaction_AccountError, process.ErrInvalidRcvAddr
+	}
+
+	// from FixAuditChangesV6 on only the owner registers its validator, so a proof copied from
+	// a pending transaction cannot register the same validator first with another sender's terms
+	if v.forkController.FixAuditChangesV6() && ctx.Block().GetNonce() != 0 && !bytes.Equal(sender, tc.GetOwnerAddress()) {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidOwnerAddress, common.ErrValidatorOwnerNotSender.Error())
+		return transaction.Transaction_AccountError, common.ErrValidatorOwnerNotSender
+	}
+
+	if len(tc.GetConfig().GetRewardAddress()) != v.addressLen {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidRewardAddress, process.ErrInvalidRcvAddr.Error())
+		return transaction.Transaction_AccountError, process.ErrInvalidRcvAddr
+	}
+
+	if resultCode, err := validateCommissionAndDelegation(ctx, tc.GetConfig()); err != nil {
+		return resultCode, err
+	}
+
+	if resultCode, err := validateValidatorMetadata(ctx, tc.GetConfig()); err != nil {
+		return resultCode, err
+	}
+
+	if err := v.validateBLSPublicKey(tc.GetConfig().GetBLSPublicKey()); err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBLSKey, err.Error())
+		return transaction.Transaction_ParameterInvalid, err
+	}
+
+	if err := v.verifyBLSKeyProof(ctx, tc.GetOwnerAddress(), tc.GetConfig().GetBLSPublicKey(), tc.GetConfig().GetBLSSignature()); err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBLSKeyProof, err.Error())
+		return transaction.Transaction_AccountError, err
+	}
+
+	return transaction.Transaction_Ok, nil
+}
+
+// claimPeerAccount binds an unused, unrevoked BLS key to owner on registration
+func (v *validatorsKApp) claimPeerAccount(ctx kapp.KappContext, owner, blsPubKey []byte) (state.PeerAccountHandler, transaction.Transaction_TXResultCode, error) {
+	peerAcc, err := v.loadPeerAccount(blsPubKey)
+	if err != nil {
+		return nil, transaction.Transaction_AccountError, err
+	}
+
+	// verify if BLS key is been used as validator...
+	if len(peerAcc.GetOwnerAddress()) > 0 {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBLSKeyAlreadyUsed, common.ErrAccountValidatorSet.Error())
+		return nil, transaction.Transaction_AccountError, common.ErrAccountValidatorSet
+	}
+
+	// check if bls has been revoked
+	if v.forkController.FixStakingBuckets() && peerAcc.GetRevoked() {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBLSKeyRevoked, common.ErrAccountValidatorSet.Error())
+		return nil, transaction.Transaction_AccountError, common.ErrAccountValidatorSet
+	}
+
+	err = peerAcc.SetOwnerAddress(owner)
+	if err != nil {
+		return nil, transaction.Transaction_AccountError, err
+	}
+
+	err = peerAcc.SetBLSPublicKey(blsPubKey)
+	if err != nil {
+		return nil, transaction.Transaction_AccountError, err
+	}
+
+	err = v.accountsCacher.UpdatePeer(peerAcc)
+	if err != nil {
+		return nil, transaction.Transaction_Fail, err
+	}
+
+	return peerAcc, transaction.Transaction_Ok, nil
+}
+
+// validateCommissionAndDelegation checks the commission and the delegation cap
+func validateCommissionAndDelegation(ctx kapp.KappContext, cfg *transaction.ValidatorConfig) (transaction.Transaction_TXResultCode, error) {
+	if cfg.GetCommission() > core.HundredPercent {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidCommission, common.ErrInvalidValue.Error())
+		return transaction.Transaction_CommissionTooHigh, common.ErrInvalidValue
+	}
+
+	if cfg.GetMaxDelegationAmount() < 0 {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidDelegation, common.ErrInvalidValue.Error())
+		return transaction.Transaction_DelegationAmountInvalid, common.ErrInvalidValue
+	}
+
+	return transaction.Transaction_Ok, nil
+}
+
+// validateValidatorMetadata checks the logo, the URIs and the name, in that order;
+// empty values pass
+func validateValidatorMetadata(ctx kapp.KappContext, cfg *transaction.ValidatorConfig) (transaction.Transaction_TXResultCode, error) {
+	if !utf8.ValidString(cfg.GetLogo()) || len(cfg.GetLogo()) > core.MaxLogoURISize {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidLogo, common.ErrInvalidValue.Error())
+		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
+	}
+
+	if len(cfg.GetURIs()) > core.MaxURIMapSize {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldURICountExceeded, common.ErrInvalidValue.Error())
+		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
+	}
+
+	for key, uri := range cfg.GetURIs() {
+		if !utf8.ValidString(key) ||
+			!utf8.ValidString(uri) ||
+			len(key) > core.MaxURIKeySize ||
+			len(uri) > core.MaxURIValueSize {
+			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidURI, common.ErrInvalidValue.Error())
+			return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
+		}
+	}
+
+	if !utf8.ValidString(cfg.GetName()) || len(cfg.GetName()) > core.MaxNameSize {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidName, common.ErrInvalidValue.Error())
+		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
+	}
+
+	return transaction.Transaction_Ok, nil
+}
+
 // UpdateValidator
 func (v *validatorsKApp) UpdateValidator(sender []byte, tc *transaction.ValidatorConfigContract) (transaction.Transaction_TXResultCode, error) {
 	ctx := v.KAppController.GetCurrentKAppContext()
@@ -393,16 +474,8 @@ func (v *validatorsKApp) UpdateValidator(sender []byte, tc *transaction.Validato
 		return transaction.Transaction_AccountError, process.ErrInvalidRcvAddr
 	}
 
-	commission := tc.GetConfig().GetCommission()
-	if commission > core.HundredPercent {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidCommission, common.ErrInvalidValue.Error())
-		return transaction.Transaction_CommissionTooHigh, common.ErrInvalidValue
-	}
-
-	maxDelegationAmount := tc.GetConfig().GetMaxDelegationAmount()
-	if maxDelegationAmount < 0 {
-		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidDelegation, common.ErrInvalidValue.Error())
-		return transaction.Transaction_DelegationAmountInvalid, common.ErrInvalidValue
+	if resultCode, err := validateCommissionAndDelegation(ctx, tc.GetConfig()); err != nil {
+		return resultCode, err
 	}
 
 	// load Kapp Accoount
@@ -421,117 +494,18 @@ func (v *validatorsKApp) UpdateValidator(sender []byte, tc *transaction.Validato
 	// check if BLS Key matchs current
 	if len(tc.GetConfig().GetBLSPublicKey()) > 0 &&
 		!bytes.Equal(val.BlsPubKey, tc.GetConfig().GetBLSPublicKey()) {
-
-		if err := v.validateBLSPublicKey(tc.GetConfig().GetBLSPublicKey()); err != nil {
-			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBLSKey, err.Error())
-			return transaction.Transaction_InvalidPeerKey, err
+		if resultCode, err := v.rotateBLSKey(ctx, sender, val, tc.GetConfig()); err != nil {
+			return resultCode, err
 		}
-
-		// Reset old peer
-		peerAccOld, err := v.revokePeerAccount(val.BlsPubKey)
-		if err != nil {
-			_ = bugsnag.Notify(err)
-			return transaction.Transaction_InvalidPeerKey, err
-		}
-
-		peerAcc, err := v.loadPeerAccount(tc.GetConfig().GetBLSPublicKey())
-		if err != nil {
-			return transaction.Transaction_InvalidPeerKey, err
-		}
-
-		if !bytes.Equal(peerAcc.GetBLSPublicKey(), tc.GetConfig().GetBLSPublicKey()) {
-			err = peerAcc.SetBLSPublicKey(tc.GetConfig().GetBLSPublicKey())
-			if err != nil {
-				return transaction.Transaction_InvalidPeerKey, err
-			}
-
-			if v.forkController.FixStakingBuckets() {
-				// copy info from old peer
-				err = peerAcc.CopyFrom(peerAccOld)
-				if err != nil {
-					return transaction.Transaction_InvalidPeerKey, err
-				}
-
-				if peerAcc.GetList() == state.List_elected {
-					peerAcc.SetRating(0)
-					peerAcc.SetTempRating(0)
-					peerAcc.SetList(state.List_jailed)
-				}
-			}
-		}
-
-		if peerAcc.GetRevoked() {
-			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBLSKeyRevoked, common.ErrBLSKeyRevoked.Error())
-			return transaction.Transaction_InvalidPeerKey, common.ErrBLSKeyRevoked
-		}
-
-		// check inconsistences in peerAcc
-		if len(peerAcc.GetOwnerAddress()) > 0 &&
-			!bytes.Equal(sender, peerAcc.GetOwnerAddress()) {
-			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBLSKeyNotOwned, common.ErrAccountValidatorNotOwner.Error())
-			return transaction.Transaction_InvalidPeerKey, common.ErrAccountValidatorNotOwner
-		}
-
-		// Set New BLS Key
-		err = peerAcc.SetOwnerAddress(sender)
-		if err != nil {
-			return transaction.Transaction_InvalidPeerKey, err
-		}
-
-		err = v.accountsCacher.UpdatePeer(peerAcc)
-		if err != nil {
-			return transaction.Transaction_Fail, err
-		}
-
-		// Update BLS in validator account
-		val.BlsPubKey = tc.Config.GetBLSPublicKey()
 	}
 
-	if len(tc.GetConfig().GetRewardAddress()) > 0 {
-		val.RewardsAddress = tc.GetConfig().GetRewardAddress()
+	// the metadata is checked after the key rotation, as it always was, so the
+	// result of a transaction that fails both stays the same
+	if resultCode, err := validateValidatorMetadata(ctx, tc.GetConfig()); err != nil {
+		return resultCode, err
 	}
 
-	if len(tc.GetConfig().GetLogo()) > 0 {
-		if !utf8.ValidString(tc.GetConfig().GetLogo()) || len(tc.GetConfig().GetLogo()) > core.MaxLogoURISize {
-			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidLogo, common.ErrInvalidValue.Error())
-			return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
-		}
-
-		val.Logo = tc.GetConfig().GetLogo()
-	}
-
-	if len(tc.GetConfig().GetURIs()) > 0 {
-		if len(tc.GetConfig().GetURIs()) > core.MaxURIMapSize {
-			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldURICountExceeded, common.ErrInvalidValue.Error())
-			return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
-		}
-
-		for key, uri := range tc.GetConfig().GetURIs() {
-			if !utf8.ValidString(key) ||
-				!utf8.ValidString(uri) ||
-				len(key) > core.MaxURIKeySize ||
-				len(uri) > core.MaxURIValueSize {
-				ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidURI, common.ErrInvalidValue.Error())
-				return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
-			}
-		}
-
-		val.URIs = tc.GetConfig().GetURIs()
-	}
-
-	if len(tc.GetConfig().GetName()) > 0 {
-		if !utf8.ValidString(tc.GetConfig().GetName()) ||
-			len(tc.GetConfig().GetName()) > core.MaxNameSize {
-			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidName, common.ErrInvalidValue.Error())
-			return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
-		}
-
-		val.Name = tc.GetConfig().GetName()
-	}
-
-	val.CanDelegate = tc.GetConfig().GetCanDelegate()
-	val.Commission = tc.GetConfig().GetCommission()
-	val.MaxDelegation = tc.GetConfig().GetMaxDelegationAmount()
+	applyValidatorConfig(val, tc.GetConfig())
 
 	err = v.setValidator(app, sender, val)
 	if err != nil {
@@ -550,6 +524,151 @@ func (v *validatorsKApp) UpdateValidator(sender []byte, tc *transaction.Validato
 	))
 
 	return transaction.Transaction_Ok, nil
+}
+
+// rotateBLSKey moves sender's validator from val.BlsPubKey to cfg's BLS key: it revokes
+// the current key, binds the new one to sender and updates val.BlsPubKey
+func (v *validatorsKApp) rotateBLSKey(ctx kapp.KappContext, sender []byte, val *ValidatorData, cfg *transaction.ValidatorConfig) (transaction.Transaction_TXResultCode, error) {
+	newKey := cfg.GetBLSPublicKey()
+
+	if err := v.validateBLSPublicKey(newKey); err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBLSKey, err.Error())
+		return transaction.Transaction_InvalidPeerKey, err
+	}
+
+	if err := v.verifyBLSKeyProof(ctx, sender, newKey, cfg.GetBLSSignature()); err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBLSKeyProof, err.Error())
+		return transaction.Transaction_InvalidPeerKey, err
+	}
+
+	// from FixAuditChangesV6 on the new key is checked before the current one is revoked, so a
+	// refused rotation leaves the current key untouched even where its writes are kept
+	checkTargetFirst := v.forkController.FixAuditChangesV6()
+	if checkTargetFirst {
+		if resultCode, err := v.loadAndCheckRotationTarget(ctx, sender, newKey); err != nil {
+			return resultCode, err
+		}
+	}
+
+	// Reset old peer
+	peerAccOld, err := v.revokePeerAccount(val.BlsPubKey)
+	if err != nil {
+		_ = bugsnag.Notify(err)
+		return transaction.Transaction_InvalidPeerKey, err
+	}
+
+	peerAcc, err := v.loadPeerAccount(newKey)
+	if err != nil {
+		return transaction.Transaction_InvalidPeerKey, err
+	}
+
+	err = v.initRotatedPeerAccount(peerAcc, peerAccOld, newKey)
+	if err != nil {
+		return transaction.Transaction_InvalidPeerKey, err
+	}
+
+	if !checkTargetFirst {
+		if resultCode, err := checkRotationTarget(ctx, sender, peerAcc); err != nil {
+			return resultCode, err
+		}
+	}
+
+	// Set New BLS Key
+	err = peerAcc.SetOwnerAddress(sender)
+	if err != nil {
+		return transaction.Transaction_InvalidPeerKey, err
+	}
+
+	err = v.accountsCacher.UpdatePeer(peerAcc)
+	if err != nil {
+		return transaction.Transaction_Fail, err
+	}
+
+	// Update BLS in validator account
+	val.BlsPubKey = newKey
+
+	return transaction.Transaction_Ok, nil
+}
+
+// checkRotationTarget refuses rotating sender's validator to a revoked key or to a key bound to another owner
+func checkRotationTarget(ctx kapp.KappContext, sender []byte, peerAcc state.PeerAccountHandler) (transaction.Transaction_TXResultCode, error) {
+	if peerAcc.GetRevoked() {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBLSKeyRevoked, common.ErrBLSKeyRevoked.Error())
+		return transaction.Transaction_InvalidPeerKey, common.ErrBLSKeyRevoked
+	}
+
+	if len(peerAcc.GetOwnerAddress()) > 0 &&
+		!bytes.Equal(sender, peerAcc.GetOwnerAddress()) {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBLSKeyNotOwned, common.ErrAccountValidatorNotOwner.Error())
+		return transaction.Transaction_InvalidPeerKey, common.ErrAccountValidatorNotOwner
+	}
+
+	return transaction.Transaction_Ok, nil
+}
+
+// loadAndCheckRotationTarget runs checkRotationTarget on the peer account of newKey
+func (v *validatorsKApp) loadAndCheckRotationTarget(ctx kapp.KappContext, sender, newKey []byte) (transaction.Transaction_TXResultCode, error) {
+	peerAcc, err := v.loadPeerAccount(newKey)
+	if err != nil {
+		return transaction.Transaction_InvalidPeerKey, err
+	}
+
+	return checkRotationTarget(ctx, sender, peerAcc)
+}
+
+// initRotatedPeerAccount sets the BLS key on a peer account seen for the first time and,
+// from FixStakingBuckets on, carries the old peer's state over, jailing it if elected
+func (v *validatorsKApp) initRotatedPeerAccount(peerAcc, peerAccOld state.PeerAccountHandler, newKey []byte) error {
+	if bytes.Equal(peerAcc.GetBLSPublicKey(), newKey) {
+		return nil
+	}
+
+	err := peerAcc.SetBLSPublicKey(newKey)
+	if err != nil {
+		return err
+	}
+
+	if !v.forkController.FixStakingBuckets() {
+		return nil
+	}
+
+	// copy info from old peer
+	err = peerAcc.CopyFrom(peerAccOld)
+	if err != nil {
+		return err
+	}
+
+	if peerAcc.GetList() == state.List_elected {
+		peerAcc.SetRating(0)
+		peerAcc.SetTempRating(0)
+		peerAcc.SetList(state.List_jailed)
+	}
+
+	return nil
+}
+
+// applyValidatorConfig copies cfg onto val; an empty reward address, logo, URI map or
+// name keeps the current value
+func applyValidatorConfig(val *ValidatorData, cfg *transaction.ValidatorConfig) {
+	if len(cfg.GetRewardAddress()) > 0 {
+		val.RewardsAddress = cfg.GetRewardAddress()
+	}
+
+	if len(cfg.GetLogo()) > 0 {
+		val.Logo = cfg.GetLogo()
+	}
+
+	if len(cfg.GetURIs()) > 0 {
+		val.URIs = cfg.GetURIs()
+	}
+
+	if len(cfg.GetName()) > 0 {
+		val.Name = cfg.GetName()
+	}
+
+	val.CanDelegate = cfg.GetCanDelegate()
+	val.Commission = cfg.GetCommission()
+	val.MaxDelegation = cfg.GetMaxDelegationAmount()
 }
 
 func (v *validatorsKApp) getExistingAccountFromAddress(adrSrc []byte) (state.UserAccountHandler, error) {

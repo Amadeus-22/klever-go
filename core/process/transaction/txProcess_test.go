@@ -2110,10 +2110,12 @@ func TestTxProcessor_ProcessDelegateAndUndelegateOkValsShouldWork(t *testing.T) 
 
 	//Creating Validators
 	_, err = args.KAppController.GetValidatorsKApp().Register(
+		testToAddress,
 		&transaction.CreateValidatorContract{
 			OwnerAddress: testToAddress,
 			Config: &transaction.ValidatorConfig{
 				BLSPublicKey:        peerAddress,
+				BLSSignature:        validBLSKeyProof("peerAddress", testToAddress),
 				RewardAddress:       testReferralAddress,
 				CanDelegate:         true,
 				MaxDelegationAmount: 100_000_000_000,
@@ -2130,11 +2132,12 @@ func TestTxProcessor_ProcessDelegateAndUndelegateOkValsShouldWork(t *testing.T) 
 	args.KAppController.SetCurrentKAppContext(kappContext)
 
 	_, err = args.KAppController.GetValidatorsKApp().Register(
-
+		testOwnerAddress,
 		&transaction.CreateValidatorContract{
 			OwnerAddress: testOwnerAddress,
 			Config: &transaction.ValidatorConfig{
 				BLSPublicKey:        peerAddress2,
+				BLSSignature:        validBLSKeyProof("peerAddress2", testOwnerAddress),
 				RewardAddress:       testReferralAddress,
 				CanDelegate:         true,
 				MaxDelegationAmount: 100_000_000_000,

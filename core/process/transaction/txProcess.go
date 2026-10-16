@@ -545,7 +545,7 @@ func (txProc *txProcessor) createValidatorContract(ctx kapp.KappContext, tx *tra
 		return err
 	}
 
-	tx.ResultCode, err = txProc.kApps.GetValidatorsKApp().Register(tc)
+	tx.ResultCode, err = txProc.kApps.GetValidatorsKApp().Register(tx.GetSender(), tc)
 
 	return err
 }

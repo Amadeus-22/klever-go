@@ -518,6 +518,7 @@ func setStakingToTrie(
 			arg.KAppController.SetCurrentKAppContext(kappContext)
 			// Register Validator
 			_, err = arg.KAppController.GetValidatorsKApp().Register(
+				account.AddressBytes(),
 				&transaction.CreateValidatorContract{
 					OwnerAddress: account.AddressBytes(),
 					Config: &transaction.ValidatorConfig{

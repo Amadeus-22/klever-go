@@ -78,6 +78,7 @@ const (
 	ErrFieldBLSKeyAlreadyUsed    = "BLSKeyAlreadyUsed"
 	ErrFieldBLSKeyRevoked        = "BLSKeyRevoked"
 	ErrFieldBLSKeyNotOwned       = "BLSKeyNotOwned"
+	ErrFieldInvalidBLSKeyProof   = "InvalidBLSKeyProof"
 	ErrFieldValidatorAlreadySet  = "ValidatorAlreadySet"
 	ErrFieldValidatorNotFound    = "ValidatorNotFound"
 	ErrFieldValidatorJailed      = "ValidatorJailed"

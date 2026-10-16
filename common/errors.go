@@ -840,6 +840,13 @@ var ErrNilKAppValidator = errors.New("validator kapp is nil")
 // ErrBLSKeyRevoked signals that BLS key has been revoked
 var ErrBLSKeyRevoked = errors.New("blsKey revoked")
 
+// ErrInvalidBLSKeyProof signals that the BLS key proof of possession is missing or
+// does not verify for the given owner and BLS public key
+var ErrInvalidBLSKeyProof = errors.New("invalid bls key proof of possession")
+
+// ErrValidatorOwnerNotSender signals a validator registration sent by an account other than its owner
+var ErrValidatorOwnerNotSender = errors.New("validator owner is not the sender")
+
 // ErrDupSignature signals that a transaction was signed twice by the same address
 var ErrDupSignature = errors.New("duplicated signature")
 
