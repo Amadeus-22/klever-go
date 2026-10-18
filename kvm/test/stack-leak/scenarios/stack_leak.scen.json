@@ -1,0 +1,110 @@
+{
+    "name": "stack-leak",
+    "comment": "loops that leaked native stack in singlepass before the fixes; each call must return 7",
+    "gasSchedule": "v1",
+    "steps": [
+        {
+            "step": "setState",
+            "accounts": {
+                "address:owner": {
+                    "nonce": "0",
+                    "balance": "0"
+                }
+            },
+            "newAddresses": [
+                {
+                    "creatorAddress": "address:owner",
+                    "creatorNonce": "1",
+                    "newAddress": "sc:stack-leak"
+                }
+            ]
+        },
+        {
+            "step": "scDeploy",
+            "id": "deploy",
+            "tx": {
+                "from": "address:owner",
+                "contractCode": "file:../output/stack_leak.wasm",
+                "arguments": [],
+                "gasLimit": "5,000,000",
+                "gasPrice": "0"
+            },
+            "expect": {
+                "out": [],
+                "status": "0",
+                "logs": "*",
+                "gas": "*",
+                "refund": "*"
+            }
+        },
+        {
+            "step": "scCall",
+            "id": "elseLeak",
+            "tx": {
+                "from": "address:owner",
+                "to": "sc:stack-leak",
+                "function": "elseLeak",
+                "arguments": [
+                    "1,000,000"
+                ],
+                "gasLimit": "10,000,000,000",
+                "gasPrice": "0"
+            },
+            "expect": {
+                "out": [
+                    "7"
+                ],
+                "status": "0",
+                "logs": "*",
+                "gas": "*",
+                "refund": "*"
+            }
+        },
+        {
+            "step": "scCall",
+            "id": "callSpilledArgs",
+            "tx": {
+                "from": "address:owner",
+                "to": "sc:stack-leak",
+                "function": "callSpilledArgs",
+                "arguments": [
+                    "1,000,000"
+                ],
+                "gasLimit": "10,000,000,000",
+                "gasPrice": "0"
+            },
+            "expect": {
+                "out": [
+                    "7"
+                ],
+                "status": "0",
+                "logs": "*",
+                "gas": "*",
+                "refund": "*"
+            }
+        },
+        {
+            "step": "scCall",
+            "id": "brIfSpilled",
+            "tx": {
+                "from": "address:owner",
+                "to": "sc:stack-leak",
+                "function": "brIfSpilled",
+                "arguments": [
+                    "1,000,000"
+                ],
+                "gasLimit": "10,000,000,000",
+                "gasPrice": "0"
+            },
+            "expect": {
+                "out": [
+                    "7"
+                ],
+                "status": "0",
+                "logs": "*",
+                "gas": "*",
+                "refund": "*"
+            }
+        }
+    ]
+}
