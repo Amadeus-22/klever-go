@@ -141,8 +141,8 @@ func (mp *metaProcessor) ProcessBlock(
 	// fails after this point, the deferred handler restores them so a rejected
 	// (e.g. future-epoch) block cannot leave the node in a mutated, future-epoch
 	// state.
-	prevEpoch := mp.epochNotifier.CurrentEpoch()
 	prevCurrentHeader := mp.blockChain.GetCurrentBlockHeader()
+	prevEpoch := epochToRestore(mp.epochNotifier.CurrentEpoch(), prevCurrentHeader)
 	restoreEpochTrigger := snapshotEpochTrigger(mp.epochStartTrigger)
 
 	// Only the epoch start branch settles proposals, so only it can move the
@@ -606,6 +606,20 @@ func (mp *metaProcessor) restoreEpochState(
 	if restoreEpochTrigger != nil {
 		restoreEpochTrigger()
 	}
+}
+
+// epochToRestore is the epoch a rejected block returns the fork flags to. The notifier holds 0
+// from a start until the first block advances it, while the committed head is already in a later
+// epoch: restoring 0 there switches every fork off, and the revert then reloads the proposal
+// parameters with the defaults of no fork, dropping the ones the trie never held (GasMultiplier,
+// MaxGasPerTX), so every contract call gets 0 gas on each retry of the block. The head is the
+// state the revert goes back to, so its epoch wins whenever the notifier lags behind it.
+func epochToRestore(notifierEpoch uint32, head data.HeaderHandler) uint32 {
+	if check.IfNil(head) || head.GetEpoch() <= notifierEpoch {
+		return notifierEpoch
+	}
+
+	return head.GetEpoch()
 }
 
 // CreateBlock creates the final block and header for the current slot

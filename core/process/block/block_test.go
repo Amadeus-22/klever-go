@@ -2630,6 +2630,83 @@ func TestMetaProcessor_RevertReloadsProposalParameters(t *testing.T) {
 	})
 }
 
+// A node restarted on a committed chain has its epoch notifier at 0 until the first block
+// advances it. If that first block is rejected, the revert must restore the fork flags of the
+// committed head, not of epoch 0: the reload backfills the defaults of the forks active at the
+// restored epoch, and the smart contract ones (GasMultiplier among them) are not in the trie. At
+// epoch 0 they were dropped, every contract call then got 0 gas, and the block failed on its
+// fees on every retry.
+func TestMetaProcessor_RevertOfTheFirstBlockAfterRestartKeepsTheCommittedEpochDefaults(t *testing.T) {
+	t.Parallel()
+
+	const committedEpoch = uint32(5)
+	gasMultiplier := int32(kapps.EnumParameter_GasMultiplier)
+	maxGasPerTX := int32(kapps.EnumParameter_MaxGasPerTX)
+
+	epochNotifier := notifier.NewGenericEpochNotifier()
+	forkController, err := fork.NewForkController(config.EnableEpochs{SmartContracts: 1, FixAuditChanges: 1}, epochNotifier)
+	require.NoError(t, err)
+
+	arguments := createMockMetaArguments()
+	arguments.EpochNotifier = epochNotifier
+	arguments.ForkController = forkController
+	arguments.BlockChain = &mock.BlockChainMock{
+		GetGenesisHeaderCalled: createTestBlockchain().GetGenesisHeaderCalled,
+		GetCurrentBlockHeaderCalled: func() data.HeaderHandler {
+			return &block.Block{Header: &block.BlockHeader{Nonce: 0, Slot: 1, Epoch: committedEpoch}}
+		},
+	}
+	// fails once the epoch has been advanced, so it reaches the rollback of ProcessBlock
+	expectedErr := errors.New("block transactions failure")
+	arguments.TxCoordinator = &mock.TransactionCoordinatorMock{
+		ProcessBlockTransactionsCalled: func(*block.Block, func() time.Duration, bool) (data.ProcessResults, error) {
+			return nil, expectedErr
+		},
+	}
+	arguments.AccountsDB[state.UserAccountsState] = &mock.AccountsStub{
+		JournalLenCalled:       func() int { return 0 },
+		RevertToSnapshotCalled: func(_ int) error { return nil },
+	}
+
+	mpp, err := blproc.NewMetaProcessor(arguments)
+	require.NoError(t, err)
+	mp := blproc.NewMetaProcessorForTests(mpp)
+
+	// the committed trie holds the controller as it was stored before the smart contract fork
+	// defaults were ever merged into it
+	SetProposal(t, mp, func(pc *kapps.ProposalController, _ state.KAppAccountHandler, mp *blproc.MetaProcessorForTests) ([]byte, error) {
+		pc.ActiveParameters = kapps.InitialProposalParameters(forkController)
+		return mp.GetMarshalizer().Marshal(pc)
+	})
+	_, err = arguments.AccountsDB[state.KAppAccountsState].Commit()
+	require.NoError(t, err)
+	require.NotContains(t, kapps.InitialProposalParameters(forkController), gasMultiplier,
+		"precondition: at epoch 0 the smart contract defaults are not part of the initial set")
+
+	// the live set a node at the committed epoch holds, then the state right after a restart
+	epochNotifier.CheckEpoch(committedEpoch)
+	controller, err := kapps.NewProposalController(forkController)
+	require.NoError(t, err)
+	require.NoError(t, mpp.SetProposalController(controller))
+	require.Contains(t, mp.GetActiveParameters(), gasMultiplier)
+	epochNotifier.CheckEpoch(0)
+
+	// an ordinary block: only an epoch start block snapshots the parameters and puts them back
+	// after the revert, which would hide the loss
+	hdr := createEpochStartHeaderForProcess()
+	hdr.Header.IsEpochStart = false
+	hdr.Header.Epoch = committedEpoch
+	hdr.Header.Slot = 2
+
+	err = mpp.ProcessBlock(hdr, haveTime)
+	require.ErrorIs(t, err, expectedErr)
+
+	params := mp.GetActiveParameters()
+	assert.Contains(t, params, gasMultiplier, "a contract call would be given 0 gas")
+	assert.Contains(t, params, maxGasPerTX)
+	assert.True(t, forkController.EnableSmartContracts(), "fork flags must be those of the committed epoch")
+}
+
 func SetProposal(
 	t *testing.T,
 	mp *blproc.MetaProcessorForTests,
