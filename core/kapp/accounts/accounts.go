@@ -343,6 +343,31 @@ func (a *accountsKapp) computeSplitRoyalties(address string, assetID []byte, ass
 	return transaction.Transaction_Ok, nil
 }
 
+// paySplitRoyalties pays each split its share of value, in sorted key order. percentOf picks which split
+// percentage applies: the fixed or the percentage transfer royalty.
+//
+// Royalties are skipped for SC senders, so these receipts never become a contract's output transfers;
+// sorting changes receipt order only and needs no fork gate.
+func (a *accountsKapp) paySplitRoyalties(
+	splits map[string]*kapps.RoyaltySplitData,
+	assetID []byte,
+	assetType kapps.KDAData_EnumAssetType,
+	acntSrc state.UserAccountHandler,
+	value int64,
+	percentOf func(*kapps.RoyaltySplitData) uint32,
+	royaltiesToPay *int64,
+) (transaction.Transaction_TXResultCode, error) {
+	for _, key := range types.OrderedKeys(splits, true) {
+		percentage := int64(percentOf(splits[key]))
+		status, err := a.computeSplitRoyalties(key, assetID, assetType, acntSrc, value, percentage, royaltiesToPay)
+		if err != nil {
+			return status, err
+		}
+	}
+
+	return transaction.Transaction_Ok, nil
+}
+
 func (a *accountsKapp) processFixedRoyaltiesTransfer(tc *transaction.TransferContract, acntSrc, acntDst state.UserAccountHandler, kda *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	if core.IsSmartContractAddress(acntSrc.AddressBytes()) ||
 		kda.Royalties == nil ||
@@ -369,11 +394,17 @@ func (a *accountsKapp) processFixedRoyaltiesTransfer(tc *transaction.TransferCon
 	}
 
 	royaltiesFixedToPay := kda.Royalties.TransferFixed
-	for key, value := range kda.Royalties.SplitRoyalties {
-		status, err := a.computeSplitRoyalties(key, kdautils.KLVIdentifier, kapps.KDAData_Fungible, acntSrc, kda.Royalties.TransferFixed, int64(value.PercentTransferFixed), &royaltiesFixedToPay)
-		if err != nil {
-			return status, err
-		}
+	status, err := a.paySplitRoyalties(
+		kda.Royalties.SplitRoyalties,
+		kdautils.KLVIdentifier,
+		kapps.KDAData_Fungible,
+		acntSrc,
+		kda.Royalties.TransferFixed,
+		(*kapps.RoyaltySplitData).GetPercentTransferFixed,
+		&royaltiesFixedToPay,
+	)
+	if err != nil {
+		return status, err
 	}
 
 	if royaltiesFixedToPay <= 0 {
@@ -464,11 +495,17 @@ func (a *accountsKapp) processPercentageRoyaltiesTransfer(tc *transaction.Transf
 		}
 	}
 
-	for key, value := range kda.Royalties.SplitRoyalties {
-		status, err := a.computeSplitRoyalties(key, assetID, kda.AssetType, acntSrc, royaltyAmount, int64(value.PercentTransferPercentage), &royaltiesToPay)
-		if err != nil {
-			return status, err
-		}
+	status, err = a.paySplitRoyalties(
+		kda.Royalties.SplitRoyalties,
+		assetID,
+		kda.AssetType,
+		acntSrc,
+		royaltyAmount,
+		(*kapps.RoyaltySplitData).GetPercentTransferPercentage,
+		&royaltiesToPay,
+	)
+	if err != nil {
+		return status, err
 	}
 
 	if royaltiesToPay <= 0 {

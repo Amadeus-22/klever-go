@@ -517,7 +517,9 @@ func (i *itoKapp) ComputeITOFixedBuyRoyalties(ctx kapp.KappContext, asset *kapps
 	}
 
 	royaltiesITOFixedToPay := asset.Royalties.ITOFixed
-	for key, value := range asset.Royalties.SplitRoyalties {
+	// KLV-only payouts no contract can tell apart, so sorting changes receipt order only and needs no fork gate.
+	for _, key := range types.OrderedKeys(asset.Royalties.SplitRoyalties, true) {
+		value := asset.Royalties.SplitRoyalties[key]
 		status, err := i.computeSplitRoyalties(ctx, key, kdautils.KLVIdentifier, ownerAcc,
 			asset.Royalties.ITOFixed, int64(value.PercentITOFixed), &royaltiesITOFixedToPay, nil)
 		if err != nil {
