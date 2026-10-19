@@ -656,6 +656,32 @@ func TestEstimateTransactionsFees(t *testing.T) {
 		assert.NotNil(t, err)
 	})
 
+	t.Run("should fail with nil contract", func(t *testing.T) {
+		t.Parallel()
+
+		feeHandlerCalled := false
+		feeHandler := &mock.FeeHandlerStub{
+			ComputeTransactionCostCalled: func(tx process.TransactionWithFeeHandler) (*transaction.CostResponse, error) {
+				feeHandlerCalled = true
+				return &transaction.CostResponse{}, nil
+			},
+		}
+		nodeWithFeeHandler, err := createNodeWithFeeHandler(t, feeHandler)
+		require.Nil(t, err)
+
+		tx := &transaction.Transaction{
+			RawData: &transaction.Transaction_Raw{
+				Sender:   validAddress,
+				Contract: []*transaction.TXContract{nil},
+			},
+		}
+
+		cost, err := nodeWithFeeHandler.EstimateTransactionFees(tx)
+		assert.Nil(t, cost)
+		assert.Equal(t, common.ErrInvalidContract, err)
+		assert.False(t, feeHandlerCalled)
+	})
+
 	t.Run("should work transaction with transfer contract", func(t *testing.T) {
 		t.Parallel()
 

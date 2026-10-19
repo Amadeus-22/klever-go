@@ -314,6 +314,12 @@ func (n *Node) EstimateTransactionFees(tx *transaction.Transaction) (*transactio
 	if txRawData == nil {
 		return nil, common.ErrNilRawTransaction
 	}
+	// a nil contract would be dereferenced while computing the fees
+	for _, contract := range txRawData.Contract {
+		if contract == nil {
+			return nil, common.ErrInvalidContract
+		}
+	}
 
 	sender := n.addressPubkeyConverter.Encode(tx.GetSender())
 
