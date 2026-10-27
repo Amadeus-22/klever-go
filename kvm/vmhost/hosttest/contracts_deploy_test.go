@@ -144,6 +144,42 @@ func TestDeployFromSource_CodeDeclaringStartSection_PreFork(t *testing.T) {
 	})
 }
 
+// A deploy that forwards everything the caller has left is the one case the relocated CompilePerByte
+// charge changes, and the reason to relocate it. Pre-fork BoundGasLimit promised the whole remainder
+// to the new contract and CreateNewContract then charged the code on top of it, leaving the caller
+// past its own budget once the init spent what it was given; checkFinalGasAfterExit fails it on exit.
+// From FixAuditChangesV6 the hook charges the code first, so only the rest is forwarded and the
+// transaction balances to the last unit.
+func TestDeployFromSource_ForwardsAllGas_InitSpendsItAll(t *testing.T) {
+	testConfig := getDeployFromSourceTestConfig()
+	// more than the caller can still have by the time it deploys, so BoundGasLimit clamps to GasLeft
+	testConfig.GasProvidedForInit = testConfig.GasProvided
+
+	spendEverything := func(instance *mock.InstanceMock, _ any) {
+		instance.AddMockMethod("init", func() *mock.InstanceMock {
+			metering := instance.Host.Metering()
+			// spend the whole forwarded budget, down to the last unit
+			metering.UseGas(metering.GetGasForExecution())
+			return instance
+		})
+	}
+
+	t.Run("before FixAuditChangesV6", func(t *testing.T) {
+		epochs := blockchainConfig.EnableEpochs{FixAuditChangesV6: 1_000_000}
+		runDeployFromSourceTestWithInit(t, &testConfig, &epochs, spendEverything,
+			func(_ *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.OutOfGas().HasRuntimeErrors(vmhost.ErrNotEnoughGas.Error())
+			})
+	})
+
+	t.Run("from FixAuditChangesV6", func(t *testing.T) {
+		runDeployFromSourceTestWithInit(t, &testConfig, &blockchainConfig.EnableEpochs{}, spendEverything,
+			func(_ *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+				verify.Ok().GasRemaining(0)
+			})
+	})
+}
+
 func runDeployFromSourceTest(
 	t *testing.T,
 	testConfig *testcommon.TestConfig,
@@ -160,11 +196,23 @@ func runDeployFromSourceTestWithEpochs(
 	asserts func(world *worldmock.MockWorld, verify *test.VMOutputVerifier),
 	extraSetup ...func(host vmhost.VMHost, world *worldmock.MockWorld),
 ) {
+	runDeployFromSourceTestWithInit(t, testConfig, epochs, contracts.InitMockMethod, asserts, extraSetup...)
+}
+
+// runDeployFromSourceTestWithEpochs with the deployed contract's init method chosen by the caller
+func runDeployFromSourceTestWithInit(
+	t *testing.T,
+	testConfig *testcommon.TestConfig,
+	epochs *blockchainConfig.EnableEpochs,
+	initMethod func(instance *mock.InstanceMock, config any),
+	asserts func(world *worldmock.MockWorld, verify *test.VMOutputVerifier),
+	extraSetup ...func(host vmhost.VMHost, world *worldmock.MockWorld),
+) {
 	var deployedContract test.MockTestSmartContract
 	if testConfig.DeployedContractAddress != nil {
 		deployedContract = test.CreateMockContract(testConfig.DeployedContractAddress).
 			WithConfig(testConfig).
-			WithMethods(contracts.InitMockMethod)
+			WithMethods(initMethod)
 	}
 	callTest := test.BuildMockInstanceCallTest(t)
 	if epochs != nil {

@@ -165,6 +165,12 @@ func (txProc *simulateTxProcessor) validateAndPrepareTransaction(tx *transaction
 		return process.ErrNilTransaction
 	}
 
+	if !txProc.economicsFee.IsProposalControllerSet() {
+		// simulating before wiring would report an out-of-gas run instead of a
+		// node still starting
+		return process.ErrProposalNotInitialized
+	}
+
 	txProc.accountsCacher.ResetAll(true)
 	tx.GasLimit = txProc.economicsFee.MaxGasLimitPerTX()
 

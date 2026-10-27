@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,11 +16,14 @@ import (
 	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
+	"github.com/klever-io/klever-go/core/kapp/builtInFunctions"
 	"github.com/klever-io/klever-go/core/kapp/kda"
 	"github.com/klever-io/klever-go/core/process"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
 	"github.com/klever-io/klever-go/kapps"
+	"github.com/klever-io/klever-go/kvm/mock/stub"
+	"github.com/klever-io/klever-go/vmcommon"
 )
 
 var defaultTicker []byte = []byte("KDA")
@@ -1066,20 +1071,19 @@ func TestKDATrigger_HandlePauseOrResume(t *testing.T) {
 }
 
 func TestKDATrigger_UpdateMetadata(t *testing.T) {
-	kdaKApp := kda.NewKDAKappForTests()
-
 	assetID := [][]byte{defaultAssetID, []byte("1")}
 	owner := makeAddress("owner")
 	nonOwner := makeAddress("nonOwner")
 
 	tests := []struct {
-		name          string
-		sender        []byte
-		asset         *kapps.KDAData
-		tc            *transaction.AssetTriggerContract
-		txData        [][]byte
-		expectedCode  transaction.Transaction_TXResultCode
-		expectedError error
+		name             string
+		sender           []byte
+		asset            *kapps.KDAData
+		tc               *transaction.AssetTriggerContract
+		txData           [][]byte
+		existingMetadata []byte
+		expectedCode     transaction.Transaction_TXResultCode
+		expectedError    error
 	}{
 		{
 			name:   "Update metadata for NFT by owner",
@@ -1112,6 +1116,37 @@ func TestKDATrigger_UpdateMetadata(t *testing.T) {
 			txData:        [][]byte{[]byte("metadata")},
 			expectedCode:  transaction.Transaction_AccountNotOwner,
 			expectedError: common.ErrAccNotOwner,
+		},
+		{
+			name:   "Update metadata for stopped NFT with existing metadata",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				AssetType:    kapps.KDAData_NonFungible,
+				Attributes:   &kapps.AttributesData{IsNFTMetadataChangeStopped: true},
+			},
+			tc: &transaction.AssetTriggerContract{
+				ToAddress: owner,
+			},
+			txData:           [][]byte{[]byte("metadata")},
+			existingMetadata: []byte("old"),
+			expectedCode:     transaction.Transaction_NFTMetadataChangeStopped,
+			expectedError:    process.ErrNFTMetadataChangeStopped,
+		},
+		{
+			name:   "Update metadata for stopped NFT with empty metadata",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				AssetType:    kapps.KDAData_NonFungible,
+				Attributes:   &kapps.AttributesData{IsNFTMetadataChangeStopped: true},
+			},
+			tc: &transaction.AssetTriggerContract{
+				ToAddress: owner,
+			},
+			txData:        [][]byte{[]byte("metadata")},
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
 		},
 		{
 			name:   "Update metadata for non-nonce asset",
@@ -1156,29 +1191,33 @@ func TestKDATrigger_UpdateMetadata(t *testing.T) {
 		},
 	}
 
-	kdaKApp.GetAccountsCacher().GetExistingUserCalled = func(address []byte) (state.UserAccountHandler, error) {
-		return &mock.UserAccountHandlerStub{
-			GetUserKDACalled: func(assetID []byte, nonce []byte, _ bool) (*kapps.UserKDA, error) {
-				return &kapps.UserKDA{Balance: 1}, nil
-			},
-			DataTrieTrackerCalled: func() state.DataTrieTracker {
-				return &mock.DataTrieTrackerStub{
-					SaveKeyValueCalled: func(key []byte, value []byte) error {
-						return nil
-					},
-				}
-			},
-			SetRootHashCalled: func(rootHash []byte) {
-				_ = rootHash
-			},
-		}, nil
-	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// FixAuditChangesV6 on, so the NFT rows also guard that the NFT branch never reads SFT meta
+			kdaKApp, getMetaCalls, _ := newSFTMetadataTestKApp(true, nil, nil)
+
+			kdaKApp.GetAccountsCacher().GetExistingUserCalled = func(address []byte) (state.UserAccountHandler, error) {
+				return &mock.UserAccountHandlerStub{
+					GetUserKDACalled: func(assetID []byte, nonce []byte, _ bool) (*kapps.UserKDA, error) {
+						return &kapps.UserKDA{Balance: 1, Metadata: tt.existingMetadata}, nil
+					},
+					DataTrieTrackerCalled: func() state.DataTrieTracker {
+						return &mock.DataTrieTrackerStub{
+							SaveKeyValueCalled: func(key []byte, value []byte) error {
+								return nil
+							},
+						}
+					},
+					SetRootHashCalled: func(rootHash []byte) {
+						_ = rootHash
+					},
+				}, nil
+			}
+
 			code, err := kdaKApp.UpdateMetadata(tt.sender, tt.tc, kdaAccHandler, assetID, tt.asset, tt.txData)
 			assert.Equal(t, tt.expectedCode, code)
 			assert.Equal(t, tt.expectedError, err)
+			assert.Equal(t, 0, *getMetaCalls)
 		})
 	}
 }
@@ -1454,19 +1493,20 @@ func TestKDATrigger_HandleStopRoyaltiesChange(t *testing.T) {
 }
 
 func TestKDATrigger_UpdateRoyaltiesReceiver(t *testing.T) {
-	kdaKApp := kda.NewKDAKappForTests()
-
 	assetID := [][]byte{defaultAssetID}
 	owner := makeAddress("owner")
 	admin := makeAddress("admin")
 	nonOwner := makeAddress("nonOwner")
 	newReceiver := makeAddress("newReceiver")
+	// a committed receiver that is not the owner, the case the stop protects
+	thirdParty := makeAddress("thirdParty")
 
 	tests := []struct {
 		name          string
 		sender        []byte
 		asset         *kapps.KDAData
 		toAddress     []byte
+		fixV6         bool
 		expectedCode  transaction.Transaction_TXResultCode
 		expectedError error
 	}{
@@ -1515,6 +1555,108 @@ func TestKDATrigger_UpdateRoyaltiesReceiver(t *testing.T) {
 			expectedCode:  transaction.Transaction_AccountError,
 			expectedError: process.ErrInvalidRcvAddr,
 		},
+		{
+			name:   "Royalties change stopped with fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     newReceiver,
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_RoyaltiesChangeStopped,
+			expectedError: common.ErrAssetTriggerInvalid,
+		},
+		{
+			name:   "Royalties change stopped before fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     newReceiver,
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
+		{
+			name:   "Royalties change stopped by non-owner with fix",
+			sender: nonOwner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     newReceiver,
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_AccountNotOwner,
+			expectedError: common.ErrAccNotOwner,
+		},
+		{
+			name:   "Royalties change stopped by admin with fix",
+			sender: admin,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				AdminAddress: admin,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     newReceiver,
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_RoyaltiesChangeStopped,
+			expectedError: common.ErrAssetTriggerInvalid,
+		},
+		{
+			name:   "Royalties change stopped with invalid receiver address and fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     []byte("invalidAddress"),
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_RoyaltiesChangeStopped,
+			expectedError: common.ErrAssetTriggerInvalid,
+		},
+		{
+			name:   "Royalties change stopped with invalid receiver address before fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{IsRoyaltiesChangeStopped: true},
+			},
+			toAddress:     []byte("invalidAddress"),
+			expectedCode:  transaction.Transaction_AccountError,
+			expectedError: process.ErrInvalidRcvAddr,
+		},
+		{
+			name:   "Nil attributes with fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+			},
+			toAddress:     newReceiver,
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
+		{
+			name:   "Royalties change not stopped with fix",
+			sender: owner,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				Royalties:    &kapps.RoyaltiesData{Address: thirdParty},
+				Attributes:   &kapps.AttributesData{},
+			},
+			toAddress:     newReceiver,
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
 	}
 
 	kdaAccHandler := &mock.KAppAccountHandlerStub{
@@ -1529,6 +1671,13 @@ func TestKDATrigger_UpdateRoyaltiesReceiver(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			kdaKApp := kda.NewKDAKappForTests()
+			fc := mock.NewForkControllerStub()
+			fc.SetFork("FixAuditChangesV6", tt.fixV6)
+			kdaKApp.SetForkController(fc)
+
+			previousReceiver := tt.asset.Royalties.GetAddress()
+
 			tc := &transaction.AssetTriggerContract{
 				ToAddress: tt.toAddress,
 			}
@@ -1537,9 +1686,122 @@ func TestKDATrigger_UpdateRoyaltiesReceiver(t *testing.T) {
 			assert.Equal(t, tt.expectedError, err)
 			if err == nil {
 				assert.Equal(t, tt.toAddress, tt.asset.Royalties.Address)
+			} else {
+				assert.Equal(t, previousReceiver, tt.asset.Royalties.Address)
 			}
 		})
 	}
+}
+
+// KLC-2737: once royalty changes are stopped, the receiver is frozen too,
+// through the native trigger and the smart-contract builtin alike
+func TestKDATrigger_ChangeRoyaltiesReceiverAfterStop(t *testing.T) {
+	newReceiver := makeAddress("newReceiver")
+	admin := makeAddress("admin")
+	thirdParty := makeAddress("thirdParty")
+
+	assetTypes := []transaction.CreateAssetContract_EnumAssetType{
+		transaction.CreateAssetContract_Fungible,
+		transaction.CreateAssetContract_NonFungible,
+		transaction.CreateAssetContract_SemiFungible,
+	}
+	stops := []string{"none", "trigger", "create"}
+	paths := []string{"trigger", "builtin"}
+	senders := map[string][]byte{"owner": defaultSender, "admin": admin}
+
+	for _, assetType := range assetTypes {
+		for _, stop := range stops {
+			for _, path := range paths {
+				for senderName, sender := range senders {
+					for _, fixV6 := range []bool{true, false} {
+						name := fmt.Sprintf("%s/stop=%s/%s/%s/fixV6=%v", assetType, stop, path, senderName, fixV6)
+						t.Run(name, func(t *testing.T) {
+							kc, err := createMockControllers()
+							require.NoError(t, err)
+							kc.GetForkController().(*mock.ForkControllerStub).SetFork("FixAuditChangesV6", fixV6)
+
+							_, err = kc.GetKDAKApp().Create(defaultSender, &transaction.CreateAssetContract{
+								Type:         assetType,
+								Name:         defaultTicker,
+								Ticker:       defaultTicker,
+								OwnerAddress: defaultSender,
+								AdminAddress: admin,
+								Properties:   &transaction.PropertiesInfo{CanMint: true},
+								Royalties:    &transaction.RoyaltiesInfo{Address: thirdParty},
+								Attributes: &transaction.AttributesInfo{
+									IsRoyaltiesChangeStopped: stop == "create",
+								},
+							})
+							require.NoError(t, err)
+
+							if stop == "trigger" {
+								_, err = kc.GetKDAKApp().Trigger(defaultSender, &transaction.AssetTriggerContract{
+									TriggerType: transaction.AssetTriggerContract_StopRoyaltiesChange,
+									AssetID:     defaultAssetID,
+								}, nil)
+								require.NoError(t, err)
+							}
+
+							ctx := kc.GetCurrentKAppContext()
+
+							switch path {
+							case "trigger":
+								_, err = kc.GetKDAKApp().Trigger(sender, &transaction.AssetTriggerContract{
+									TriggerType: transaction.AssetTriggerContract_ChangeRoyaltiesReceiver,
+									AssetID:     defaultAssetID,
+									ToAddress:   newReceiver,
+								}, nil)
+							case "builtin":
+								builtin, errNew := builtInFunctions.NewKleverAssetTriggerFunc(
+									0,
+									&mock.ProtoMarshalizerMock{},
+									kc.GetAccountsKApp().GetAccountsCacher(),
+									kc.GetForkController(),
+									kc,
+								)
+								require.NoError(t, errNew)
+
+								_, err = builtin.ProcessBuiltinFunction(&vmcommon.ContractCallInput{
+									VMInput: vmcommon.VMInput{
+										CallerAddr: sender,
+										Arguments: [][]byte{
+											big.NewInt(int64(transaction.AssetTriggerContract_ChangeRoyaltiesReceiver)).Bytes(),
+											defaultAssetID,
+											newReceiver,
+										},
+									},
+								})
+							}
+
+							_, asset, errGet := kc.GetKDAKApp().GetKDA(defaultAssetID)
+							require.NoError(t, errGet)
+
+							if stop != "none" && fixV6 {
+								require.Equal(t, common.ErrAssetTriggerInvalid, err)
+								assert.Equal(t, thirdParty, asset.Royalties.Address)
+								assert.True(t, hasErrorReceipt(ctx, common.ErrFieldRoyaltiesChangeStopped))
+								return
+							}
+
+							require.NoError(t, err)
+							assert.Equal(t, newReceiver, asset.Royalties.Address)
+							assert.False(t, hasErrorReceipt(ctx, common.ErrFieldRoyaltiesChangeStopped))
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func hasErrorReceipt(ctx kapp.KappContext, field string) bool {
+	for _, receipt := range ctx.Receipts().GetByType(int8(kapp.ReceiptTypeError)) {
+		if data := receipt.GetData(); len(data) > 1 && string(data[1]) == field {
+			return true
+		}
+	}
+
+	return false
 }
 
 func TestKDATrigger_UpdateStaking(t *testing.T) {
@@ -1556,6 +1818,7 @@ func TestKDATrigger_UpdateStaking(t *testing.T) {
 		asset         *kapps.KDAData
 		staking       *transaction.StakingInfo
 		stakingData   *kapps.StakingData
+		fixV6         bool
 		expectedCode  transaction.Transaction_TXResultCode
 		expectedError error
 	}{
@@ -1706,6 +1969,45 @@ func TestKDATrigger_UpdateStaking(t *testing.T) {
 			expectedCode:  transaction.Transaction_AssetTypeInvalid,
 			expectedError: common.ErrAssetTypeInvalid,
 		},
+		{
+			name:          "Update staking APR at the limit with fix",
+			sender:        owner,
+			asset:         &kapps.KDAData{OwnerAddress: owner, AssetType: kapps.KDAData_Fungible, ID: assetID[0]},
+			staking:       &transaction.StakingInfo{Type: transaction.StakingInfo_APRI, APR: core.MaxStakingAPR},
+			stakingData:   &kapps.StakingData{},
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
+		{
+			name:          "Update staking APR above the limit with fix",
+			sender:        owner,
+			asset:         &kapps.KDAData{OwnerAddress: owner, AssetType: kapps.KDAData_Fungible, ID: assetID[0]},
+			staking:       &transaction.StakingInfo{Type: transaction.StakingInfo_APRI, APR: core.MaxStakingAPR + 1},
+			stakingData:   &kapps.StakingData{},
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_ParameterInvalid,
+			expectedError: common.ErrAPRAboveMaximum,
+		},
+		{
+			name:          "Update staking APR above the limit before fix",
+			sender:        owner,
+			asset:         &kapps.KDAData{OwnerAddress: owner, AssetType: kapps.KDAData_Fungible, ID: assetID[0]},
+			staking:       &transaction.StakingInfo{Type: transaction.StakingInfo_APRI, APR: core.MaxStakingAPR + 1},
+			stakingData:   &kapps.StakingData{},
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
+		{
+			name:          "Update staking FPRI ignores the APR limit with fix",
+			sender:        owner,
+			asset:         &kapps.KDAData{OwnerAddress: owner, AssetType: kapps.KDAData_Fungible, ID: assetID[0]},
+			staking:       &transaction.StakingInfo{Type: transaction.StakingInfo_FPRI, APR: core.MaxStakingAPR + 1},
+			stakingData:   &kapps.StakingData{InterestType: kapps.StakingData_FPRI},
+			fixV6:         true,
+			expectedCode:  transaction.Transaction_Ok,
+			expectedError: nil,
+		},
 	}
 
 	kdaAccHandler := &mock.KAppAccountHandlerStub{
@@ -1720,7 +2022,10 @@ func TestKDATrigger_UpdateStaking(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			kdaKApp.SetForkController(mock.NewForkControllerStub().SetFork("FixAuditChangesV6", tt.fixV6))
+
 			// update staking data
+			var savedStaking []byte
 			kdaKApp.GetAccountsCacher().GetExistingKappCalled = func(assetID []byte) (state.KAppAccountHandler, error) {
 				return &mock.KAppAccountHandlerStub{
 					DataTrieTrackerCalled: func() state.DataTrieTracker {
@@ -1729,6 +2034,7 @@ func TestKDATrigger_UpdateStaking(t *testing.T) {
 								return json.Marshal(tt.stakingData)
 							},
 							SaveKeyValueCalled: func(key []byte, value []byte) error {
+								savedStaking = value
 								return nil
 							},
 						}
@@ -1742,6 +2048,9 @@ func TestKDATrigger_UpdateStaking(t *testing.T) {
 			code, err := kdaKApp.UpdateStaking(tt.sender, tc, kdaAccHandler, assetID, tt.asset)
 			assert.Equal(t, tt.expectedCode, code)
 			assert.Equal(t, tt.expectedError, err)
+			if tt.expectedError != nil {
+				assert.Nil(t, savedStaking)
+			}
 		})
 	}
 }
@@ -2332,4 +2641,437 @@ func generateLargeURIMap(size int) map[string]string {
 		uris[key] = value
 	}
 	return uris
+}
+
+// newSFTMetadataTestKApp wires a KDA kapp whose system account stub reports the given
+// nonce meta and records SFTGetMeta / SFTSetMetadata calls
+func newSFTMetadataTestKApp(
+	gate bool,
+	meta *kapps.MetaV2,
+	getMetaErr error,
+) (*kda.KDAKappForTests, *int, *[][]byte) {
+	kdaKApp := kda.NewKDAKappForTests()
+
+	forkController := mock.NewForkControllerStub()
+	forkController.FixAuditChangesV6Value = gate
+	kdaKApp.SetForkController(forkController)
+
+	getMetaCalls := 0
+	var setArgs [][]byte
+	systemAccount := &mock.SystemAccountKappStub{
+		SFTGetMetaCalled: func(asset, nonce []byte) (*kapps.MetaV2, error) {
+			getMetaCalls++
+			return meta, getMetaErr
+		},
+		SFTSetMetadataCalled: func(asset, nonce []byte, args [][]byte) error {
+			if !bytes.Equal(asset, defaultAssetID) || !bytes.Equal(nonce, []byte("1")) {
+				return fmt.Errorf("unexpected SFTSetMetadata target %s/%s", asset, nonce)
+			}
+			setArgs = args
+			return nil
+		},
+	}
+
+	kdaKApp.KAppController.(*stub.KAppControllerStub).GetSystemAccountsCalled = func() kapp.SystemAccountKapp {
+		return systemAccount
+	}
+
+	return kdaKApp, &getMetaCalls, &setArgs
+}
+
+func TestKDATrigger_UpdateMetadataSFTMetadataChangeStopped(t *testing.T) {
+	assetID := [][]byte{defaultAssetID, []byte("1")}
+	owner := makeAddress("owner")
+	txData := [][]byte{[]byte("6e657756616c7565@6e65774b6579")}
+	expectedArgs := [][]byte{[]byte("newValue"), []byte("newKey")}
+	errGetMeta := errors.New("get meta failure")
+
+	existingMeta := &kapps.MetaV2{Metadata: &kapps.MetaV2Data{
+		Hash:       []byte("hash"),
+		Name:       []byte("oldName"),
+		Attributes: []byte("oldAttributes"),
+	}}
+
+	newAsset := func(stopped bool) *kapps.KDAData {
+		return &kapps.KDAData{
+			OwnerAddress: owner,
+			AssetType:    kapps.KDAData_SemiFungible,
+			Attributes:   &kapps.AttributesData{IsNFTMetadataChangeStopped: stopped},
+		}
+	}
+
+	tests := []struct {
+		name            string
+		gate            bool
+		asset           *kapps.KDAData
+		txData          [][]byte
+		meta            *kapps.MetaV2
+		getMetaErr      error
+		expectedCode    transaction.Transaction_TXResultCode
+		expectedError   error
+		expectedGetMeta int
+		expectSet       bool
+	}{
+		{
+			name:            "gate off, stopped, existing metadata is still overwritten",
+			gate:            false,
+			asset:           newAsset(true),
+			txData:          txData,
+			meta:            existingMeta,
+			expectedCode:    transaction.Transaction_Ok,
+			expectedGetMeta: 0,
+			expectSet:       true,
+		},
+		{
+			name:   "gate on, stopped, name only is refused",
+			gate:   true,
+			asset:  newAsset(true),
+			txData: txData,
+			meta: &kapps.MetaV2{Metadata: &kapps.MetaV2Data{
+				Hash: []byte("hash"),
+				Name: []byte("oldName"),
+			}},
+			expectedCode:    transaction.Transaction_NFTMetadataChangeStopped,
+			expectedError:   process.ErrNFTMetadataChangeStopped,
+			expectedGetMeta: 1,
+		},
+		{
+			name:            "gate on, not stopped, existing metadata is overwritten",
+			gate:            true,
+			asset:           newAsset(false),
+			txData:          txData,
+			meta:            existingMeta,
+			expectedCode:    transaction.Transaction_Ok,
+			expectedGetMeta: 0,
+			expectSet:       true,
+		},
+		{
+			name: "gate on, nil attributes is treated as not stopped",
+			gate: true,
+			asset: &kapps.KDAData{
+				OwnerAddress: owner,
+				AssetType:    kapps.KDAData_SemiFungible,
+			},
+			txData:          txData,
+			meta:            existingMeta,
+			expectedCode:    transaction.Transaction_Ok,
+			expectedGetMeta: 0,
+			expectSet:       true,
+		},
+		{
+			name:            "gate on, stopped, SFTGetMeta error returns asset error",
+			gate:            true,
+			asset:           newAsset(true),
+			txData:          txData,
+			getMetaErr:      errGetMeta,
+			expectedCode:    transaction.Transaction_AssetError,
+			expectedError:   errGetMeta,
+			expectedGetMeta: 1,
+		},
+		{
+			name:            "gate on, stopped, invalid hex keeps the parameter error",
+			gate:            true,
+			asset:           newAsset(true),
+			txData:          [][]byte{[]byte("zz")},
+			meta:            existingMeta,
+			expectedCode:    transaction.Transaction_ParameterInvalid,
+			expectedError:   process.ErrInvalidArgument,
+			expectedGetMeta: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kdaKApp, getMetaCalls, setArgs := newSFTMetadataTestKApp(tt.gate, tt.meta, tt.getMetaErr)
+
+			tc := &transaction.AssetTriggerContract{
+				TriggerType: transaction.AssetTriggerContract_UpdateMetadata,
+			}
+
+			code, err := kdaKApp.UpdateMetadata(owner, tc, nil, assetID, tt.asset, tt.txData)
+			require.Equal(t, tt.expectedCode, code)
+			require.Equal(t, tt.expectedError, err)
+			require.Equal(t, tt.expectedGetMeta, *getMetaCalls)
+
+			if tt.expectSet {
+				require.Equal(t, expectedArgs, *setArgs)
+			} else {
+				require.Nil(t, *setArgs)
+			}
+		})
+	}
+}
+
+// createSFTWithMintedNonce creates the default SFT (optionally with an admin and with
+// metadata change already stopped) and mints nonce 1 through the real KDA kapp
+func createSFTWithMintedNonce(t *testing.T, kc kapp.KAppController, admin []byte, stoppedAtCreation bool) {
+	tc := &transaction.CreateAssetContract{
+		Type:         transaction.CreateAssetContract_SemiFungible,
+		Name:         defaultTicker,
+		Ticker:       defaultTicker,
+		OwnerAddress: defaultSender,
+		AdminAddress: admin,
+		Properties: &transaction.PropertiesInfo{
+			CanMint:     true,
+			CanAddRoles: true,
+		},
+		Attributes: &transaction.AttributesInfo{
+			IsNFTMetadataChangeStopped: stoppedAtCreation,
+		},
+	}
+
+	_, err := kc.GetKDAKApp().Create(defaultSender, tc)
+	require.NoError(t, err)
+
+	_, err = kc.GetKDAKApp().Mint(defaultSender, &transaction.AssetTriggerContract{
+		TriggerType: transaction.AssetTriggerContract_Mint,
+		AssetID:     defaultAssetID,
+		ToAddress:   defaultSender,
+		Amount:      10,
+	})
+	require.NoError(t, err)
+}
+
+func sftUpdateMetadata(kc kapp.KAppController, sender []byte, name string, attributes string) (transaction.Transaction_TXResultCode, error) {
+	payload := hex.EncodeToString([]byte(attributes))
+	if len(name) > 0 {
+		payload = hex.EncodeToString([]byte(name)) + "@" + payload
+	}
+
+	return sftUpdateMetadataRaw(kc, sender, "1", payload)
+}
+
+func sftUpdateMetadataRaw(kc kapp.KAppController, sender []byte, nonce string, payload string) (transaction.Transaction_TXResultCode, error) {
+	return kc.GetKDAKApp().Trigger(sender, &transaction.AssetTriggerContract{
+		TriggerType: transaction.AssetTriggerContract_UpdateMetadata,
+		AssetID:     withNonce(defaultAssetID, nonce),
+	}, [][]byte{[]byte(payload)})
+}
+
+func requireSFTMeta(t *testing.T, kc kapp.KAppController, name string, attributes string) {
+	meta, err := kc.GetSystemAccountKApp().SFTGetMeta(defaultAssetID, []byte("1"))
+	require.NoError(t, err)
+	require.Equal(t, name, string(meta.GetMetadata().GetName()))
+	require.Equal(t, attributes, string(meta.GetMetadata().GetAttributes()))
+	require.NotEmpty(t, meta.GetMetadata().GetHash())
+}
+
+func TestKDATrigger_UpdateMetadataSFTStoppedByTrigger(t *testing.T) {
+	kc, err := createMockControllers()
+	require.NoError(t, err)
+	forkController := kc.GetForkController().(*mock.ForkControllerStub)
+	require.True(t, forkController.FixAuditChangesV6Value)
+
+	createSFTWithMintedNonce(t, kc, nil, false)
+
+	code, err := sftUpdateMetadata(kc, defaultSender, "name1", "attr1")
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, code)
+	requireSFTMeta(t, kc, "name1", "attr1")
+
+	_, err = kc.GetKDAKApp().Trigger(defaultSender, &transaction.AssetTriggerContract{
+		TriggerType: transaction.AssetTriggerContract_StopNFTMetadataChange,
+		AssetID:     defaultAssetID,
+	}, nil)
+	require.NoError(t, err)
+
+	code, err = sftUpdateMetadata(kc, defaultSender, "name2", "attr2")
+	require.Equal(t, process.ErrNFTMetadataChangeStopped, err)
+	require.Equal(t, transaction.Transaction_NFTMetadataChangeStopped, code)
+	requireSFTMeta(t, kc, "name1", "attr1")
+
+	// pre-fork behaviour is preserved: the stopped SFT nonce is still rewritable
+	forkController.FixAuditChangesV6Value = false
+	code, err = sftUpdateMetadata(kc, defaultSender, "name2", "attr2")
+	require.NoError(t, err)
+	require.Equal(t, transaction.Transaction_Ok, code)
+	requireSFTMeta(t, kc, "name2", "attr2")
+}
+
+func TestKDATrigger_UpdateMetadataSFTStoppedAtCreation(t *testing.T) {
+	admin := makeAddress("sft_admin")
+
+	t.Run("first write allowed, then locked for owner and admin", func(t *testing.T) {
+		kc, err := createMockControllers()
+		require.NoError(t, err)
+
+		createSFTWithMintedNonce(t, kc, admin, true)
+		requireSFTMeta(t, kc, "", "")
+
+		code, err := sftUpdateMetadata(kc, admin, "name1", "attr1")
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, code)
+		requireSFTMeta(t, kc, "name1", "attr1")
+
+		for _, sender := range [][]byte{admin, defaultSender} {
+			code, err = sftUpdateMetadata(kc, sender, "name2", "attr2")
+			require.Equal(t, process.ErrNFTMetadataChangeStopped, err)
+			require.Equal(t, transaction.Transaction_NFTMetadataChangeStopped, code)
+		}
+		requireSFTMeta(t, kc, "name1", "attr1")
+	})
+
+	t.Run("gate off, a written nonce is still rewritable", func(t *testing.T) {
+		kc, err := createMockControllers()
+		require.NoError(t, err)
+		forkController := kc.GetForkController().(*mock.ForkControllerStub)
+
+		createSFTWithMintedNonce(t, kc, nil, true)
+
+		code, err := sftUpdateMetadata(kc, defaultSender, "name1", "attr1")
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, code)
+
+		forkController.FixAuditChangesV6Value = false
+		code, err = sftUpdateMetadata(kc, defaultSender, "name2", "attr2")
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, code)
+		requireSFTMeta(t, kc, "name2", "attr2")
+	})
+
+	t.Run("attributes only first write locks the name as well", func(t *testing.T) {
+		kc, err := createMockControllers()
+		require.NoError(t, err)
+
+		createSFTWithMintedNonce(t, kc, nil, true)
+
+		code, err := sftUpdateMetadata(kc, defaultSender, "", "attr1")
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, code)
+		requireSFTMeta(t, kc, "", "attr1")
+
+		code, err = sftUpdateMetadata(kc, defaultSender, "name2", "attr2")
+		require.Equal(t, process.ErrNFTMetadataChangeStopped, err)
+		require.Equal(t, transaction.Transaction_NFTMetadataChangeStopped, code)
+		requireSFTMeta(t, kc, "", "attr1")
+	})
+
+	t.Run("unminted nonce on a committed trie returns the same asset error with the gate on and off", func(t *testing.T) {
+		kc, err := createMockControllers()
+		require.NoError(t, err)
+		forkController := kc.GetForkController().(*mock.ForkControllerStub)
+
+		createSFTWithMintedNonce(t, kc, nil, true)
+		require.NoError(t, kc.GetKDAKApp().GetAccountsCacher().SaveAll())
+
+		for _, gate := range []bool{true, false} {
+			forkController.FixAuditChangesV6Value = gate
+			code, err := sftUpdateMetadataRaw(kc, defaultSender, "99", hex.EncodeToString([]byte("attr1")))
+			require.Equal(t, common.ErrAssetNotFound, err)
+			require.Equal(t, transaction.Transaction_AssetError, code)
+		}
+	})
+
+	t.Run("first write and rewrite in separate committed blocks", func(t *testing.T) {
+		kc, err := createMockControllers()
+		require.NoError(t, err)
+		accountsCacher := kc.GetKDAKApp().GetAccountsCacher()
+
+		createSFTWithMintedNonce(t, kc, nil, true)
+		require.NoError(t, accountsCacher.SaveAll())
+
+		code, err := sftUpdateMetadata(kc, defaultSender, "name1", "attr1")
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, code)
+		require.NoError(t, accountsCacher.SaveAll())
+
+		code, err = sftUpdateMetadata(kc, defaultSender, "name2", "attr2")
+		require.Equal(t, process.ErrNFTMetadataChangeStopped, err)
+		require.Equal(t, transaction.Transaction_NFTMetadataChangeStopped, code)
+		requireSFTMeta(t, kc, "name1", "attr1")
+	})
+
+	// the in-memory harness never commits the system account's data trie, so this lookup
+	// hits ErrNilTrie; the committed-trie case above is the one a live chain takes
+	t.Run("unminted nonce on an uncommitted trie returns the same asset error with the gate on and off", func(t *testing.T) {
+		kc, err := createMockControllers()
+		require.NoError(t, err)
+		forkController := kc.GetForkController().(*mock.ForkControllerStub)
+
+		createSFTWithMintedNonce(t, kc, nil, true)
+
+		for _, gate := range []bool{true, false} {
+			forkController.FixAuditChangesV6Value = gate
+			code, err := sftUpdateMetadataRaw(kc, defaultSender, "99", hex.EncodeToString([]byte("attr1")))
+			require.ErrorIs(t, err, common.ErrNilTrie)
+			require.Equal(t, transaction.Transaction_AssetError, code)
+		}
+	})
+
+	t.Run("more than two arguments on a locked nonce is refused by the stop", func(t *testing.T) {
+		kc, err := createMockControllers()
+		require.NoError(t, err)
+
+		createSFTWithMintedNonce(t, kc, nil, true)
+
+		code, err := sftUpdateMetadata(kc, defaultSender, "name1", "attr1")
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, code)
+
+		code, err = sftUpdateMetadataRaw(kc, defaultSender, "1", "61@62@63")
+		require.Equal(t, process.ErrNFTMetadataChangeStopped, err)
+		require.Equal(t, transaction.Transaction_NFTMetadataChangeStopped, code)
+		requireSFTMeta(t, kc, "name1", "attr1")
+	})
+
+	t.Run("empty payload leaves the nonce empty and unlocked", func(t *testing.T) {
+		kc, err := createMockControllers()
+		require.NoError(t, err)
+
+		createSFTWithMintedNonce(t, kc, nil, true)
+
+		code, err := sftUpdateMetadataRaw(kc, defaultSender, "1", "")
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, code)
+		requireSFTMeta(t, kc, "", "")
+
+		code, err = sftUpdateMetadata(kc, defaultSender, "name1", "attr1")
+		require.NoError(t, err)
+		require.Equal(t, transaction.Transaction_Ok, code)
+		requireSFTMeta(t, kc, "name1", "attr1")
+	})
+}
+
+func TestKDATrigger_UpdateMetadataSFTStoppedViaBuiltinFunction(t *testing.T) {
+	kc, err := createMockControllers()
+	require.NoError(t, err)
+
+	createSFTWithMintedNonce(t, kc, nil, true)
+
+	assetTrigger, err := builtInFunctions.NewKleverAssetTriggerFunc(
+		0,
+		&mock.ProtoMarshalizerMock{},
+		kc.GetAccountsKApp().GetAccountsCacher(),
+		kc.GetForkController(),
+		kc,
+	)
+	require.NoError(t, err)
+
+	updateMetadataInput := func(name string, attributes string) *vmcommon.ContractCallInput {
+		return &vmcommon.ContractCallInput{
+			VMInput: vmcommon.VMInput{
+				CallerAddr: defaultSender,
+				Arguments: [][]byte{
+					big.NewInt(int64(transaction.AssetTriggerContract_UpdateMetadata)).Bytes(),
+					defaultAssetID,
+					big.NewInt(1).Bytes(),
+					defaultSender,
+					nil,
+					[]byte(attributes),
+					[]byte(name),
+				},
+			},
+		}
+	}
+
+	// the first write goes through the bridge too, so its name/attributes decoding is checked on real state
+	vmOutput, err := assetTrigger.ProcessBuiltinFunction(updateMetadataInput("name1", "attr1"))
+	require.NoError(t, err)
+	require.NotNil(t, vmOutput)
+	requireSFTMeta(t, kc, "name1", "attr1")
+
+	vmOutput, err = assetTrigger.ProcessBuiltinFunction(updateMetadataInput("name2", "attr2"))
+	require.Equal(t, process.ErrNFTMetadataChangeStopped, err)
+	require.Nil(t, vmOutput)
+	requireSFTMeta(t, kc, "name1", "attr1")
 }

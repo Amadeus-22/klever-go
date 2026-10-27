@@ -80,7 +80,7 @@ func (e *kleverCreateValidator) ProcessBuiltinFunction(vmInput *vmcommon.Contrac
 	vmOutput := &vmcommon.VMOutput{GasRemaining: gasRemaining, ReturnCode: vmcommon.Ok}
 
 	//Using Kapps
-	resultCode, err := e.kappController.GetValidatorsKApp().Register(contract)
+	resultCode, err := e.kappController.GetValidatorsKApp().Register(vmInput.CallerAddr, contract)
 	if err != nil {
 		log.Trace("CreateValidator error", "resultCode", resultCode, "err", err.Error())
 		return nil, err
@@ -101,6 +101,7 @@ func (e *kleverCreateValidator) getCreateValidatorContract(vmInput *vmcommon.Con
 		return nil, ErrInvalidArguments
 	}
 
+	// The optional last argument is the BLS proof of possession; NextArg yields empty when absent.
 	contract := &transaction.CreateValidatorContract{
 		OwnerAddress: vmInput.NextArg(),
 		Config: &transaction.ValidatorConfig{
@@ -111,6 +112,7 @@ func (e *kleverCreateValidator) getCreateValidatorContract(vmInput *vmcommon.Con
 			Commission:          vmInput.NextArg().Uint32(),
 			MaxDelegationAmount: vmInput.NextArg().Int64(),
 			Logo:                vmInput.NextArg().String(),
+			BLSSignature:        vmInput.NextArg(),
 			URIs:                make(map[string]string),
 		},
 	}

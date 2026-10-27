@@ -8,20 +8,21 @@ import (
 	"github.com/klever-io/klever-go/network/api/models"
 )
 
-func createValidator(fromAddr, blsKey, ownerAddr, rewardAddr, logo string, commission, maxDelegation float64, canDelegate bool, uris map[string]string, name string) error {
-	parsedCommission := commission * math.Pow10(2)
-	parsedMaxDelegation := maxDelegation * math.Pow10(6)
+func createValidator(fromAddr, ownerAddr string, f *validatorFlags) error {
+	parsedCommission := f.commission * math.Pow10(2)
+	parsedMaxDelegation := f.maxDelegation * math.Pow10(6)
 
 	data, err := buildRequest(transaction.TXContract_CreateValidatorContractType, fromAddr, []interface{}{models.CreateValidatorTXRequest{
-		BLSPublicKey:        blsKey,
+		BLSPublicKey:        f.blsKey,
+		BLSSignature:        f.blsProof,
 		OwnerAddress:        ownerAddr,
-		RewardAddress:       rewardAddr,
+		RewardAddress:       f.rewardsAddress,
 		Commission:          uint32(parsedCommission),
-		CanDelegate:         canDelegate,
+		CanDelegate:         f.canDelegate,
 		MaxDelegationAmount: int64(parsedMaxDelegation),
-		Logo:                logo,
-		Name:                name,
-		URIs:                uris,
+		Logo:                f.logo,
+		Name:                f.validatorName,
+		URIs:                f.uris,
 	}})
 	if err != nil {
 		return err
@@ -32,19 +33,20 @@ func createValidator(fromAddr, blsKey, ownerAddr, rewardAddr, logo string, commi
 	return err
 }
 
-func validatorConfig(fromAddr, blsKey, rewardAddr, logo string, commission, maxDelegation float64, canDelegate bool, uris map[string]string, name string) error {
-	parsedCommission := commission * math.Pow10(2)
-	parsedMaxDelegation := maxDelegation * math.Pow10(6)
+func validatorConfig(fromAddr string, f *validatorFlags) error {
+	parsedCommission := f.commission * math.Pow10(2)
+	parsedMaxDelegation := f.maxDelegation * math.Pow10(6)
 
 	data, err := buildRequest(transaction.TXContract_ValidatorConfigContractType, fromAddr, []interface{}{models.ValidatorConfigTXRequest{
-		BLSPublicKey:        blsKey,
-		RewardAddress:       rewardAddr,
-		CanDelegate:         canDelegate,
+		BLSPublicKey:        f.blsKey,
+		BLSSignature:        f.blsProof,
+		RewardAddress:       f.rewardsAddress,
+		CanDelegate:         f.canDelegate,
 		Commission:          uint32(parsedCommission),
 		MaxDelegationAmount: int64(parsedMaxDelegation),
-		Logo:                logo,
-		Name:                name,
-		URIs:                uris,
+		Logo:                f.logo,
+		Name:                f.validatorName,
+		URIs:                f.uris,
 	}})
 
 	if err != nil {

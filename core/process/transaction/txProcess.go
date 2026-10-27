@@ -17,7 +17,6 @@ import (
 	"github.com/klever-io/klever-go/data/block"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
-	"github.com/klever-io/klever-go/kapps"
 	"github.com/klever-io/klever-go/tools"
 	"github.com/klever-io/klever-go/tools/check"
 	"github.com/klever-io/klever-go/tools/marshal"
@@ -36,9 +35,8 @@ const (
 
 type txProcessor struct {
 	*baseTxProcessor
-	txFeeHandler       process.TransactionFeeHandler
-	ratingsData        process.RatingsInfoHandler
-	proposalController kapps.ActiveProposalController
+	txFeeHandler process.TransactionFeeHandler
+	ratingsData  process.RatingsInfoHandler
 }
 
 // ArgsNewTxProcessor defines the arguments needed for new tx processor
@@ -133,17 +131,6 @@ func (txProc *txProcessor) EpochConfirmed(epoch uint32) {
 // IsInterfaceNil returns true if there is no value under the interface
 func (txProc *txProcessor) IsInterfaceNil() bool {
 	return txProc == nil
-}
-
-// LoadProposalController will load the proposal controller into txProcess instance
-func (txProc *txProcessor) SetProposalController(controller kapps.ActiveProposalController) error {
-	if check.IfNil(controller) {
-		return common.ErrNilProposalController
-	}
-
-	txProc.proposalController = controller
-
-	return nil
 }
 
 // ProcessBandwidthFee processed bandwidth fees of the transactions
@@ -558,7 +545,7 @@ func (txProc *txProcessor) createValidatorContract(ctx kapp.KappContext, tx *tra
 		return err
 	}
 
-	tx.ResultCode, err = txProc.kApps.GetValidatorsKApp().Register(tc)
+	tx.ResultCode, err = txProc.kApps.GetValidatorsKApp().Register(tx.GetSender(), tc)
 
 	return err
 }

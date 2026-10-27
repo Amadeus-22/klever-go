@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"testing"
 
+	blockchainConfig "github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp/builtInFunctions"
 	"github.com/klever-io/klever-go/kvm/executor"
@@ -16,55 +17,61 @@ import (
 )
 
 func TestExecution_ExecuteOnDestContext_MockBuiltinFunctions_Claim(t *testing.T) {
-	parentGasUsed := uint64(1973)
-	transferGas := uint64(2005)
-	parentGasUsed += transferGas
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-builtin", "../../")).
-				WithBalance(1000)).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithGasProvided(test.GasProvided).
-			WithFunction("callBuiltinClaim").
-			Build()).
-		WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
-			stubBlockchainHook.ProcessBuiltInFunctionCalled = dummyProcessBuiltInFunction
-			host.SetBuiltInFunctionsContainer(getDummyBuiltinFunctionsContainer())
-		}).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				GasUsed(test.ParentAddress, parentGasUsed).
-				GasRemaining(test.GasProvided - parentGasUsed).
-				ReturnData([]byte("succ"))
-		})
+	forEachFixAuditChangesV6(t, 12, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+		parentGasUsed := uint64(1973) + copyGas
+		transferGas := uint64(2005)
+		parentGasUsed += transferGas
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-builtin", "../../")).
+					WithBalance(1000)).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithGasProvided(test.GasProvided).
+				WithFunction("callBuiltinClaim").
+				Build()).
+			WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
+				stubBlockchainHook.ProcessBuiltInFunctionCalled = dummyProcessBuiltInFunction
+				host.SetBuiltInFunctionsContainer(getDummyBuiltinFunctionsContainer())
+			}).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					GasUsed(test.ParentAddress, parentGasUsed).
+					GasRemaining(test.GasProvided - parentGasUsed).
+					ReturnData([]byte("succ"))
+			})
+	})
 }
 
 func TestExecution_ExecuteOnDestContext_MockBuiltinFunctions_DoSomething(t *testing.T) {
-	parentGasUsed := uint64(1977)
-	transferGas := uint64(2005)
-	parentGasUsed += transferGas
-	test.BuildInstanceCallTest(t).
-		WithContracts(
-			test.CreateInstanceContract(test.ParentAddress).
-				WithCode(test.GetTestSCCode("exec-dest-ctx-builtin", "../../")).
-				WithBalance(1000)).
-		WithInput(test.CreateTestContractCallInputBuilder().
-			WithRecipientAddr(test.ParentAddress).
-			WithGasProvided(test.GasProvided).
-			WithFunction("callBuiltinDoSomething").
-			Build()).
-		WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
-			stubBlockchainHook.ProcessBuiltInFunctionCalled = dummyProcessBuiltInFunction
-			host.SetBuiltInFunctionsContainer(getDummyBuiltinFunctionsContainer())
-		}).
-		AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
-			verify.Ok().
-				GasUsed(test.ParentAddress, parentGasUsed).
-				GasRemaining(test.GasProvided - parentGasUsed).
-				ReturnData([]byte("succ"))
-		})
+	forEachFixAuditChangesV6(t, 18, func(t *testing.T, epochs blockchainConfig.EnableEpochs, copyGas uint64) {
+		parentGasUsed := uint64(1977) + copyGas
+		transferGas := uint64(2005)
+		parentGasUsed += transferGas
+		test.BuildInstanceCallTest(t).
+			WithEnableEpochs(epochs).
+			WithContracts(
+				test.CreateInstanceContract(test.ParentAddress).
+					WithCode(test.GetTestSCCode("exec-dest-ctx-builtin", "../../")).
+					WithBalance(1000)).
+			WithInput(test.CreateTestContractCallInputBuilder().
+				WithRecipientAddr(test.ParentAddress).
+				WithGasProvided(test.GasProvided).
+				WithFunction("callBuiltinDoSomething").
+				Build()).
+			WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
+				stubBlockchainHook.ProcessBuiltInFunctionCalled = dummyProcessBuiltInFunction
+				host.SetBuiltInFunctionsContainer(getDummyBuiltinFunctionsContainer())
+			}).
+			AndAssertResults(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub, verify *test.VMOutputVerifier) {
+				verify.Ok().
+					GasUsed(test.ParentAddress, parentGasUsed).
+					GasRemaining(test.GasProvided - parentGasUsed).
+					ReturnData([]byte("succ"))
+			})
+	})
 }
 
 func TestExecution_ExecuteOnDestContext_MockBuiltinFunctions_Nonexistent(t *testing.T) {

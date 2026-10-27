@@ -74,11 +74,23 @@ func TestTransaction_PrepareForProcessing(t *testing.T) {
 		Receipts: []*transaction.Transaction_Receipt{{
 			Data: [][]byte{{1, 2, 3, 4}},
 		}},
+		Result:        transaction.Transaction_FAILED,
+		ResultCode:    transaction.Transaction_FeeInvalid,
+		Block:         42,
+		GasLimit:      50000,
+		GasMultiplier: 2,
 	}
 
 	tx.PrepareForProcessing()
 
+	// every field block processing writes must be cleared - a leftover Block made the
+	// API report a pending transaction as on-chain (KLR-69)
 	assert.Empty(t, tx.Receipts)
+	assert.Equal(t, transaction.Transaction_SUCCESS, tx.Result)
+	assert.Equal(t, transaction.Transaction_Ok, tx.ResultCode)
+	assert.Equal(t, uint64(0), tx.Block)
+	assert.Equal(t, uint64(0), tx.GasLimit)
+	assert.Equal(t, uint64(0), tx.GasMultiplier)
 	assert.NotEmpty(t, tx.RawData.Contract)
 	assert.NotEmpty(t, tx.RawData.Data)
 }
@@ -1072,5 +1084,100 @@ func TestAddTransaction_FreezeContract(t *testing.T) {
 		require.Nil(t, err)
 
 		require.EqualValues(t, expectedBucketAmount, parsedContract.Amount)
+	})
+}
+
+func TestAddTransaction_ValidatorBLSSignature(t *testing.T) {
+	t.Parallel()
+
+	const blsKeyHex = "1d8cb37e902525bf8bda62b635ca240ac7c3a713250295381b3e661cb32a7cdeb64cd8f17144ca7ad2520c92dfe5330f610d18bf9b503dda86a1ba5d7071cdeb0e510bcc28e32ca8c033c493f61abf43448ea39e3215cec49e4f4ae796c13b08"
+	proof := bytes.Repeat([]byte{0xab}, 48)
+	proofHex := fmt.Sprintf("%x", proof)
+
+	build := func(txType transaction.TXContract_ContractType, contract string) (*transaction.Transaction, error) {
+		tx := transaction.NewBaseTransaction(mockSender, 0, nil, 0, 0)
+		err := tx.AddTransaction(transaction.TXArgs{
+			Type:       uint32(txType),
+			Sender:     mockSender,
+			Contract:   json.RawMessage(contract),
+			NodeHelper: createMockNodeHelper(),
+		})
+		return tx, err
+	}
+
+	createConfig := func(t *testing.T, tx *transaction.Transaction) *transaction.ValidatorConfig {
+		t.Helper()
+		require.Len(t, tx.GetContracts(), 1)
+		parsed := &transaction.CreateValidatorContract{}
+		require.NoError(t, anypb.UnmarshalTo(tx.GetContracts()[0].Parameter, parsed, proto.UnmarshalOptions{}))
+		return parsed.GetConfig()
+	}
+
+	updateConfig := func(t *testing.T, tx *transaction.Transaction) *transaction.ValidatorConfig {
+		t.Helper()
+		require.Len(t, tx.GetContracts(), 1)
+		parsed := &transaction.ValidatorConfigContract{}
+		require.NoError(t, anypb.UnmarshalTo(tx.GetContracts()[0].Parameter, parsed, proto.UnmarshalOptions{}))
+		return parsed.GetConfig()
+	}
+
+	withProof := fmt.Sprintf(`{"BLSPublicKey": %q, "blsSignature": %q, "commission": 1000, "maxDelegationAmount": 1000000}`, blsKeyHex, proofHex)
+	withoutProof := fmt.Sprintf(`{"BLSPublicKey": %q, "commission": 1000, "maxDelegationAmount": 1000000}`, blsKeyHex)
+	badHex := fmt.Sprintf(`{"BLSPublicKey": %q, "blsSignature": "zz", "commission": 1000, "maxDelegationAmount": 1000000}`, blsKeyHex)
+	oddHex := fmt.Sprintf(`{"BLSPublicKey": %q, "blsSignature": "abc", "commission": 1000, "maxDelegationAmount": 1000000}`, blsKeyHex)
+	shortProof := fmt.Sprintf(`{"BLSPublicKey": %q, "blsSignature": "%x", "commission": 1000, "maxDelegationAmount": 1000000}`, blsKeyHex, proof[:transaction.BLSKeyProofSize-1])
+	longProof := fmt.Sprintf(`{"BLSPublicKey": %q, "blsSignature": "%x00", "commission": 1000, "maxDelegationAmount": 1000000}`, blsKeyHex, proof)
+	invalidProofs := []string{badHex, oddHex, shortProof, longProof}
+
+	t.Run("create validator carries the decoded proof", func(t *testing.T) {
+		t.Parallel()
+
+		tx, err := build(transaction.TXContract_CreateValidatorContractType, withProof)
+		require.NoError(t, err)
+		assert.Equal(t, proof, createConfig(t, tx).GetBLSSignature())
+	})
+
+	t.Run("create validator without proof leaves it nil", func(t *testing.T) {
+		t.Parallel()
+
+		tx, err := build(transaction.TXContract_CreateValidatorContractType, withoutProof)
+		require.NoError(t, err)
+		assert.Nil(t, createConfig(t, tx).GetBLSSignature())
+	})
+
+	t.Run("create validator rejects invalid hex or length", func(t *testing.T) {
+		t.Parallel()
+
+		for _, contract := range invalidProofs {
+			tx, err := build(transaction.TXContract_CreateValidatorContractType, contract)
+			require.Error(t, err)
+			assert.Empty(t, tx.GetContracts())
+		}
+	})
+
+	t.Run("validator config carries the decoded proof", func(t *testing.T) {
+		t.Parallel()
+
+		tx, err := build(transaction.TXContract_ValidatorConfigContractType, withProof)
+		require.NoError(t, err)
+		assert.Equal(t, proof, updateConfig(t, tx).GetBLSSignature())
+	})
+
+	t.Run("validator config without proof leaves it nil", func(t *testing.T) {
+		t.Parallel()
+
+		tx, err := build(transaction.TXContract_ValidatorConfigContractType, withoutProof)
+		require.NoError(t, err)
+		assert.Nil(t, updateConfig(t, tx).GetBLSSignature())
+	})
+
+	t.Run("validator config rejects invalid hex or length", func(t *testing.T) {
+		t.Parallel()
+
+		for _, contract := range invalidProofs {
+			tx, err := build(transaction.TXContract_ValidatorConfigContractType, contract)
+			require.Error(t, err)
+			assert.Empty(t, tx.GetContracts())
+		}
 	})
 }

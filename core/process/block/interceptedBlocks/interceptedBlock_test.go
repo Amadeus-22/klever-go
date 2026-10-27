@@ -57,7 +57,7 @@ func createDefaultBlockArgument() *interceptedBlocks.ArgInterceptedBlock {
 }
 
 func createMockBlock() *block.Block {
-	return &block.Block{
+	blk := &block.Block{
 		Header: &block.BlockHeader{
 			Slot:            hdrSlot,
 			Nonce:           hdrNonce,
@@ -67,14 +67,39 @@ func createMockBlock() *block.Block {
 			RandSeed:        []byte("rand seed"),
 			ChainID:         []byte("chain ID"),
 			SoftwareVersion: []byte("version"),
+			TxCount:         2,
 		},
 		PubKeysBitmap: []byte{1},
 		Signature:     []byte("signature"),
 		TxHashes: [][]byte{
-			[]byte("hash1"),
-			[]byte("hash2"),
+			testHasher.Compute("hash1"),
+			testHasher.Compute("hash2"),
 		},
+		TxResults: []uint32{0, 0},
 	}
+	_ = blk.UpdateTxRootHash(testHasher)
+
+	return blk
+}
+
+func createInterceptedBlock(t *testing.T, blk *block.Block, arg *interceptedBlocks.ArgInterceptedBlock) *interceptedBlocks.InterceptedBlock {
+	t.Helper()
+
+	buff, err := testMarshalizer.Marshal(blk)
+	require.NoError(t, err)
+	arg.BlockBuff = buff
+
+	inBlk, err := interceptedBlocks.NewInterceptedBlock(arg)
+	require.NoError(t, err)
+
+	return inBlk
+}
+
+func assertBodyNotMatchingHeader(t *testing.T, err error, expected error) {
+	t.Helper()
+
+	assert.ErrorIs(t, err, process.ErrBlockBodyNotMatchingHeader)
+	assert.ErrorIs(t, err, expected)
 }
 
 func createMockKeyGen() crypto.KeyGenerator {
@@ -150,20 +175,229 @@ func TestInterceptedBlock_CheckValidityNilPubKeyBitmapShouldErr(t *testing.T) {
 	assert.Equal(t, process.ErrNilPubKeysBitmap, err)
 }
 
-func TestInterceptedBlock_ContainsNilHashShouldErr(t *testing.T) {
+func TestInterceptedBlock_TxHashWithWrongLengthShouldErr(t *testing.T) {
+	t.Parallel()
+
+	for _, length := range []int{0, testHasher.Size() - 1, testHasher.Size() + 1} {
+		t.Run(fmt.Sprintf("length %d", length), func(t *testing.T) {
+			blk := createMockBlock()
+			blk.TxHashes[1] = make([]byte, length)
+
+			inBlk := createInterceptedBlock(t, blk, createDefaultBlockArgument())
+
+			assertBodyNotMatchingHeader(t, inBlk.CheckValidity(), process.ErrInvalidTxHashLength)
+		})
+	}
+}
+
+func TestInterceptedBlock_TxHashesSplitAtWrongWidthShouldErr(t *testing.T) {
 	t.Parallel()
 
 	blk := createMockBlock()
-	blk.TxHashes[1] = nil
-	buff, _ := testMarshalizer.Marshal(blk)
+	resplit := createMockBlock()
+	joined := append(append([]byte{}, resplit.TxHashes[0]...), resplit.TxHashes[1]...)
+	resplit.TxHashes = [][]byte{joined[:testHasher.Size()-1], joined[testHasher.Size()-1:]}
+
+	txRootHash, err := resplit.ComputeRootHash(testHasher)
+	require.NoError(t, err)
+	require.Equal(t, blk.GetTxRootHash(), txRootHash)
+
+	inBlk := createInterceptedBlock(t, blk, createDefaultBlockArgument())
+	inResplit := createInterceptedBlock(t, resplit, createDefaultBlockArgument())
+	require.Equal(t, inBlk.Hash(), inResplit.Hash())
+
+	assert.NoError(t, inBlk.CheckValidity())
+	assertBodyNotMatchingHeader(t, inResplit.CheckValidity(), process.ErrInvalidTxHashLength)
+}
+
+func TestInterceptedBlock_TxCountNotMatchingTxHashesShouldErr(t *testing.T) {
+	t.Parallel()
+
+	t.Run("fewer tx hashes than the header count", func(t *testing.T) {
+		t.Parallel()
+
+		blk := createMockBlock()
+		blk.TxHashes = blk.TxHashes[:1]
+		blk.TxResults = blk.TxResults[:1]
+
+		inBlk := createInterceptedBlock(t, blk, createDefaultBlockArgument())
+
+		assertBodyNotMatchingHeader(t, inBlk.CheckValidity(), process.ErrInvalidTXCount)
+	})
+
+	t.Run("more tx hashes than the header count", func(t *testing.T) {
+		t.Parallel()
+
+		blk := createMockBlock()
+		blk.TxHashes = append(blk.TxHashes, testHasher.Compute("hash3"))
+		blk.TxResults = append(blk.TxResults, 0)
+
+		inBlk := createInterceptedBlock(t, blk, createDefaultBlockArgument())
+
+		assertBodyNotMatchingHeader(t, inBlk.CheckValidity(), process.ErrInvalidTXCount)
+	})
+}
+
+func TestInterceptedBlock_TxRootHashNotMatchingTxHashesShouldErr(t *testing.T) {
+	t.Parallel()
+
+	blk := createMockBlock()
+	reordered := createMockBlock()
+	reordered.TxHashes[0], reordered.TxHashes[1] = reordered.TxHashes[1], reordered.TxHashes[0]
+
+	inBlk := createInterceptedBlock(t, blk, createDefaultBlockArgument())
+	inReordered := createInterceptedBlock(t, reordered, createDefaultBlockArgument())
+	require.Equal(t, inBlk.Hash(), inReordered.Hash())
+
+	assert.NoError(t, inBlk.CheckValidity())
+	assertBodyNotMatchingHeader(t, inReordered.CheckValidity(), process.ErrTxRootHashDoesNotMatch)
+}
+
+func TestInterceptedBlock_BodyIsCheckedAfterTheSignature(t *testing.T) {
+	t.Parallel()
+
+	blk := createMockBlock()
+	blk.Header.TxRootHash = testHasher.Compute("another root")
+	expectedErr := errors.New("expected err")
 
 	arg := createDefaultBlockArgument()
-	arg.BlockBuff = buff
-	inBlk, _ := interceptedBlocks.NewInterceptedBlock(arg)
+	arg.HeaderSigVerifier = &cMock.HeaderSigVerifierStub{
+		VerifySignatureCalled: func(header data.HeaderHandler) error {
+			return expectedErr
+		},
+	}
+	inBlk := createInterceptedBlock(t, blk, arg)
 
-	err := inBlk.CheckValidity()
+	assert.Equal(t, expectedErr, inBlk.CheckValidity())
+}
 
-	assert.Equal(t, process.ErrNilTxHash, err)
+func TestInterceptedBlock_EmptyBlockTxRootHash(t *testing.T) {
+	t.Parallel()
+
+	createEmptyBlock := func(txRootHash []byte) *block.Block {
+		blk := createMockBlock()
+		blk.Header.TxCount = 0
+		blk.TxHashes = nil
+		blk.TxResults = nil
+		blk.Header.TxRootHash = txRootHash
+
+		return blk
+	}
+
+	t.Run("nil root", func(t *testing.T) {
+		t.Parallel()
+
+		inBlk := createInterceptedBlock(t, createEmptyBlock(nil), createDefaultBlockArgument())
+
+		assert.NoError(t, inBlk.CheckValidity())
+	})
+
+	t.Run("empty hash root", func(t *testing.T) {
+		t.Parallel()
+
+		inBlk := createInterceptedBlock(t, createEmptyBlock(testHasher.EmptyHash()), createDefaultBlockArgument())
+
+		assert.NoError(t, inBlk.CheckValidity())
+	})
+
+	t.Run("arbitrary root should err", func(t *testing.T) {
+		t.Parallel()
+
+		inBlk := createInterceptedBlock(t, createEmptyBlock(testHasher.Compute("another root")), createDefaultBlockArgument())
+
+		err := inBlk.CheckValidity()
+		assert.ErrorIs(t, err, process.ErrTxRootHashInvalidForEmptyBlock)
+		assert.False(t, errors.Is(err, process.ErrBlockBodyNotMatchingHeader))
+	})
+}
+
+func TestInterceptedBlock_TxResultsCountNotMatchingTxHashes(t *testing.T) {
+	t.Parallel()
+
+	activeFromHeaderEpoch := func() *interceptedBlocks.ArgInterceptedBlock {
+		arg := createDefaultBlockArgument()
+		activationEpoch := hdrEpoch
+		arg.ForkController = &mock.ForkControllerStub{FixAuditChangesV5Epoch: &activationEpoch}
+
+		return arg
+	}
+
+	t.Run("missing tx results should err", func(t *testing.T) {
+		t.Parallel()
+
+		blk := createMockBlock()
+		blk.TxResults = nil
+
+		inBlk := createInterceptedBlock(t, blk, activeFromHeaderEpoch())
+
+		assertBodyNotMatchingHeader(t, inBlk.CheckValidity(), process.ErrInvalidTXResultsCount)
+	})
+
+	t.Run("more tx results than tx hashes should err", func(t *testing.T) {
+		t.Parallel()
+
+		blk := createMockBlock()
+		blk.TxResults = append(blk.TxResults, 0)
+
+		inBlk := createInterceptedBlock(t, blk, activeFromHeaderEpoch())
+
+		assertBodyNotMatchingHeader(t, inBlk.CheckValidity(), process.ErrInvalidTXResultsCount)
+	})
+
+	beforeTheFork := func() *interceptedBlocks.ArgInterceptedBlock {
+		arg := createDefaultBlockArgument()
+		activationEpoch := hdrEpoch + 1
+		arg.ForkController = &mock.ForkControllerStub{FixAuditChangesV5Epoch: &activationEpoch}
+
+		return arg
+	}
+
+	t.Run("header epoch before the fork accepts an empty list", func(t *testing.T) {
+		t.Parallel()
+
+		blk := createMockBlock()
+		blk.TxResults = nil
+
+		inBlk := createInterceptedBlock(t, blk, beforeTheFork())
+
+		assert.NoError(t, inBlk.CheckValidity())
+	})
+
+	t.Run("header epoch before the fork rejects more tx results than tx hashes", func(t *testing.T) {
+		t.Parallel()
+
+		blk := createMockBlock()
+		blk.TxResults = append(blk.TxResults, 0)
+
+		inBlk := createInterceptedBlock(t, blk, beforeTheFork())
+
+		assertBodyNotMatchingHeader(t, inBlk.CheckValidity(), process.ErrInvalidTXResultsCount)
+	})
+
+	t.Run("header epoch before the fork rejects fewer tx results than tx hashes", func(t *testing.T) {
+		t.Parallel()
+
+		blk := createMockBlock()
+		blk.TxResults = blk.TxResults[:1]
+
+		inBlk := createInterceptedBlock(t, blk, beforeTheFork())
+
+		assertBodyNotMatchingHeader(t, inBlk.CheckValidity(), process.ErrInvalidTXResultsCount)
+	})
+
+	t.Run("header epoch before the fork rejects tx results on a block without tx hashes", func(t *testing.T) {
+		t.Parallel()
+
+		blk := createMockBlock()
+		blk.Header.TxCount = 0
+		blk.Header.TxRootHash = nil
+		blk.TxHashes = nil
+		blk.TxResults = []uint32{0}
+
+		inBlk := createInterceptedBlock(t, blk, beforeTheFork())
+
+		assertBodyNotMatchingHeader(t, inBlk.CheckValidity(), process.ErrInvalidTXResultsCount)
+	})
 }
 
 func TestInterceptedBlock_CheckValidityLeaderSignatureNotCorrectShouldErr(t *testing.T) {

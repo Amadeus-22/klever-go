@@ -101,6 +101,7 @@ func (e *kleverValidatorConfig) getValidatorConfigContract(vmInput *vmcommon.Con
 		return nil, ErrInvalidArguments
 	}
 
+	// The optional last argument is the BLS proof of possession; NextArg yields empty when absent.
 	contract := &transaction.ValidatorConfigContract{
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        vmInput.NextArg(),
@@ -110,6 +111,7 @@ func (e *kleverValidatorConfig) getValidatorConfigContract(vmInput *vmcommon.Con
 			Commission:          vmInput.NextArg().Uint32(),
 			MaxDelegationAmount: vmInput.NextArg().Int64(),
 			Logo:                vmInput.NextArg().String(),
+			BLSSignature:        vmInput.NextArg(),
 			URIs:                make(map[string]string),
 		},
 	}

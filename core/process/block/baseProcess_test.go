@@ -1,6 +1,7 @@
 package block
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/klever-io/klever-go/common/mock"
@@ -19,7 +20,8 @@ func getValidBlock(hasher hashing.Hasher) *block.Block {
 		Header: &block.BlockHeader{
 			TxCount: 1,
 		},
-		TxHashes: [][]byte{hasher.Compute("valid")},
+		TxHashes:  [][]byte{hasher.Compute("valid")},
+		TxResults: []uint32{0},
 	}
 
 	txRootHash, _ := validBlock.ComputeRootHash(hasher)
@@ -33,7 +35,8 @@ func getInvalidBlock(hasher hashing.Hasher, txHashes [][]byte) *block.Block {
 		Header: &block.BlockHeader{
 			TxCount: 1,
 		},
-		TxHashes: [][]byte{hasher.Compute("valid")},
+		TxHashes:  [][]byte{hasher.Compute("valid")},
+		TxResults: []uint32{0},
 	}
 
 	txRootHash, _ := validBlock.ComputeRootHash(hasher)
@@ -46,6 +49,24 @@ func getInvalidBlock(hasher hashing.Hasher, txHashes [][]byte) *block.Block {
 	return validBlock
 }
 
+func getBlockWithTxHashesSplitAtWrongWidth(hasher hashing.Hasher) *block.Block {
+	blk := &block.Block{
+		Header: &block.BlockHeader{
+			TxCount: 2,
+		},
+		TxHashes:  [][]byte{hasher.Compute("first"), hasher.Compute("second")},
+		TxResults: []uint32{0, 0},
+	}
+
+	txRootHash, _ := blk.ComputeRootHash(hasher)
+	blk.Header.TxRootHash = txRootHash
+
+	joined := append(append([]byte{}, blk.TxHashes[0]...), blk.TxHashes[1]...)
+	blk.TxHashes = [][]byte{joined[:hasher.Size()-1], joined[hasher.Size()-1:]}
+
+	return blk
+}
+
 func Test_validateTxRootHash(t *testing.T) {
 	hasher := &blake2b.Blake2b{HashSize: 32}
 
@@ -55,11 +76,12 @@ func Test_validateTxRootHash(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
-		block       *block.Block
-		disableFork bool
-		wantErr     bool
-		err         error
+		name         string
+		block        *block.Block
+		disableFork  bool
+		wantErr      bool
+		err          error
+		bodyMismatch bool
 	}{
 		{
 			name: "should ok when doesn't have rootHash",
@@ -97,9 +119,11 @@ func Test_validateTxRootHash(t *testing.T) {
 				TxHashes: [][]byte{
 					hasher.Compute("valid"),
 				},
+				TxResults: []uint32{0},
 			},
-			wantErr: true,
-			err:     process.ErrTxRootHashDoesNotMatch,
+			wantErr:      true,
+			err:          process.ErrTxRootHashDoesNotMatch,
+			bodyMismatch: true,
 		},
 		{
 			name: "should error because empty txRootHash",
@@ -108,17 +132,79 @@ func Test_validateTxRootHash(t *testing.T) {
 					TxCount:    1,
 					TxRootHash: []byte(""),
 				},
+				TxHashes: [][]byte{
+					hasher.Compute("valid"),
+				},
+				TxResults: []uint32{0},
 			},
-			wantErr: true,
-			err:     process.ErrTxRootHashDoesNotMatch,
+			wantErr:      true,
+			err:          process.ErrTxRootHashDoesNotMatch,
+			bodyMismatch: true,
 		},
 		{
 			name: "should error because empty hash in TxHashes",
 			block: getInvalidBlock(hasher, [][]byte{
 				[]byte(""),
 			}),
-			wantErr: true,
-			err:     process.ErrTxRootHashDoesNotMatch,
+			wantErr:      true,
+			err:          process.ErrInvalidTxHashLength,
+			bodyMismatch: true,
+		},
+		{
+			name:         "should error when tx hashes are not hasher sized even if the root matches",
+			block:        getBlockWithTxHashesSplitAtWrongWidth(hasher),
+			wantErr:      true,
+			err:          process.ErrInvalidTxHashLength,
+			bodyMismatch: true,
+		},
+		{
+			name: "should error when the tx count does not match the tx hashes",
+			block: &block.Block{
+				Header: &block.BlockHeader{
+					TxCount: 2,
+				},
+				TxHashes:  [][]byte{hasher.Compute("valid")},
+				TxResults: []uint32{0},
+			},
+			wantErr:      true,
+			err:          process.ErrInvalidTXCount,
+			bodyMismatch: true,
+		},
+		{
+			name: "should error when tx results do not pair up with the tx hashes",
+			block: func() *block.Block {
+				blk := getValidBlock(hasher)
+				blk.TxResults = nil
+				return blk
+			}(),
+			wantErr:      true,
+			err:          process.ErrInvalidTXResultsCount,
+			bodyMismatch: true,
+		},
+		{
+			name: "should error when the tx count is zero but the block has tx hashes",
+			block: &block.Block{
+				Header: &block.BlockHeader{
+					TxCount: 0,
+				},
+				TxHashes:  [][]byte{hasher.Compute("valid")},
+				TxResults: []uint32{0},
+			},
+			wantErr:      true,
+			err:          process.ErrInvalidTXCount,
+			bodyMismatch: true,
+		},
+		{
+			name: "should error when a block without transactions carries tx results",
+			block: &block.Block{
+				Header: &block.BlockHeader{
+					TxCount: 0,
+				},
+				TxResults: []uint32{0},
+			},
+			wantErr:      true,
+			err:          process.ErrInvalidTXResultsCount,
+			bodyMismatch: true,
 		},
 		{
 			name: "should error when using EmptyHash without transactions",
@@ -171,7 +257,8 @@ func Test_validateTxRootHash(t *testing.T) {
 			err := bp.validateTxRootHash(tt.block)
 			if tt.wantErr {
 				require.Error(err)
-				assert.Equal(tt.err, err)
+				assert.ErrorIs(err, tt.err)
+				assert.Equal(tt.bodyMismatch, errors.Is(err, process.ErrBlockBodyNotMatchingHeader))
 			} else {
 				require.NoError(err)
 			}

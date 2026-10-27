@@ -110,12 +110,6 @@ var ErrNilReconnecter = errors.New("nil reconnecter")
 // peers and a connection to this peer will result in an immediate disconnection
 var ErrUnwantedPeer = errors.New("unwanted peer: will not initiate connection as it will get disconnected")
 
-// ErrEmptySeed signals that an empty seed has been provided
-var ErrEmptySeed = errors.New("empty seed")
-
-// ErrEmptyBuffer signals that an empty buffer has been provided
-var ErrEmptyBuffer = errors.New("empty buffer")
-
 // ErrNilPeerDenialEvaluator signals that a nil peer denial evaluator was provided
 var ErrNilPeerDenialEvaluator = errors.New("nil peer denial evaluator")
 
@@ -134,3 +128,6 @@ var ErrUnsupportedMessageVersion = errors.New("unsupported message version")
 
 // ErrNilSyncTimer signals that a nil sync timer was provided
 var ErrNilSyncTimer = errors.New("nil sync timer")
+
+// ErrNilP2pPrivateKey signals that a nil p2p private key was provided
+var ErrNilP2pPrivateKey = errors.New("nil p2p private key")

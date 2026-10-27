@@ -175,6 +175,50 @@ func TestUpdatePool(t *testing.T) {
 		require.Equal(t, common.ErrAccNotOwner, err)
 	})
 
+	t.Run("NewPoolWithoutAssetOwner", func(t *testing.T) {
+		args := createMockArgsKDAFeesPool()
+		kapp, err := kdafeespool.NewKDAFeesPoolKApp(args)
+		require.NoError(t, err)
+
+		poolData := make(map[string][]byte)
+		kappAcc := &mock.KAppAccountHandlerStub{
+			GetStorageCalled: func(key []byte) []byte {
+				return poolData[string(key)]
+			},
+		}
+
+		cacher := &mock.AccountsCacherStub{
+			LoadKAppCalled: func(address []byte) (state.KAppAccountHandler, error) {
+				return kappAcc, nil
+			},
+		}
+		_ = kapp.SetAccountsCacher(cacher)
+
+		receipts := &mock.ReceiptsContextStub{}
+		kappContext := &mock.KAppContextStub{
+			ReceiptsValue: receipts,
+		}
+		controller := &mock.KappsControllerMock{}
+		controller.SetCurrentKAppContext(kappContext)
+		_ = kapp.SetKAppController(controller)
+
+		poolID := []byte("pool-id")
+		adminAddress := make([]byte, 32)
+		copy(adminAddress, []byte("admin-address"))
+		info := &transaction.KDAPoolInfo{
+			Active:       true,
+			AdminAddress: adminAddress,
+			FRatioKLV:    1000,
+			FRatioKDA:    100,
+		}
+
+		for _, sender := range [][]byte{nil, {}} {
+			code, err := kapp.UpdatePool(poolID, nil, sender, info)
+			require.Equal(t, transaction.Transaction_AccountNotOwner, code)
+			require.Equal(t, common.ErrAccNotOwner, err)
+		}
+	})
+
 	t.Run("InvalidFRatioKLV", func(t *testing.T) {
 		args := createMockArgsKDAFeesPool()
 		kapp, err := kdafeespool.NewKDAFeesPoolKApp(args)

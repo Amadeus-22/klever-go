@@ -28,6 +28,7 @@ func TestNewPrintTxLogProcessor(t *testing.T) {
 
 	ptlp.EnableLogToBeSavedInCache()
 	ptlp.Clean()
+	require.Nil(t, ptlp.SaveLogsToStorage())
 
 	l, err := ptlp.GetLog(nil)
 	require.Nil(t, l)

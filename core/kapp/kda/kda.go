@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/klever-io/klever-go/common"
+	"github.com/klever-io/klever-go/common/types"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
 	"github.com/klever-io/klever-go/core/process"
@@ -259,7 +260,7 @@ func (k *kdaKapp) Burn(sender []byte, tc *transaction.AssetTriggerContract) (tra
 	}
 
 	if tc.GetTriggerType() == transaction.AssetTriggerContract_Wipe {
-		if !bytes.Equal(kda.OwnerAddress, sender) && !bytes.Equal(kda.AdminAddress, sender) {
+		if !kda.IsOwnerOrAdmin(sender) {
 			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 			return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 		}
@@ -411,6 +412,75 @@ func (k *kdaKapp) isValidCirculatingSupply(kda *kapps.KDAData) bool {
 	return kda.CirculatingSupply > 0
 }
 
+func (k *kdaKapp) validateStakingAPR(staking *transaction.StakingInfo) error {
+	if !k.forkController.FixAuditChangesV6() || staking.GetType() != transaction.StakingInfo_APRI {
+		return nil
+	}
+
+	if staking.GetAPR() > core.MaxStakingAPR {
+		return common.ErrAPRAboveMaximum
+	}
+
+	return nil
+}
+
+// checkDepositPauseAndTransferControls refuses, once FixAuditChangesV6 is active, an FPR deposit
+// into the pool of a paused asset, and one of a currency that is paused or that the depositor could
+// not send to any account. The pool is not an account, so only the sender side of the transfer
+// restriction applies.
+func (k *kdaKapp) checkDepositPauseAndTransferControls(sender []byte, asset, currency *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
+	if !k.forkController.FixAuditChangesV6() {
+		return transaction.Transaction_Ok, nil
+	}
+
+	ctx := k.KAppController.GetCurrentKAppContext()
+
+	if asset.GetAttributes().GetIsPaused() || currency.GetAttributes().GetIsPaused() {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetPaused, process.ErrAssetIsPaused.Error())
+		return transaction.Transaction_AssetPaused, process.ErrAssetIsPaused
+	}
+
+	if !currency.CanSenderTransfer(sender) {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldTransferNotAllowed, process.ErrKDATransferNotAllowed.Error())
+		return transaction.Transaction_KDATransferNotAllowed, process.ErrKDATransferNotAllowed
+	}
+
+	return transaction.Transaction_Ok, nil
+}
+
+// expiredResidualAccount returns the account an expired FPR residual is paid to: the staking asset's
+// owner once FixAuditChangesV6 is active, the depositor before it. The owner can be any address, so
+// its account is loaded the way a transfer destination is.
+func (k *kdaKapp) expiredResidualAccount(depositorAcc state.UserAccountHandler, asset *kapps.KDAData) (state.UserAccountHandler, error) {
+	if !k.forkController.FixAuditChangesV6() || bytes.Equal(asset.GetOwnerAddress(), depositorAcc.AddressBytes()) {
+		return depositorAcc, nil
+	}
+
+	return k.LoadUserAccount(asset.GetOwnerAddress())
+}
+
+// refundExpiredFPR pays the unclaimed residual of one currency of an expired FPR entry and records
+// the Transfer receipt for it.
+func (k *kdaKapp) refundExpiredFPR(recipient state.UserAccountHandler, amount int64, currencyID []byte) error {
+	if err := recipient.AddToBalance(amount, currencyID, k.forkController.EnableSmartContracts()); err != nil {
+		return err
+	}
+
+	ctx := k.KAppController.GetCurrentKAppContext()
+	ctx.Receipts().Add(txProcess.NewReceipt(
+		txProcess.Transfer,
+		ctx.ContractID(),
+		core.ZeroAddress,
+		recipient.AddressBytes(),
+		[]byte(strconv.FormatInt(amount, 10)),
+		currencyID,
+		nil,
+		[]byte{byte(kapps.KDAData_Fungible)},
+	))
+
+	return nil
+}
+
 func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
@@ -448,9 +518,13 @@ func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (trans
 	}
 
 	// test if currency actually exists
-	_, _, err = k.GetKDA(currencyID)
+	_, currency, err := k.GetKDA(currencyID)
 	if err != nil {
 		return transaction.Transaction_KAPPError, err
+	}
+
+	if resultCode, errControls := k.checkDepositPauseAndTransferControls(sender, kda, currency); errControls != nil {
+		return resultCode, errControls
 	}
 
 	stakingKapp, staking, err := k.GetStaking(assetID)
@@ -464,13 +538,18 @@ func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (trans
 		return transaction.Transaction_AssetTypeInvalid, common.ErrAssetTypeInvalid
 	}
 
-	ownerAcc, err := k.GetExistingUserAccount(sender)
+	depositorAcc, err := k.GetExistingUserAccount(sender)
 	if err != nil {
 		return transaction.Transaction_LoadAccountError, err
 	}
 
-	if err := ownerAcc.SubFromBalance(tc.GetAmount(), currencyID, k.forkController.EnableSmartContracts()); err != nil {
+	if err := depositorAcc.SubFromBalance(tc.GetAmount(), currencyID, k.forkController.EnableSmartContracts()); err != nil {
 		return transaction.Transaction_BalanceError, err
+	}
+
+	residualAcc, err := k.expiredResidualAccount(depositorAcc, kda)
+	if err != nil {
+		return transaction.Transaction_LoadAccountError, err
 	}
 
 	validFPRs := make([]*kapps.FPRData, 0)
@@ -484,9 +563,15 @@ func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (trans
 
 		maxEpochsUnclaimed := tools.SafeI64ToU32(k.KAppController.GetProposalController().GetParameterInt(kapps.EnumParameter_MaxEpochsUnclaimed))
 		//if a fpr is not expired, add it to the valid list
-		if fpr.GetEpoch()+
+		notExpired := fpr.GetEpoch()+
 			maxEpochsUnclaimed >=
-			ctx.Block().GetEpoch() {
+			ctx.Block().GetEpoch()
+		if k.forkController.FixAuditChangesV6() {
+			// summed in uint64: a parameter saturated at MaxUint32 wrapped the uint32 sum above,
+			// which made every FPR past epoch 0 look expired
+			notExpired = uint64(fpr.GetEpoch())+uint64(maxEpochsUnclaimed) >= uint64(ctx.Block().GetEpoch())
+		}
+		if notExpired {
 			validFPRs = append(validFPRs, fpr)
 			continue
 		}
@@ -494,42 +579,20 @@ func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (trans
 		//pay expired KLV
 		expiredKLV := fpr.TotalAmount - fpr.TotalClaimed
 		if expiredKLV > 0 {
-			err = ownerAcc.AddToBalance(expiredKLV, nil, k.forkController.EnableSmartContracts())
-			if err != nil {
+			if err := k.refundExpiredFPR(residualAcc, expiredKLV, kdautils.KLVIdentifier); err != nil {
 				return transaction.Transaction_AssetError, err
 			}
-
-			ctx.Receipts().Add(txProcess.NewReceipt(
-				txProcess.Transfer,
-				ctx.ContractID(),
-				core.ZeroAddress,
-				ownerAcc.AddressBytes(),
-				[]byte(strconv.FormatInt(expiredKLV, 10)),
-				kdautils.KLVIdentifier,
-				nil,
-				[]byte{byte(kapps.KDAData_Fungible)},
-			))
 		}
 
 		//pay expired KDAS
-		for key, value := range fpr.GetKDAS() {
+		kdas := fpr.GetKDAS()
+		for _, key := range types.OrderedKeys(kdas, k.forkController.FixAuditChangesV6()) {
+			value := kdas[key]
 			expiredKDA := value.TotalAmount - value.TotalClaimed
 			if expiredKDA > 0 {
-				err = ownerAcc.AddToBalance(expiredKDA, []byte(key), k.forkController.EnableSmartContracts())
-				if err != nil {
+				if err := k.refundExpiredFPR(residualAcc, expiredKDA, []byte(key)); err != nil {
 					return transaction.Transaction_AssetError, err
 				}
-
-				ctx.Receipts().Add(txProcess.NewReceipt(
-					txProcess.Transfer,
-					ctx.ContractID(),
-					core.ZeroAddress,
-					ownerAcc.AddressBytes(),
-					[]byte(strconv.FormatInt(expiredKDA, 10)),
-					[]byte(key),
-					nil,
-					[]byte{byte(kapps.KDAData_Fungible)},
-				))
 			}
 		}
 	}
@@ -543,7 +606,7 @@ func (k *kdaKapp) Deposit(sender []byte, tc *transaction.DepositContract) (trans
 	ctx.Receipts().Add(txProcess.NewReceipt(
 		txProcess.Deposit,
 		ctx.ContractID(),
-		ownerAcc.AddressBytes(),
+		depositorAcc.AddressBytes(),
 		[]byte(strconv.FormatInt(int64(transaction.DepositContract_FPRDeposit.Number()), 10)),
 		[]byte(strconv.FormatInt(tc.GetAmount(), 10)),
 		assetID,

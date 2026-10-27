@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"testing"
 
+	blockchainConfig "github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/kvm/config"
 	contextmock "github.com/klever-io/klever-go/kvm/mock/context"
@@ -51,11 +52,23 @@ var DeleteExec = uint64(13)
 // contract is loaded 1 initial call + 2 ExecDestCall
 var contractLoadCost = 3 * contractSize
 
-// (Initial Call + 2 ExecDestCall) * contractSize + 2*GetOwner+ DeleteCost
-var baseCost = contractLoadCost + 2*GetOwnerReturn + 2*GetOwner + DeleteExec + DeleteCost
-
 // kvm/test/contracts/delete-contract/output/delete-contract.wasm
 func TestBaseOps_DeleteContractValidateGas(t *testing.T) {
+	// before FixAuditChangesV6 the gas must stay exactly historical, so blocks from before the fork
+	// replay unchanged; from it, each GetOwner call also pays for copying its function name, and the
+	// contract's getArgument pays for copying the 32-byte address it deletes
+	t.Run("before FixAuditChangesV6", func(t *testing.T) {
+		testDeleteContractValidateGas(t, blockchainConfig.EnableEpochs{FixAuditChangesV6: 1_000_000}, 0, 0)
+	})
+	t.Run("from FixAuditChangesV6", func(t *testing.T) {
+		testDeleteContractValidateGas(t, blockchainConfig.EnableEpochs{}, 22, 32)
+	})
+}
+
+func testDeleteContractValidateGas(t *testing.T, epochs blockchainConfig.EnableEpochs, nameCopyGas uint64, argCopyGas uint64) {
+	// (Initial Call + 2 ExecDestCall) * contractSize + 2*GetOwner+ DeleteCost
+	baseCost := contractLoadCost + 2*(GetOwnerReturn+nameCopyGas) + 2*GetOwner + DeleteExec + DeleteCost + argCopyGas
+
 	baseOpsCode := common.GetTestSCCodeModule(contractName, contractName, "../../")
 	codeHash := worldmock.DefaultHasher.Compute(string(baseOpsCode))
 	codeMeta := &vmcommon.CodeMetadata{
@@ -109,13 +122,14 @@ func TestBaseOps_DeleteContractValidateGas(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		runDeleteContractTest(t, test)
+		runDeleteContractTest(t, test, epochs)
 	}
 }
 
 func runDeleteContractTest(
 	t *testing.T,
 	test DeleteTest,
+	epochs blockchainConfig.EnableEpochs,
 ) {
 	contractsMap := make(map[string]*worldmock.Account)
 	contractsMap[string(test.ParentAddress)] = &worldmock.Account{
@@ -139,6 +153,7 @@ func runDeleteContractTest(
 	}
 
 	common.BuildInstanceCallTest(t).
+		WithEnableEpochs(epochs).
 		WithSetup(func(host vmhost.VMHost, stubBlockchainHook *contextmock.BlockchainHookStub) {
 			stubBlockchainHook.GetUserAccountCalled = func(address []byte) (state.UserAccountHandler, error) {
 				account, ok := contractsMap[string(address)]

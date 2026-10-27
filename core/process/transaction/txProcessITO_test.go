@@ -1370,3 +1370,108 @@ func TestITOTriggerTxProcessor_BuyRoyalties_ShouldWork(t *testing.T) {
 	//Check ITO royalties receiver klv balance - (initial balanace + 2 royalties fixed split + 2 royalties percentage split)
 	c.CheckBalance(itoReferralAddress, kdautils.KLVIdentifier, 0+3_000+650_000)
 }
+
+var itoPaymentCurrencyID = []byte("RST")
+
+// CreateLimitTransferCurrency stores a transfer-restricted currency whose issuer granted the
+// deposit role to depositors.
+func (c *Controller) CreateLimitTransferCurrency(depositors ...[]byte) {
+	roles := make([]*kapps.RolesData, 0, len(depositors))
+	for _, depositor := range depositors {
+		roles = append(roles, &kapps.RolesData{Address: depositor, HasRoleDeposit: true})
+	}
+
+	currency := kapps.KDAData{
+		ID:           itoPaymentCurrencyID,
+		AssetType:    kapps.KDAData_Fungible,
+		Name:         []byte("RST"),
+		Ticker:       itoPaymentCurrencyID,
+		OwnerAddress: testWhitelistAddress,
+		Properties:   &kapps.PropertiesData{LimitTransfer: true},
+		Attributes:   &kapps.AttributesData{},
+		Roles:        roles,
+	}
+
+	currencyData, _ := marshalizer.Marshal(&currency)
+
+	_ = c.kdaKapp.DataTrieTracker().SaveKeyValue(kdautils.ToKDAKey(itoPaymentCurrencyID, nil), currencyData)
+
+	_ = c.kappDB.SaveAccount(c.kdaKapp)
+}
+
+// A payment destination is checked where it is paid, so by the time the ITO receiver is refused
+// the buyer has paid the fixed KLV royalty and the royalty destinations hold their share. The
+// failed transaction is what undoes them.
+func TestITOBuyTxProcessor_RefusedPaymentDestination(t *testing.T) {
+	const (
+		funding       = int64(10_000_000_000)
+		price         = int64(1_000_000_000)
+		fixedRoyalty  = int64(10_000)
+		fixedSplit    = int64(3_000)
+		royalty       = int64(13_000_000)
+		royaltySplit  = int64(650_000)
+		receiverShare = price - royalty
+	)
+
+	buyer, itoReceiver, royaltyAddress, splitAddress := receiver, admin, sender, itoReferralAddress
+
+	buy := func(t *testing.T, depositors ...[]byte) (*Controller, error) {
+		t.Helper()
+
+		c := NewController(t)
+		c.AddUser(buyer, funding, kdautils.KLVIdentifier)
+		c.AddUser(buyer, funding, itoPaymentCurrencyID)
+		c.AddUser(royaltyAddress, funding, kdautils.KLVIdentifier)
+
+		blk := createBlockHeader()
+		c.CreateAssetWithITORoyalties()
+		c.CreateLimitTransferCurrency(depositors...)
+		c.RunConfigITOTX(blk, sender, itoReceiver, assetITOIdentifier, 1000, 10)
+		c.RunTriggerITOTX(blk, sender, &transaction.ITOTriggerContract{
+			TriggerType: transaction.ITOTriggerContract_SetITOPrices,
+			AssetID:     assetITOIdentifier,
+			PackInfo:    map[string]*transaction.PackInfo{string(itoPaymentCurrencyID): {Packs: []*transaction.PackItem{{Amount: 1, Price: price}}}},
+		})
+
+		tx, err := createTransactionMock(&transaction.BuyContract{
+			BuyType:        transaction.BuyContract_ITOBuy,
+			ID:             assetITOIdentifier,
+			CurrencyID:     itoPaymentCurrencyID,
+			Amount:         1,
+			CurrencyAmount: price,
+		}, transaction.TXContract_BuyContractType, buyer, 0)
+		require.NoError(t, err)
+		_, hash, err := c.execTx.PreProcessTransaction(tx)
+		require.NoError(t, err)
+
+		return c, c.execTx.ProcessTransaction(c.CreateBlockHeader(time.Now().AddDate(0, 0, 2).Unix(), 2, 2), hash, tx)
+	}
+
+	t.Run("every destination authorized pays the fixed royalty and every destination", func(t *testing.T) {
+		c, err := buy(t, itoReceiver, royaltyAddress, splitAddress)
+		require.NoError(t, err)
+
+		c.CheckBalance(buyer, kdautils.KLVIdentifier, funding-fixedRoyalty)
+		c.CheckBalance(buyer, itoPaymentCurrencyID, funding-price)
+		c.CheckBalance(buyer, assetITOIdentifier, 1)
+		c.CheckBalance(royaltyAddress, kdautils.KLVIdentifier, funding+fixedRoyalty-fixedSplit)
+		c.CheckBalance(royaltyAddress, itoPaymentCurrencyID, royalty-royaltySplit)
+		c.CheckBalance(splitAddress, kdautils.KLVIdentifier, fixedSplit)
+		c.CheckBalance(splitAddress, itoPaymentCurrencyID, royaltySplit)
+		c.CheckBalance(itoReceiver, itoPaymentCurrencyID, receiverShare)
+	})
+
+	t.Run("a refused receiver leaves every balance as it was", func(t *testing.T) {
+		c, err := buy(t, royaltyAddress, splitAddress)
+		require.ErrorIs(t, err, process.ErrKDATransferNotAllowed)
+
+		c.CheckBalance(buyer, kdautils.KLVIdentifier, funding)
+		c.CheckBalance(buyer, itoPaymentCurrencyID, funding)
+		c.CheckBalance(buyer, assetITOIdentifier, 0)
+		c.CheckBalance(royaltyAddress, kdautils.KLVIdentifier, funding)
+		c.CheckBalance(royaltyAddress, itoPaymentCurrencyID, 0)
+		c.CheckBalance(splitAddress, kdautils.KLVIdentifier, 0)
+		c.CheckBalance(splitAddress, itoPaymentCurrencyID, 0)
+		c.CheckBalance(itoReceiver, itoPaymentCurrencyID, 0)
+	})
+}

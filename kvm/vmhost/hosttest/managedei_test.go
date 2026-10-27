@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"encoding/hex"
 	"math/big"
+	"math/rand/v2"
 	"strings"
 	"testing"
 	"time"
@@ -1122,7 +1123,7 @@ func Test_ManagedDeleteContract(t *testing.T) {
 						managedTypes := host.ManagedTypes()
 
 						argumentsHandle := managedTypes.NewManagedBuffer()
-						managedTypes.WriteManagedVecOfManagedBuffers([][]byte{{1, 2}, {3, 4}}, argumentsHandle)
+						require.NoError(t, managedTypes.WriteManagedVecOfManagedBuffers([][]byte{{1, 2}, {3, 4}}, argumentsHandle))
 
 						destHandle := managedTypes.NewManagedBufferFromBytes(test.ParentAddress)
 
@@ -1150,6 +1151,161 @@ func Test_ManagedDeleteContract(t *testing.T) {
 				DeletedAccounts(test.ParentAddress)
 		})
 	assert.Nil(t, err)
+}
+
+var (
+	parentDeleteTarget       = test.MakeTestSCAddressWithDefaultVM("parentTarget")
+	childDeleteTarget        = test.MakeTestSCAddressWithDefaultVM("childTarget")
+	failingChildDeleteTarget = test.MakeTestSCAddressWithDefaultVM("failingTarget")
+)
+
+func deleteContractWithHost(t *testing.T, host vmhost.VMHost, target []byte) {
+	managedTypes := host.ManagedTypes()
+	argumentsHandle := managedTypes.NewManagedBuffer()
+	require.NoError(t, managedTypes.WriteManagedVecOfManagedBuffers(nil, argumentsHandle))
+	destHandle := managedTypes.NewManagedBufferFromBytes(target)
+
+	vmhooks.ManagedDeleteContractWithHost(host, destHandle, 100000, argumentsHandle)
+}
+
+func callChildOnDestContext(host vmhost.VMHost, function string) int32 {
+	return vmhooks.ExecuteOnDestContextWithTypedArgs(host, 100000, big.NewInt(0), []byte(function), test.ChildAddress, [][]byte{})
+}
+
+func callChildOnDestContextTimes(t *testing.T, host vmhost.VMHost, function string, numCalls int) {
+	for i := 0; i < numCalls; i++ {
+		require.Equal(t, int32(0), callChildOnDestContext(host, function))
+	}
+}
+
+func runManagedDeleteContractScenario(t *testing.T, fixAuditChangesV6 uint32, parentFunction func(host vmhost.VMHost)) *vmcommon.VMOutput {
+	testConfig := baseTestConfig
+
+	deleteTarget := func(address []byte, owner []byte) test.MockTestSmartContract {
+		return test.CreateMockContract(address).
+			WithCodeMetadata([]byte{vmcommon.MetadataUpgradeable, 0}).
+			WithOwnerAddress(owner).
+			WithMethods()
+	}
+
+	vmOutput, err := test.BuildMockInstanceCallTest(t).
+		WithEnableEpochs(blockchainConfig.EnableEpochs{FixAuditChangesV6: fixAuditChangesV6}).
+		WithContracts(
+			test.CreateMockContract(test.ParentAddress).
+				WithBalance(testConfig.ParentBalance).
+				WithConfig(testConfig).
+				WithMethods(func(parentInstance *mock.InstanceMock, config interface{}) {
+					parentInstance.AddMockMethod("testFunction", func() *mock.InstanceMock {
+						parentFunction(parentInstance.Host)
+						return parentInstance
+					})
+				}),
+			test.CreateMockContract(test.ChildAddress).
+				WithMethods(func(childInstance *mock.InstanceMock, config interface{}) {
+					childInstance.AddMockMethod("doNothing", func() *mock.InstanceMock {
+						return childInstance
+					})
+					childInstance.AddMockMethod("deleteChildTarget", func() *mock.InstanceMock {
+						deleteContractWithHost(t, childInstance.Host, childDeleteTarget)
+						return childInstance
+					})
+					childInstance.AddMockMethod("deleteChildTargetAndFail", func() *mock.InstanceMock {
+						deleteContractWithHost(t, childInstance.Host, failingChildDeleteTarget)
+						childInstance.Host.Runtime().SignalUserError("child failed after delete")
+						return childInstance
+					})
+					childInstance.AddMockMethod("deleteParentTargetOnSameContext", func() *mock.InstanceMock {
+						deleteContractWithHost(t, childInstance.Host, parentDeleteTarget)
+						return childInstance
+					})
+				}),
+			deleteTarget(parentDeleteTarget, test.ParentAddress),
+			deleteTarget(childDeleteTarget, test.ChildAddress),
+			deleteTarget(failingChildDeleteTarget, test.ChildAddress),
+		).
+		WithInput(test.CreateTestContractCallInputBuilder().
+			WithRecipientAddr(test.ParentAddress).
+			WithGasProvided(testConfig.GasProvided).
+			WithFunction("testFunction").
+			Build()).
+		WithSetup(func(host vmhost.VMHost, world *worldmock.MockWorld) {
+			setZeroCodeCosts(host)
+		}).
+		AndAssertResults(func(world *worldmock.MockWorld, verify *test.VMOutputVerifier) {
+			verify.Ok()
+		})
+	require.NoError(t, err)
+
+	return vmOutput
+}
+
+func Test_ManagedDeleteContract_ListedOnceAfterNestedCalls(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
+		deleteContractWithHost(t, host, parentDeleteTarget)
+		callChildOnDestContextTimes(t, host, "doNothing", 10)
+	})
+
+	require.Equal(t, [][]byte{parentDeleteTarget}, vmOutput.DeletedAccounts)
+}
+
+func Test_ManagedDeleteContract_RepeatedAfterNestedCallsBeforeFixAuditChangesV6(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 1_000_000, func(host vmhost.VMHost) {
+		deleteContractWithHost(t, host, parentDeleteTarget)
+		callChildOnDestContextTimes(t, host, "doNothing", 3)
+	})
+
+	require.Len(t, vmOutput.DeletedAccounts, 8)
+	for _, address := range vmOutput.DeletedAccounts {
+		require.Equal(t, parentDeleteTarget, address)
+	}
+}
+
+func Test_ManagedDeleteContract_ParentAndChildDeletionsListedOnce(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
+		deleteContractWithHost(t, host, parentDeleteTarget)
+		callChildOnDestContextTimes(t, host, "deleteChildTarget", 1)
+		callChildOnDestContextTimes(t, host, "doNothing", 5)
+	})
+
+	require.Equal(t, [][]byte{parentDeleteTarget, childDeleteTarget}, vmOutput.DeletedAccounts)
+}
+
+func Test_ManagedDeleteContract_RepeatedDeleteListedOncePerCall(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
+		deleteContractWithHost(t, host, parentDeleteTarget)
+		deleteContractWithHost(t, host, parentDeleteTarget)
+		callChildOnDestContextTimes(t, host, "doNothing", 5)
+	})
+
+	require.Equal(t, [][]byte{parentDeleteTarget, parentDeleteTarget}, vmOutput.DeletedAccounts)
+}
+
+func Test_ManagedDeleteContract_OnSameContextListedOnceAfterNestedCalls(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
+		result := vmhooks.ExecuteOnSameContextWithTypedArgs(host, 100000, big.NewInt(0), []byte("deleteParentTargetOnSameContext"), test.ChildAddress, [][]byte{})
+		require.Equal(t, int32(0), result)
+		callChildOnDestContextTimes(t, host, "doNothing", 5)
+	})
+
+	require.Equal(t, [][]byte{parentDeleteTarget}, vmOutput.DeletedAccounts)
+}
+
+func Test_ManagedDeleteContract_FailedNestedCallDropsItsDeletion(t *testing.T) {
+	vmOutput := runManagedDeleteContractScenario(t, 0, func(host vmhost.VMHost) {
+		callChildOnDestContextTimes(t, host, "deleteChildTarget", 1)
+
+		failingInput := test.DefaultTestContractCallInput()
+		failingInput.CallerAddr = test.ParentAddress
+		failingInput.RecipientAddr = test.ChildAddress
+		failingInput.Function = "deleteChildTargetAndFail"
+		failingInput.GasProvided = host.Metering().GasLeft() / 2
+		_, err := host.ExecuteOnDestContext(failingInput)
+		require.Error(t, err)
+
+		callChildOnDestContextTimes(t, host, "doNothing", 3)
+	})
+
+	require.Equal(t, [][]byte{childDeleteTarget}, vmOutput.DeletedAccounts)
 }
 
 func TestBaseOpsAPI_NFTNonceOverflow(t *testing.T) {
@@ -1512,5 +1668,220 @@ func TestManagedei_ManagedAccHasPerm_Helper_Func_ValidatePerm(t *testing.T) {
 			opsValue(tv.contractType...),
 		)
 		assert.Equal(t, tv.expected, result, tv.name)
+	}
+}
+
+// A key or signature buffer longer than its scheme's size must never verify. Checking only a prefix
+// of it would let a contract that keys on the whole buffer (a used-signature set, a per-key
+// allowlist) accept the same signature or key again, padded differently. From FixAuditChangesV6 the
+// size is checked before anything is copied.
+func Test_ManagedVerify_RejectsPaddedKeyOrSignature_PostFork(t *testing.T) {
+	seed, _ := hex.DecodeString("1122334455667788990011223344556677889900112233445566778899001122")
+	edPrivateKey := ed25519.NewKeyFromSeed(seed)
+	edKey := []byte(edPrivateKey.Public().(ed25519.PublicKey))
+	edMessage := []byte("test message!")
+	edSig := ed25519.Sign(edPrivateKey, edMessage)
+	blsKey, blsMessage, blsSig := blsSplitString(t, blsCheckOK)
+	pad := func(b []byte) []byte { return append(bytes.Clone(b), 0) }
+
+	tests := []struct {
+		name              string
+		verify            func(host vmhost.VMHost, keyHandle, messageHandle, sigHandle int32) int32
+		key, message, sig []byte
+		wantErr           error
+	}{
+		{"BLS padded key", vmhooks.ManagedVerifyBLSWithHost, pad(blsKey), blsMessage, blsSig, vmhost.ErrInvalidPublicKeySize},
+		{"BLS padded signature", vmhooks.ManagedVerifyBLSWithHost, blsKey, blsMessage, pad(blsSig), vmhost.ErrInvalidSignatureSize},
+		{"Ed25519 padded key", vmhooks.ManagedVerifyEd25519WithHost, pad(edKey), edMessage, edSig, vmhost.ErrInvalidPublicKeySize},
+		{"Ed25519 padded signature", vmhooks.ManagedVerifyEd25519WithHost, edKey, edMessage, pad(edSig), vmhost.ErrInvalidSignatureSize},
+		{"secp256k1 key of neither size", vmhooks.ManagedVerifySecp256k1WithHost, make([]byte, 34), edMessage, edSig, vmhost.ErrInvalidPublicKeySize},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runManagedHookForkGateTest(t, nil,
+				func(host vmhost.VMHost) {
+					managedTypes := host.ManagedTypes()
+					tt.verify(host,
+						managedTypes.NewManagedBufferFromBytes(tt.key),
+						managedTypes.NewManagedBufferFromBytes(tt.message),
+						managedTypes.NewManagedBufferFromBytes(tt.sig))
+				},
+				func(verify *test.VMOutputVerifier) {
+					verify.ExecutionFailed().ReturnMessage(tt.wantErr.Error())
+				},
+			)
+		})
+	}
+}
+
+// Before the fork a padded Ed25519 signature was copied whole and failed in ed25519.Verify, so it is
+// still rejected, only by the verifier rather than by the size check.
+func Test_ManagedVerifyEd25519_RejectsPaddedSignature_PreFork(t *testing.T) {
+	seed, _ := hex.DecodeString("1122334455667788990011223344556677889900112233445566778899001122")
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	message := []byte("test message!")
+	paddedSig := append(ed25519.Sign(privateKey, message), 0)
+
+	runManagedHookForkGateTest(t, &blockchainConfig.EnableEpochs{FixAuditChangesV6: 1},
+		func(host vmhost.VMHost) {
+			managedTypes := host.ManagedTypes()
+			vmhooks.ManagedVerifyEd25519WithHost(host,
+				managedTypes.NewManagedBufferFromBytes(privateKey.Public().(ed25519.PublicKey)),
+				managedTypes.NewManagedBufferFromBytes(message),
+				managedTypes.NewManagedBufferFromBytes(paddedSig))
+		},
+		func(verify *test.VMOutputVerifier) {
+			verify.ExecutionFailed().ReturnMessage("invalid signature")
+		},
+	)
+}
+
+// Before FixAuditChangesV6 ManagedUnmarshalEC returned 1 on a missing data buffer without failing the
+// execution. From it the data is paid for before it is loaded, so a load error has to stop the contract
+// instead of letting it carry on, unpaid.
+func Test_ManagedUnmarshalEC_MissingBufferFailsExecution_PostFork(t *testing.T) {
+	runManagedHookForkGateTest(t, nil,
+		func(host vmhost.VMHost) {
+			callManagedUnmarshalECOnMissingBuffer(host)
+		},
+		func(verify *test.VMOutputVerifier) {
+			verify.ExecutionFailed().ReturnMessage(vmhost.ErrNoManagedBufferUnderThisHandle.Error())
+		},
+	)
+}
+
+func Test_ManagedUnmarshalEC_MissingBufferReturnsWithoutFailing_PreFork(t *testing.T) {
+	runManagedHookForkGateTest(t, &blockchainConfig.EnableEpochs{FixAuditChangesV6: 1},
+		func(host vmhost.VMHost) {
+			if callManagedUnmarshalECOnMissingBuffer(host) != 1 {
+				host.Runtime().SignalUserError("assert failed")
+			}
+		},
+		func(verify *test.VMOutputVerifier) {
+			verify.Ok()
+		},
+	)
+}
+
+func callManagedUnmarshalECOnMissingBuffer(host vmhost.VMHost) int32 {
+	const missingDataHandle = int32(12345)
+	managedTypes := host.ManagedTypes()
+	return vmhooks.ManagedUnmarshalECWithHost(host,
+		managedTypes.NewBigIntFromInt64(0),
+		managedTypes.NewBigIntFromInt64(0),
+		managedTypes.PutEllipticCurve(elliptic.P256().Params()),
+		missingDataHandle)
+}
+
+// From FixAuditChangesV6 a scalar longer than the curve order's byte size is reduced modulo the order
+// before the multiplication. The curves have cofactor 1, so that has to be invisible: every long scalar
+// here goes through both managed scalar hooks before and after the fork, and the outcome (point, return
+// code, message, gas) must not change. Go's constant-time curves, which reduce the same way, give the
+// expected point.
+func Test_ManagedScalarMultEC_LongScalarKeepsHistoricalResult(t *testing.T) {
+	// 32 bytes, used on P-224 by crypto_elliptic_curves_legacy.scen.json
+	legacyScalar, _ := hex.DecodeString("f93e4ae433cc12cf2a43fc0ef26400c0e125508224cdb649380f25479148a4ad")
+	rng := rand.New(rand.NewPCG(1, 2))
+	randomBytes := func(n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte(rng.Uint32())
+		}
+		return b
+	}
+
+	type outcome struct {
+		x, y         string
+		returnCode   vmcommon.ReturnCode
+		message      string
+		gasRemaining uint64
+	}
+	type scalarHook func(host vmhost.VMHost, xHandle, yHandle, ecHandle, dataHandle int32) int32
+
+	run := func(t *testing.T, enableEpochs *blockchainConfig.EnableEpochs, hook scalarHook, curve *elliptic.CurveParams, scalar []byte) outcome {
+		var got outcome
+		runManagedHookForkGateTest(t, enableEpochs,
+			func(host vmhost.VMHost) {
+				managedTypes := host.ManagedTypes()
+				xHandle := managedTypes.NewBigIntFromInt64(0)
+				yHandle := managedTypes.NewBigIntFromInt64(0)
+				hook(host, xHandle, yHandle, managedTypes.PutEllipticCurve(curve), managedTypes.NewManagedBufferFromBytes(scalar))
+				x, _ := managedTypes.GetBigInt(xHandle)
+				y, _ := managedTypes.GetBigInt(yHandle)
+				got.x, got.y = x.Text(16), y.Text(16)
+			},
+			func(verify *test.VMOutputVerifier) {
+				got.returnCode = verify.VmOutput.ReturnCode
+				got.message = verify.VmOutput.ReturnMessage
+				got.gasRemaining = verify.VmOutput.GasRemaining
+			},
+		)
+		return got
+	}
+
+	for _, curve := range []elliptic.Curve{elliptic.P224(), elliptic.P256(), elliptic.P384(), elliptic.P521()} {
+		params := curve.Params()
+		byteLen := (params.N.BitLen() + 7) / 8
+		pointX, pointY := curve.ScalarBaseMult([]byte{7})
+
+		scalars := []struct {
+			name   string
+			scalar []byte
+		}{
+			{"a small scalar padded with leading zeros", append(make([]byte, byteLen+4), 7)},
+			{"the order, padded", append([]byte{0}, params.N.Bytes()...)},
+			{"the order plus one, padded", append([]byte{0}, new(big.Int).Add(params.N, big.NewInt(1)).Bytes()...)},
+			{"a large multiple of the order minus one", new(big.Int).Sub(new(big.Int).Lsh(params.N, 40), big.NewInt(1)).Bytes()},
+			{"a large multiple of the order plus five", new(big.Int).Add(new(big.Int).Lsh(params.N, 64), big.NewInt(5)).Bytes()},
+			{"random, one byte too long", randomBytes(byteLen + 1)},
+			{"random, twice as long", randomBytes(2*byteLen + 3)},
+			{"the legacy scenario's 32 bytes", legacyScalar},
+		}
+
+		hooks := []struct {
+			name     string
+			hook     scalarHook
+			expected func(scalar []byte) (*big.Int, *big.Int)
+		}{
+			{
+				"ManagedScalarBaseMultEC",
+				func(host vmhost.VMHost, xHandle, yHandle, ecHandle, dataHandle int32) int32 {
+					return vmhooks.ManagedScalarBaseMultECWithHost(host, xHandle, yHandle, ecHandle, dataHandle)
+				},
+				curve.ScalarBaseMult,
+			},
+			{
+				"ManagedScalarMultEC",
+				func(host vmhost.VMHost, xHandle, yHandle, ecHandle, dataHandle int32) int32 {
+					managedTypes := host.ManagedTypes()
+					return vmhooks.ManagedScalarMultECWithHost(host, xHandle, yHandle, ecHandle,
+						managedTypes.NewBigInt(new(big.Int).Set(pointX)), managedTypes.NewBigInt(new(big.Int).Set(pointY)), dataHandle)
+				},
+				func(scalar []byte) (*big.Int, *big.Int) { return curve.ScalarMult(pointX, pointY, scalar) },
+			},
+		}
+
+		for _, sc := range scalars {
+			for _, h := range hooks {
+				t.Run(params.Name+"/"+h.name+"/"+sc.name, func(t *testing.T) {
+					before := run(t, &blockchainConfig.EnableEpochs{FixAuditChangesV6: 1}, h.hook, params, sc.scalar)
+					after := run(t, nil, h.hook, params, sc.scalar)
+
+					require.Equal(t, before, after)
+
+					if new(big.Int).Mod(new(big.Int).SetBytes(sc.scalar), params.N).Sign() == 0 {
+						// k·P is the point at infinity, which the hooks have always refused
+						require.Equal(t, vmcommon.VMExecutionFailed, after.returnCode)
+						require.Equal(t, vmhost.ErrPointNotOnCurve.Error(), after.message)
+						return
+					}
+					require.Equal(t, vmcommon.Ok, after.returnCode, after.message)
+					expectedX, expectedY := h.expected(sc.scalar)
+					require.Equal(t, expectedX.Text(16), after.x)
+					require.Equal(t, expectedY.Text(16), after.y)
+				})
+			}
+		}
 	}
 }

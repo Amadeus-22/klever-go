@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"strings"
 
@@ -703,7 +704,11 @@ func readBigUint(buf *bytes.Reader) (*big.Int, error) {
 	if err != nil {
 		return nil, err
 	}
-	return new(big.Int).SetBytes(valBytes), nil
+	value := new(big.Int).SetBytes(valBytes)
+	if !value.IsUint64() {
+		value.SetUint64(math.MaxUint64)
+	}
+	return value, nil
 }
 
 // readString reads a string from the buffer by first reading its length.

@@ -97,6 +97,21 @@ func TestTimeCache_AddWithSpanShouldWork(t *testing.T) {
 
 //------- Has
 
+func TestTimeCache_RemoveShouldOnlyRemoveThatKey(t *testing.T) {
+	t.Parallel()
+
+	tc := NewTimeCache(time.Minute)
+	require.Nil(t, tc.Add("key1"))
+	require.Nil(t, tc.Add("key2"))
+
+	tc.Remove("key1")
+	tc.Remove("missing key")
+
+	assert.False(t, tc.Has("key1"))
+	assert.True(t, tc.Has("key2"))
+	assert.Equal(t, 1, tc.Len())
+}
+
 func TestTimeCache_HasNotExistingShouldRetFalse(t *testing.T) {
 	t.Parallel()
 

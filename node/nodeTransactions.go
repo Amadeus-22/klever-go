@@ -30,18 +30,20 @@ func (n *Node) GetTransaction(txHash string, withResults bool) (*api.Transaction
 		return nil, err
 	}
 
-	tx, err := n.optionallyGetTransactionFromPool(hash)
-	if err != nil {
-		return nil, err
-	}
+	// Committed storage first: a committed tx may still be pooled until
+	// removeTxsFromPools runs, and only a storage hit reports on-chain.
+	stx, errStorage := n.getTransactionFromStorage(hash)
+	if errStorage != nil {
+		tx, err := n.optionallyGetTransactionFromPool(hash)
+		if err != nil {
+			return nil, err
+		}
 
-	if tx != nil {
-		return n.prepareNormalTx(tx)
-	}
+		if tx == nil {
+			return nil, errStorage
+		}
 
-	stx, err := n.getTransactionFromStorage(hash)
-	if err != nil {
-		return nil, err
+		return n.prepareNormalTx(tx, api.TRANSACTION_STATUS_PENDING)
 	}
 
 	if withResults && stx.ResultCode != transaction.Transaction_AccountError {
@@ -85,7 +87,7 @@ func (n *Node) TXPool(sender string, page int, pageSize int) ([]*api.Transaction
 		if !ok || tx == nil {
 			continue
 		}
-		apiTx, err := n.prepareNormalTx(tx)
+		apiTx, err := n.prepareNormalTx(tx, api.TRANSACTION_STATUS_PENDING)
 		if err != nil {
 			continue
 		}
@@ -312,6 +314,12 @@ func (n *Node) EstimateTransactionFees(tx *transaction.Transaction) (*transactio
 	if txRawData == nil {
 		return nil, common.ErrNilRawTransaction
 	}
+	// a nil contract would be dereferenced while computing the fees
+	for _, contract := range txRawData.Contract {
+		if contract == nil {
+			return nil, common.ErrInvalidContract
+		}
+	}
 
 	sender := n.addressPubkeyConverter.Encode(tx.GetSender())
 
@@ -397,10 +405,10 @@ func (n *Node) unmarshalTransaction(txBytes []byte) (*api.Transaction, error) {
 	if err != nil {
 		return nil, err
 	}
-	return n.prepareNormalTx(&tx)
+	return n.prepareNormalTx(&tx, api.TRANSACTION_STATUS_ON_CHAIN)
 }
 
-func (n *Node) prepareNormalTx(tx *transaction.Transaction) (*api.Transaction, error) {
+func (n *Node) prepareNormalTx(tx *transaction.Transaction, status string) (*api.Transaction, error) {
 
 	hash, err := tools.CalculateHash(n.internalMarshalizer, n.hasher, tx.RawData)
 	if err != nil {
@@ -410,11 +418,6 @@ func (n *Node) prepareNormalTx(tx *transaction.Transaction) (*api.Transaction, e
 	signature := make([]string, 0)
 	for _, s := range tx.Signature {
 		signature = append(signature, hex.EncodeToString(s))
-	}
-
-	status := api.TRANSACTION_STATUS_PENDING
-	if tx.Block > 0 {
-		status = api.TRANSACTION_STATUS_ON_CHAIN
 	}
 
 	return &api.Transaction{

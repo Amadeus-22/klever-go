@@ -693,14 +693,30 @@ func TestSubslotEndSlot_IsConsensusHeaderReceived_HeaderNotReceivedShouldReturnF
 func TestSubslotEndSlot_IsConsensusHeaderReceivedShouldReturnTrue(t *testing.T) {
 	t.Parallel()
 
-	hdr := &block.Block{Header: &block.BlockHeader{Nonce: 37}}
+	inner := &block.BlockHeader{Nonce: 37}
+	local := &block.Block{Header: inner, TxResults: []uint32{0}}
+	received := &block.Block{
+		Header:            inner,
+		TxResults:         []uint32{7},
+		PubKeysBitmap:     []byte{1},
+		Signature:         []byte("sig"),
+		ProducerSignature: []byte("leader sig"),
+	}
 	sr := *initSubslotEndSlot()
-	sr.Header = hdr
-	sr.AddReceivedHeader(hdr)
+	sr.Header = local
+	sr.AddReceivedHeader(received)
 
 	res, retHdr := sr.IsConsensusHeaderReceived()
 	assert.True(t, res)
-	assert.Equal(t, hdr, retHdr)
+	require.NotNil(t, retHdr)
+	assert.NotSame(t, received, retHdr)
+	assert.NotSame(t, local, retHdr)
+	assert.Equal(t, local.GetNonce(), retHdr.GetNonce())
+	assert.Equal(t, local.GetTxResults(), retHdr.GetTxResults())
+	assert.Equal(t, received.GetPubKeysBitmap(), retHdr.GetPubKeysBitmap())
+	assert.Equal(t, received.GetSignature(), retHdr.GetSignature())
+	assert.Equal(t, received.GetProducerSignature(), retHdr.GetProducerSignature())
+	assert.Nil(t, local.GetSignature())
 }
 
 func TestSubslotEndSlot_HaveConsensusHeaderWithFullInfoNilHdrShouldNotWork(t *testing.T) {
@@ -1083,4 +1099,69 @@ func TestSubslotEndSlot_DoEndSlotJobByParticipantWithCurrentSlotShouldReturnTrue
 	sr.SetStatus(3, slot.SsNotFinished)
 
 	assert.True(t, sr.DoEndSlotJobByParticipant(&consensus.Message{}))
+}
+
+func TestSubslotEndSlot_DoEndSlotJobByParticipant_CommitBlockErrShouldCancelSlot(t *testing.T) {
+	t.Parallel()
+
+	container := mock.InitConsensusCore()
+	commitCalls := 0
+	blProcMock := mock.InitBlockProcessorMock()
+	blProcMock.CommitBlockCalled = func(header data.HeaderHandler) error {
+		commitCalls++
+		if commitCalls == 1 {
+			return blockchain.ErrHeaderUnitNil
+		}
+		return nil
+	}
+	container.SetBlockProcessor(blProcMock)
+
+	sr := *initSubslotEndSlotWithContainer(container)
+	hdr := &block.Block{Header: &block.BlockHeader{Nonce: 37}}
+	sr.Header = hdr
+	sr.AddReceivedHeader(hdr)
+	sr.SetStatus(2, slot.SsFinished)
+	sr.SetStatus(3, slot.SsNotFinished)
+
+	assert.False(t, sr.DoEndSlotJobByParticipant(nil))
+	assert.True(t, sr.SlotCanceled)
+
+	assert.False(t, sr.DoEndSlotJobByParticipant(&consensus.Message{}))
+	assert.Equal(t, 1, commitCalls)
+}
+
+func TestSubslotEndSlot_DoEndSlotJobByParticipant_ShouldCommitProcessedBodyWithReceivedSignatures(t *testing.T) {
+	t.Parallel()
+
+	container := mock.InitConsensusCore()
+	var committed data.HeaderHandler
+	blProcMock := mock.InitBlockProcessorMock()
+	blProcMock.CommitBlockCalled = func(header data.HeaderHandler) error {
+		committed = header
+		return nil
+	}
+	container.SetBlockProcessor(blProcMock)
+
+	sr := *initSubslotEndSlotWithContainer(container)
+	inner := &block.BlockHeader{Nonce: 37, TxCount: 1}
+	local := &block.Block{Header: inner, TxHashes: [][]byte{[]byte("tx")}, TxResults: []uint32{0}}
+	received := &block.Block{
+		Header:            inner,
+		TxHashes:          [][]byte{[]byte("tx")},
+		TxResults:         []uint32{7},
+		PubKeysBitmap:     []byte{1},
+		Signature:         []byte("sig"),
+		ProducerSignature: []byte("leader sig"),
+	}
+	sr.Header = local
+	sr.AddReceivedHeader(received)
+	sr.SetStatus(2, slot.SsFinished)
+	sr.SetStatus(3, slot.SsNotFinished)
+
+	require.True(t, sr.DoEndSlotJobByParticipant(nil))
+	require.NotNil(t, committed)
+	assert.Equal(t, local.GetTxResults(), committed.GetTxResults())
+	assert.Equal(t, received.GetSignature(), committed.GetSignature())
+	assert.Equal(t, received.GetPubKeysBitmap(), committed.GetPubKeysBitmap())
+	assert.Equal(t, received.GetProducerSignature(), committed.GetProducerSignature())
 }

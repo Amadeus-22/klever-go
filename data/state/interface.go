@@ -285,6 +285,9 @@ type AccountsCacher interface {
 	/// Deprecated Update account has no effect now, only save account data prior AccountsCacher fork for backward compatibility
 	UpdatePeer(account AccountHandler) error
 	GetCode(codeHash []byte) []byte
+	// RemoveCode is the pre-FixAuditChangesV6 contract code removal, kept for replay. It
+	// decrements the shared code entry eagerly and is not idempotent: do not call it once
+	// the fork is active; clear the account's code and let the account save adjust it.
 	RemoveCode(address []byte) error
 	IsInterfaceNil() bool
 }

@@ -343,6 +343,31 @@ func (a *accountsKapp) computeSplitRoyalties(address string, assetID []byte, ass
 	return transaction.Transaction_Ok, nil
 }
 
+// paySplitRoyalties pays each split its share of value, in sorted key order. percentOf picks which split
+// percentage applies: the fixed or the percentage transfer royalty.
+//
+// Royalties are skipped for SC senders, so these receipts never become a contract's output transfers;
+// sorting changes receipt order only and needs no fork gate.
+func (a *accountsKapp) paySplitRoyalties(
+	splits map[string]*kapps.RoyaltySplitData,
+	assetID []byte,
+	assetType kapps.KDAData_EnumAssetType,
+	acntSrc state.UserAccountHandler,
+	value int64,
+	percentOf func(*kapps.RoyaltySplitData) uint32,
+	royaltiesToPay *int64,
+) (transaction.Transaction_TXResultCode, error) {
+	for _, key := range types.OrderedKeys(splits, true) {
+		percentage := int64(percentOf(splits[key]))
+		status, err := a.computeSplitRoyalties(key, assetID, assetType, acntSrc, value, percentage, royaltiesToPay)
+		if err != nil {
+			return status, err
+		}
+	}
+
+	return transaction.Transaction_Ok, nil
+}
+
 func (a *accountsKapp) processFixedRoyaltiesTransfer(tc *transaction.TransferContract, acntSrc, acntDst state.UserAccountHandler, kda *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	if core.IsSmartContractAddress(acntSrc.AddressBytes()) ||
 		kda.Royalties == nil ||
@@ -369,11 +394,17 @@ func (a *accountsKapp) processFixedRoyaltiesTransfer(tc *transaction.TransferCon
 	}
 
 	royaltiesFixedToPay := kda.Royalties.TransferFixed
-	for key, value := range kda.Royalties.SplitRoyalties {
-		status, err := a.computeSplitRoyalties(key, kdautils.KLVIdentifier, kapps.KDAData_Fungible, acntSrc, kda.Royalties.TransferFixed, int64(value.PercentTransferFixed), &royaltiesFixedToPay)
-		if err != nil {
-			return status, err
-		}
+	status, err := a.paySplitRoyalties(
+		kda.Royalties.SplitRoyalties,
+		kdautils.KLVIdentifier,
+		kapps.KDAData_Fungible,
+		acntSrc,
+		kda.Royalties.TransferFixed,
+		(*kapps.RoyaltySplitData).GetPercentTransferFixed,
+		&royaltiesFixedToPay,
+	)
+	if err != nil {
+		return status, err
 	}
 
 	if royaltiesFixedToPay <= 0 {
@@ -464,11 +495,17 @@ func (a *accountsKapp) processPercentageRoyaltiesTransfer(tc *transaction.Transf
 		}
 	}
 
-	for key, value := range kda.Royalties.SplitRoyalties {
-		status, err := a.computeSplitRoyalties(key, assetID, kda.AssetType, acntSrc, royaltyAmount, int64(value.PercentTransferPercentage), &royaltiesToPay)
-		if err != nil {
-			return status, err
-		}
+	status, err = a.paySplitRoyalties(
+		kda.Royalties.SplitRoyalties,
+		assetID,
+		kda.AssetType,
+		acntSrc,
+		royaltyAmount,
+		(*kapps.RoyaltySplitData).GetPercentTransferPercentage,
+		&royaltiesToPay,
+	)
+	if err != nil {
+		return status, err
 	}
 
 	if royaltiesToPay <= 0 {
@@ -636,6 +673,12 @@ func (a *accountsKapp) processFungibleTransfer(tc *transaction.TransferContract,
 	return transaction.Transaction_Ok, nil
 }
 
+type claimRecords struct {
+	staking *kapps.StakingData
+	kda     *kapps.KDAData
+	userKDA *kapps.UserKDA
+}
+
 func (a *accountsKapp) ClaimBalance(
 	claimType transaction.ClaimContract_EnumClaimType,
 	assetID []byte,
@@ -644,6 +687,17 @@ func (a *accountsKapp) ClaimBalance(
 	staking *kapps.StakingData,
 	kda *kapps.KDAData,
 	userKDA *kapps.UserKDA,
+) (map[string]int64, error) {
+	return a.claimBalance(claimType, assetID, block, acc, claimRecords{staking: staking, kda: kda, userKDA: userKDA}, true)
+}
+
+func (a *accountsKapp) claimBalance(
+	claimType transaction.ClaimContract_EnumClaimType,
+	assetID []byte,
+	block *block.Block,
+	acc state.UserAccountHandler,
+	rec claimRecords,
+	dropUncreditedAPRGain bool,
 ) (map[string]int64, error) {
 	// Market claim does not update balance based on staking process, return here
 	if claimType == transaction.ClaimContract_MarketClaim {
@@ -658,11 +712,12 @@ func (a *accountsKapp) ClaimBalance(
 		assetID,
 		epoch,
 		blockTime,
-		staking,
-		kda,
-		userKDA,
+		rec.staking,
+		rec.kda,
+		rec.userKDA,
 		a.forkController,
 	)
+	gains, err = a.recordDroppedAPRGain(gains, err, assetID, dropUncreditedAPRGain)
 	if err != nil {
 		return nil, err
 	}
@@ -670,8 +725,8 @@ func (a *accountsKapp) ClaimBalance(
 	if claimType == transaction.ClaimContract_StakingClaim {
 		if a.forkController.ClaimKFI() ||
 			gains[string(assetID)] > 0 {
-			userKDA.LastClaim.Timestamp = blockTime
-			userKDA.LastClaim.Epoch = epoch
+			rec.userKDA.LastClaim.Timestamp = blockTime
+			rec.userKDA.LastClaim.Epoch = epoch
 		}
 	}
 
@@ -679,7 +734,7 @@ func (a *accountsKapp) ClaimBalance(
 		if value > 0 {
 			var userKDAToUpdate *kapps.UserKDA
 			if bytes.Equal([]byte(key), assetID) {
-				userKDAToUpdate = userKDA
+				userKDAToUpdate = rec.userKDA
 			}
 
 			err = acc.AddToBalance(value, []byte(key), a.forkController.EnableSmartContracts(), userKDAToUpdate)
@@ -690,6 +745,73 @@ func (a *accountsKapp) ClaimBalance(
 	}
 
 	return gains, nil
+}
+
+// checkPausedStakingAsset refuses, once FixAuditChangesV6 is active, the staking operations on a
+// paused asset, whatever the interest type of its pool. ClaimStaking, Freeze, Unfreeze and Withdraw
+// all run the claim, so refusing only the first would let a Freeze top-up collect the rewards
+// anyway. A paused reward currency of another asset's pool refuses nothing here: that pool keeps
+// paying it.
+func (a *accountsKapp) checkPausedStakingAsset(kda *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
+	if !a.forkController.FixAuditChangesV6() ||
+		!kda.GetAttributes().GetIsPaused() {
+		return transaction.Transaction_Ok, nil
+	}
+
+	ctx := a.KAppController.GetCurrentKAppContext()
+	ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetPaused, process.ErrAssetIsPaused.Error())
+
+	return transaction.Transaction_AssetPaused, process.ErrAssetIsPaused
+}
+
+// stakingClaimState is what a claim on an asset's staking pool reads and writes back.
+type stakingClaimState struct {
+	stakingKapp state.KAppAccountHandler
+	kdaKapp     state.KAppAccountHandler
+	claimRecords
+}
+
+// loadStakingClaimState loads the staking, asset and holder records of a claim on the asset's pool,
+// and refuses a paused asset.
+func (a *accountsKapp) loadStakingClaimState(
+	ownerAcc state.UserAccountHandler,
+	assetID []byte,
+) (*stakingClaimState, transaction.Transaction_TXResultCode, error) {
+	stakingKapp, staking, err := a.KAppController.GetKDAKApp().GetStaking(assetID)
+	if err != nil {
+		return nil, transaction.Transaction_AssetError, err
+	}
+
+	kdaKapp, kda, err := a.KAppController.GetKDAKApp().GetKDA(assetID)
+	if err != nil {
+		return nil, transaction.Transaction_KAPPError, err
+	}
+
+	userKDA, err := ownerAcc.GetUserKDA(assetID, nil, a.forkController.EnableSmartContracts())
+	if err != nil {
+		return nil, transaction.Transaction_AccountError, err
+	}
+
+	if resultCode, errPaused := a.checkPausedStakingAsset(kda); errPaused != nil {
+		return nil, resultCode, errPaused
+	}
+
+	return &stakingClaimState{
+		stakingKapp:  stakingKapp,
+		kdaKapp:      kdaKapp,
+		claimRecords: claimRecords{staking: staking, kda: kda, userKDA: userKDA},
+	}, transaction.Transaction_Ok, nil
+}
+
+func (a *accountsKapp) recordDroppedAPRGain(gains map[string]int64, err error, assetID []byte, drop bool) (map[string]int64, error) {
+	if !drop || !errors.Is(err, state.ErrAPRGainDropped) {
+		return gains, err
+	}
+
+	ctx := a.KAppController.GetCurrentKAppContext()
+	ctx.Receipts().Add(txProcess.NewReceipt(txProcess.Warning, ctx.ContractID(), []byte(common.ErrFieldAPRGainDropped), assetID))
+
+	return nil, nil
 }
 
 func (a *accountsKapp) updateFPRTotalStake(
@@ -773,6 +895,23 @@ func (a *accountsKapp) Freeze(sender []byte, tc *transaction.FreezeContract) (tr
 		return transaction.Transaction_AssetError, err
 	}
 
+	if resultCode, errPaused := a.checkPausedStakingAsset(kda); errPaused != nil {
+		return resultCode, errPaused
+	}
+
+	var bucketID = assetID
+	if bytes.Equal(assetID, kdautils.KLVIdentifier) || bytes.Equal(assetID, kdautils.KFIIdentifier) {
+		bucketID = kdautils.ToBucketID(a.hasher, ctx.Block().GetRandSeed(), sender, assetID, ctx.TxNonce(), ctx.ContractID(), tc.GetAmount())
+
+		// Inside a contract call the ID ignores the outer sender and tx, so equal freezes in one tx, or by
+		// two users at the same nonce in one block, collide. Merging into a delegated bucket would drop
+		// its delegation while the validator still books it.
+		if a.forkController.FixAuditChangesV6() && len(userKDA.GetBuckets()[hex.EncodeToString(bucketID)].GetDelegation()) > 0 {
+			ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidBucketID, common.ErrBucketAlreadyDelegated.Error())
+			return transaction.Transaction_BucketIDInvalid, common.ErrBucketAlreadyDelegated
+		}
+	}
+
 	gains, err := a.ClaimBalance(transaction.ClaimContract_StakingClaim, assetID, ctx.Block(), ownerAcc, staking, kda, userKDA)
 	if err != nil && !errors.Is(err, state.ErrClaimNotAvailable) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldClaimError, err.Error())
@@ -789,11 +928,6 @@ func (a *accountsKapp) Freeze(sender []byte, tc *transaction.FreezeContract) (tr
 	if err != nil {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldBalanceError, err.Error())
 		return transaction.Transaction_BalanceError, err
-	}
-
-	var bucketID = assetID
-	if bytes.Equal(assetID, kdautils.KLVIdentifier) || bytes.Equal(assetID, kdautils.KFIIdentifier) {
-		bucketID = kdautils.ToBucketID(a.hasher, ctx.Block().GetRandSeed(), sender, assetID, ctx.TxNonce(), ctx.ContractID(), tc.GetAmount())
 	}
 
 	err = ownerAcc.Freeze(assetID, bucketID, value, staking, userKDA, state.FreezeOptions{
@@ -927,6 +1061,10 @@ func (a *accountsKapp) Unfreeze(
 	userKDA, err := ownerAcc.GetUserKDA(assetID, nil, a.forkController.EnableSmartContracts())
 	if err != nil {
 		return transaction.Transaction_AssetError, err
+	}
+
+	if resultCode, errPaused := a.checkPausedStakingAsset(kda); errPaused != nil {
+		return resultCode, errPaused
 	}
 
 	// Claim any pending rewards
@@ -1677,20 +1815,12 @@ func (a *accountsKapp) Withdraw(sender []byte, tc *transaction.WithdrawContract)
 		return transaction.Transaction_LoadAccountError, err
 	}
 
-	stakingKapp, staking, err := a.KAppController.GetKDAKApp().GetStaking(assetID)
+	claimState, resultCode, err := a.loadStakingClaimState(ownerAcc, assetID)
 	if err != nil {
-		return transaction.Transaction_AssetError, err
+		return resultCode, err
 	}
-
-	kdaKapp, kda, err := a.KAppController.GetKDAKApp().GetKDA(assetID)
-	if err != nil {
-		return transaction.Transaction_KAPPError, err
-	}
-
-	userKDA, err := ownerAcc.GetUserKDA(assetID, nil, a.forkController.EnableSmartContracts())
-	if err != nil {
-		return transaction.Transaction_AccountError, err
-	}
+	stakingKapp, staking := claimState.stakingKapp, claimState.staking
+	kdaKapp, kda, userKDA := claimState.kdaKapp, claimState.kda, claimState.userKDA
 
 	gains, err := a.ClaimBalance(transaction.ClaimContract_StakingClaim, assetID, ctx.Block(), ownerAcc, staking, kda, userKDA)
 	if err != nil && !errors.Is(err, state.ErrClaimNotAvailable) {
@@ -1785,22 +1915,14 @@ func (a *accountsKapp) ClaimStaking(sender []byte, tc *transaction.ClaimContract
 		assetID = kdautils.KLVIdentifier
 	}
 
-	stakingKapp, staking, err := a.KAppController.GetKDAKApp().GetStaking(assetID)
+	claimState, resultCode, err := a.loadStakingClaimState(ownerAcc, assetID)
 	if err != nil {
-		return transaction.Transaction_AssetError, err
+		return resultCode, err
 	}
+	stakingKapp, staking := claimState.stakingKapp, claimState.staking
+	kdaKapp, kda, userKDA := claimState.kdaKapp, claimState.kda, claimState.userKDA
 
-	kdaKapp, kda, err := a.KAppController.GetKDAKApp().GetKDA(assetID)
-	if err != nil {
-		return transaction.Transaction_KAPPError, err
-	}
-
-	userKDA, err := ownerAcc.GetUserKDA(assetID, nil, a.forkController.EnableSmartContracts())
-	if err != nil {
-		return transaction.Transaction_AccountError, err
-	}
-
-	gains, err := a.ClaimBalance(transaction.ClaimContract_StakingClaim, assetID, ctx.Block(), ownerAcc, staking, kda, userKDA)
+	gains, err := a.claimBalance(transaction.ClaimContract_StakingClaim, assetID, ctx.Block(), ownerAcc, claimState.claimRecords, false)
 	if err != nil {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldClaimNotAvailable, err.Error())
 		return claimErrorResultCode(err, transaction.Transaction_ClaimError), err

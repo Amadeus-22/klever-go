@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/klever-io/klever-go/common"
 	commonMock "github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/core"
@@ -138,6 +139,42 @@ func TestInitKApps_SetProposalControllerOverwrites(t *testing.T) {
 	require.NoError(t, controller.SetProposalController(shared))
 	require.Same(t, shared, controller.GetProposalController(),
 		"node.go must be able to replace the InitKApps instance with the shared one")
+
+	require.ErrorIs(t, controller.SetProposalController(nil), common.ErrNilProposalController)
+	require.Same(t, shared, controller.GetProposalController(),
+		"a rejected nil must not un-wire the controller")
+}
+
+// kappControllerSimulator is read by the REST simulate path while StartConsensus
+// sets it, so Get and Set must not race.
+func TestInitKApps_SetProposalControllerConcurrently(t *testing.T) {
+	t.Parallel()
+
+	shared, err := kapps.NewProposalController(testArgs(t).ForkController)
+	require.NoError(t, err)
+
+	proposalKApp := &commonMock.KAppAccountHandlerStub{
+		StartProposalsKAppCalled: func(_ core.ForkController) (kapps.ActiveProposalController, error) {
+			return shared, nil
+		},
+	}
+
+	controller, err := NewKappController(testArgs(t))
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			_ = controller.GetProposalController()
+		}
+	}()
+
+	require.NoError(t, controller.InitKApps(cacherOverProposalKApp(t, proposalKApp)))
+	require.NoError(t, controller.SetProposalController(shared))
+	<-done
+
+	require.Same(t, shared, controller.GetProposalController())
 }
 
 // A failure starting the proposals kapp must abort InitKApps rather than leaving a

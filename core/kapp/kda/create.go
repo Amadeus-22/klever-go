@@ -431,6 +431,11 @@ func (k *kdaKapp) createFungible(ctx kapp.KappContext, tc *transaction.CreateAss
 	}
 
 	if asset.Properties.CanFreeze {
+		err = k.validateStakingAPR(tc.GetStaking())
+		if err != nil {
+			return transaction.Transaction_ParameterInvalid, err
+		}
+
 		stakingKapp, _, err := k.GetStaking(nil)
 		if err != nil {
 			return transaction.Transaction_AssetError, err

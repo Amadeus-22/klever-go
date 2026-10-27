@@ -53,6 +53,12 @@ func NewTransactionCostEstimator(
 
 // EstimateTransactionGas will calculate how many gas units a transaction will consume
 func (tce *transactionCostEstimator) EstimateTransactionGas(tx *transaction.Transaction) (*transaction.CostResponse, error) {
+	// checked once, whatever the gas limit is, so a request before wiring never
+	// comes back as a success-shaped CostResponse with an out-of-gas RetMessage
+	if !tce.feeHandler.IsProposalControllerSet() {
+		return nil, process.ErrProposalNotInitialized
+	}
+
 	tce.addMissingFieldsIfNeeded(tx)
 
 	res, err := tce.txSimulator.ProcessTx(tx)

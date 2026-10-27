@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -824,6 +828,8 @@ func TestMetaProcessor_ProcessBlockEpochStartErrorShouldNotApplySideEffects(t *t
 	tests := []struct {
 		name        string
 		errContains string
+		errIs       []error
+		errIsNot    []error
 		prepare     func(hdr *block.Block, arguments *blproc.ArgMetaProcessor)
 	}{
 		{
@@ -879,6 +885,7 @@ func TestMetaProcessor_ProcessBlockEpochStartErrorShouldNotApplySideEffects(t *t
 		{
 			name:        "account trie root does not match",
 			errContains: process.ErrRootStateDoesNotMatch.Error(),
+			errIs:       []error{process.ErrRootStateDoesNotMatch, process.ErrBlockExecutionNotMatchingHeader},
 			prepare: func(hdr *block.Block, _ *blproc.ArgMetaProcessor) {
 				hdr.Header.TrieRoot = []byte("another root hash")
 			},
@@ -895,8 +902,22 @@ func TestMetaProcessor_ProcessBlockEpochStartErrorShouldNotApplySideEffects(t *t
 			},
 		},
 		{
+			name:        "validator statistics root hash does not match the header",
+			errContains: process.ErrValidatorStatsRootHashDoesNotMatch.Error(),
+			errIs:       []error{process.ErrValidatorStatsRootHashDoesNotMatch},
+			errIsNot:    []error{process.ErrBlockExecutionNotMatchingHeader},
+			prepare: func(_ *block.Block, arguments *blproc.ArgMetaProcessor) {
+				arguments.ValidatorStatisticsProcessor = &mock.ValidatorStatisticsProcessorStub{
+					UpdatePeerStateCalled: func(_ data.HeaderHandler, _ data.HeaderHandler) ([]byte, error) {
+						return []byte("another validators root hash"), nil
+					},
+				}
+			},
+		},
+		{
 			name:        "kapp trie root does not match",
 			errContains: process.ErrRootStateDoesNotMatch.Error(),
+			errIs:       []error{process.ErrRootStateDoesNotMatch, process.ErrBlockExecutionNotMatchingHeader},
 			prepare: func(hdr *block.Block, _ *blproc.ArgMetaProcessor) {
 				// verifyKAppRootHash is the last check before the side effects
 				hdr.Header.KAppsTrieRoot = []byte("another kapp root hash")
@@ -947,6 +968,12 @@ func TestMetaProcessor_ProcessBlockEpochStartErrorShouldNotApplySideEffects(t *t
 			err = mp.ProcessBlock(hdr, haveTime)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tt.errContains)
+			for _, expected := range tt.errIs {
+				require.ErrorIs(t, err, expected)
+			}
+			for _, unexpected := range tt.errIsNot {
+				assert.False(t, errors.Is(err, unexpected))
+			}
 
 			assert.Zero(t, setEpochValidatorsCalls, "rejected epoch start block must not update the nodes coordinator")
 			assert.Zero(t, indexerCalls, "rejected epoch start block must not notify the indexer")
@@ -1159,12 +1186,19 @@ func TestMetaProcessor_RejectedEpochStartMustRollBackProposalParameters(t *testi
 		})
 	}
 
-	newProcessor := func(t *testing.T) *blproc.MetaProcessorForTests {
+	// onRevert, when set, runs inside the accounts revert, which the rejection
+	// path calls right before it restores the proposal parameters
+	newProcessor := func(t *testing.T, onRevert func()) (*blproc.MetaProcessorForTests, kapps.ActiveProposalController) {
 		arguments := createMockMetaArguments()
 		arguments.AccountsDB[state.UserAccountsState] = &mock.AccountsStub{
-			JournalLenCalled:       func() int { return 0 },
-			RootHashCalled:         func() ([]byte, error) { return []byte("roothash"), nil },
-			RevertToSnapshotCalled: func(_ int) error { return nil },
+			JournalLenCalled: func() int { return 0 },
+			RootHashCalled:   func() ([]byte, error) { return []byte("roothash"), nil },
+			RevertToSnapshotCalled: func(_ int) error {
+				if onRevert != nil {
+					onRevert()
+				}
+				return nil
+			},
 		}
 
 		mpp, err := blproc.NewMetaProcessor(arguments)
@@ -1179,12 +1213,12 @@ func TestMetaProcessor_RejectedEpochStartMustRollBackProposalParameters(t *testi
 
 		SetProposal(t, mp, seedActiveProposal)
 
-		return mp
+		return mp, controller
 	}
 
 	// settling applies the parameter immediately: readers later in the same
 	// epoch start run depend on seeing it
-	mp := newProcessor(t)
+	mp, _ := newProcessor(t, nil)
 	initialValue := mp.GetActiveParameters()[paramKey].Value
 	require.NotEqual(t, settledValue, initialValue, "the test parameter must actually change")
 
@@ -1194,12 +1228,93 @@ func TestMetaProcessor_RejectedEpochStartMustRollBackProposalParameters(t *testi
 		"settling must apply the parameter in place for the rest of the run")
 
 	// but a block rejected afterwards must leave nothing behind
-	mp = newProcessor(t)
+	mp, _ = newProcessor(t, nil)
 	err = mp.ProcessBlock(newHeader(), haveTime)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), process.ErrRootStateDoesNotMatch.Error())
 	assert.Equal(t, initialValue, mp.GetActiveParameters()[paramKey].Value,
 		"a rejected epoch start block must not leave settled parameters behind")
+
+	// KLR-18 residual: the rollback is a write to the same set the API and the
+	// fee path read from other goroutines. Readers must never see a partially
+	// restored set, nor a value that was never live. Meaningful under -race.
+	t.Run("concurrent API and fee reads during the rollback", func(t *testing.T) {
+		// The accounts revert runs right before the restore, with the settled
+		// set still live. Holding it until the readers are looping guarantees
+		// they overlap the restore instead of relying on the scheduler.
+		const minReadsBeforeRestore = 100
+		var reads, readsAtRevert atomic.Int64
+		waitForReaders := func() {
+			deadline := time.Now().Add(5 * time.Second)
+			for reads.Load() < minReadsBeforeRestore && time.Now().Before(deadline) {
+				runtime.Gosched()
+			}
+			readsAtRevert.CompareAndSwap(0, reads.Load())
+		}
+
+		mp, controller := newProcessor(t, waitForReaders)
+		fullLen := len(mp.GetActiveParameters())
+		initialInt := controller.GetParameterInt(kapps.EnumParameter(paramKey))
+		settledInt := int64(1234)
+
+		// keep only the first failure: the readers loop until ProcessBlock
+		// returns, so reporting each one would repeat it thousands of times
+		var firstFailure atomic.Pointer[string]
+		fail := func(format string, args ...any) {
+			msg := fmt.Sprintf(format, args...)
+			firstFailure.CompareAndSwap(nil, &msg)
+		}
+
+		done := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-done:
+						return
+					default:
+					}
+
+					// API path (Node.GetProposalParameters)
+					params := mp.GetActiveParameters()
+					if len(params) != fullLen {
+						fail("API read returned %d parameters, want %d", len(params), fullLen)
+						return
+					}
+					param := params[paramKey]
+					if param == nil || (!bytes.Equal(param.Value, initialValue) && !bytes.Equal(param.Value, settledValue)) {
+						fail("API read returned parameter %d = %v, want %q or %q", paramKey, param, initialValue, settledValue)
+						return
+					}
+
+					// fee path (EconomicsData.GetParameterInt)
+					value := controller.GetParameterInt(kapps.EnumParameter(paramKey))
+					if value != initialInt && value != settledInt {
+						fail("fee read returned %d, want %d or %d", value, initialInt, settledInt)
+						return
+					}
+
+					reads.Add(1)
+				}
+			}()
+		}
+
+		err := mp.ProcessBlock(newHeader(), haveTime)
+		close(done)
+		wg.Wait()
+
+		if msg := firstFailure.Load(); msg != nil {
+			t.Fatal(*msg)
+		}
+		require.GreaterOrEqual(t, readsAtRevert.Load(), int64(minReadsBeforeRestore),
+			"the readers must already be running when the rollback restores the parameters")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), process.ErrRootStateDoesNotMatch.Error())
+		assert.Equal(t, initialValue, mp.GetActiveParameters()[paramKey].Value)
+	})
 }
 
 // Round trip over an epoch start block: the proposer applies the side effects
@@ -1477,7 +1592,7 @@ func TestMetaProcessor_ProcessBlockWithMismatchedTxResultsCount(t *testing.T) {
 				Slot:    11,
 				TxCount: 1,
 			},
-			TxHashes:  [][]byte{[]byte("txHash")},
+			TxHashes:  [][]byte{(&sha256.Sha256{}).Compute("txHash")},
 			TxResults: txResults,
 		}
 	}
@@ -1508,13 +1623,13 @@ func TestMetaProcessor_ProcessBlockWithMismatchedTxResultsCount(t *testing.T) {
 	t.Run("missing tx results", func(t *testing.T) {
 		t.Parallel()
 
-		assert.Equal(t, process.ErrInvalidTXResultsCount, processBlock(t, nil, nil))
+		assert.ErrorIs(t, processBlock(t, nil, nil), process.ErrInvalidTXResultsCount)
 	})
 
 	t.Run("more tx results than tx hashes", func(t *testing.T) {
 		t.Parallel()
 
-		assert.Equal(t, process.ErrInvalidTXResultsCount, processBlock(t, []uint32{0, 0}, nil))
+		assert.ErrorIs(t, processBlock(t, []uint32{0, 0}, nil), process.ErrInvalidTXResultsCount)
 	})
 
 	t.Run("fork disabled: mismatch is not rejected here", func(t *testing.T) {
@@ -1527,7 +1642,7 @@ func TestMetaProcessor_ProcessBlockWithMismatchedTxResultsCount(t *testing.T) {
 
 		// The gate being inert must be observable, so pin the check the header
 		// falls through to instead of merely asserting the gate's error is absent.
-		assert.Equal(t, process.ErrTxRootHashDoesNotMatch, err)
+		assert.ErrorIs(t, err, process.ErrTxRootHashDoesNotMatch)
 	})
 }
 
@@ -1589,13 +1704,13 @@ func TestMetaProcessor_ProcessBlockRejectsMismatchedTxResultsOnFirstBlockOfActiv
 			Epoch:   activationEpoch,
 			TxCount: 1,
 		},
-		TxHashes:  [][]byte{[]byte("txHash")},
+		TxHashes:  [][]byte{(&sha256.Sha256{}).Compute("txHash")},
 		TxResults: nil,
 	}
 
 	err = mp.ProcessBlock(header, haveTime)
 
-	assert.Equal(t, process.ErrInvalidTXResultsCount, err)
+	assert.ErrorIs(t, err, process.ErrInvalidTXResultsCount)
 	assert.False(t, epochAdvanced,
 		"the header must be rejected before the epoch notifier is advanced, otherwise the "+
 			"gate is being read from the notifier instead of from the header's own epoch")
@@ -1785,6 +1900,26 @@ func TestMetaProcessor_CommitBlockStorageFailsForHeaderShouldErr(t *testing.T) {
 func TestMetaProcessor_CommitBlockOkValsShouldWork(t *testing.T) {
 	t.Parallel()
 
+	commitBlockOkVals(t, &mock.TransactionCoordinatorMock{})
+}
+
+// SC logs reach storage only through CommitBlock, and a flush failure must not fail it.
+func TestMetaProcessor_CommitBlockFlushesLogsOnce(t *testing.T) {
+	t.Parallel()
+
+	for _, flushErr := range []error{nil, errors.New("log flush failure")} {
+		flushCalls := 0
+		commitBlockOkVals(t, &mock.TransactionCoordinatorMock{
+			SaveLogsToStorageCalled: func() error {
+				flushCalls++
+				return flushErr
+			},
+		})
+		assert.Equal(t, 1, flushCalls)
+	}
+}
+
+func commitBlockOkVals(t *testing.T, txCoordinator process.TransactionCoordinator) {
 	mdp := initDataPool([]byte("tx_hash"))
 	rootHash := []byte("rootHash")
 	hdr := createMetaBlockHeader()
@@ -1827,6 +1962,7 @@ func TestMetaProcessor_CommitBlockOkValsShouldWork(t *testing.T) {
 	arguments.DataPool = mdp
 	arguments.AccountsDB[state.UserAccountsState] = accounts
 	arguments.AccountsDB[state.PeerAccountsState] = accounts
+	arguments.TxCoordinator = txCoordinator
 	arguments.ForkDetector = fd
 	arguments.Store = store
 	arguments.Hasher = &mock.HasherStub{
@@ -2154,6 +2290,7 @@ func TestMetaProcessor_ProcessProposalEndOfEpoch(t *testing.T) {
 		// only fired once the block is verified
 		proposalsToIndex []string
 		err              interface{}
+		forks            core.ForkController
 	}{
 		{
 			name: "Error ProposalController",
@@ -2293,12 +2430,17 @@ func TestMetaProcessor_ProcessProposalEndOfEpoch(t *testing.T) {
 			},
 			check: map[int32][]byte{1: []byte("50000000000")},
 			err:   "strconv.ParseInt: parsing \"invalid\": invalid syntax",
+			// before FixAuditChangesV6 an invalid approved value fails the block
+			forks: mock.NewForkControllerStub().SetFork("FixAuditChangesV6", false),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			arguments := createMockMetaArguments()
+			if tt.forks != nil {
+				arguments.ForkController = tt.forks
+			}
 			mpp, err := blproc.NewMetaProcessor(arguments)
 			require.NoError(t, err)
 			mp := blproc.NewMetaProcessorForTests(mpp)
@@ -2324,6 +2466,245 @@ func TestMetaProcessor_ProcessProposalEndOfEpoch(t *testing.T) {
 			}
 		})
 	}
+}
+
+// settleApprovedProposal stores proposal 1 as approved with params and settles it at the
+// start of epoch 1.
+func settleApprovedProposal(t *testing.T, mp *blproc.MetaProcessorForTests, params map[int32][]byte) {
+	settleApprovedProposals(t, mp, 1, 1, params)
+}
+
+// settleApprovedProposals stores each params set as an approved proposal, numbered from
+// firstID, and settles them in that order at the start of epoch. The stored parameter set
+// is kept, so a later settlement builds on an earlier one.
+func settleApprovedProposals(t *testing.T, mp *blproc.MetaProcessorForTests, epoch uint32, firstID uint64, params ...map[int32][]byte) {
+	ids := make([]uint64, 0, len(params))
+	SetProposal(t, mp, func(pc *kapps.ProposalController, kApp state.KAppAccountHandler, mp *blproc.MetaProcessorForTests) ([]byte, error) {
+		for i, p := range params {
+			id := firstID + uint64(i)
+			err := mp.SetProposalKApp(kApp, id, &kapps.ProposalData{
+				Parameters: p,
+				Votes:      map[int32]int64{int32(kapps.ProposalData_VoteDetail_Yes): 10},
+			})
+			if err != nil {
+				return nil, err
+			}
+			ids = append(ids, id)
+		}
+
+		pc.ActiveProposals = map[uint32]*kapps.ActiveProposals{epoch: {ProposalIDs: ids}}
+		return mp.GetMarshalizer().Marshal(pc)
+	})
+
+	proposalsToIndex, err := mp.ProcessProposalsEndOfEpoch(&block.Block{Header: &block.BlockHeader{Nonce: 1, Slot: 1, Epoch: epoch}})
+	require.NoError(t, err)
+	require.Len(t, proposalsToIndex, len(params))
+}
+
+func storedProposal(t *testing.T, mp *blproc.MetaProcessorForTests, id uint64) *kapps.ProposalData {
+	acnt, err := mp.GetKAppAdapter().LoadAccount(kapps.ProposalKAppAddress)
+	require.NoError(t, err)
+	kApp, ok := acnt.(state.KAppAccountHandler)
+	require.True(t, ok)
+
+	proposal, err := mp.GetProposalKApp(kApp, id)
+	require.NoError(t, err)
+
+	return proposal
+}
+
+// From FixAuditChangesV6 an approved proposal holding an invalid parameter is denied whole
+// rather than applied in part, and the epoch start block still settles: failing it would
+// fail identically on every node and every retry. Proposals settle one by one, so another
+// proposal in the same epoch still lands.
+func TestMetaProcessor_ProcessProposalEndOfEpochDeniesAProposalWithAnInvalidParameter(t *testing.T) {
+	t.Parallel()
+
+	arguments := createMockMetaArguments()
+	arguments.ForkController = mock.NewForkControllerStub()
+	mpp, err := blproc.NewMetaProcessor(arguments)
+	require.NoError(t, err)
+	mp := blproc.NewMetaProcessorForTests(mpp)
+
+	before := mp.GetActiveParameters()
+	createValidator := int32(kapps.EnumParameter_KAppFeeCreateValidator)
+	transfer := int32(kapps.EnumParameter_KAppFeeTransfer)
+	threshold := int32(kapps.EnumParameter_MinKFIStakedToEnableProposals)
+
+	settleApprovedProposals(t, mp, 1, 1,
+		// a valid fee next to a negative one: neither lands
+		map[int32][]byte{createValidator: []byte("1234"), transfer: []byte("-1")},
+		// above the KFI staked, which no check compares against: an in-range threshold settles
+		map[int32][]byte{threshold: []byte("2000000000000")},
+	)
+
+	assert.Equal(t, kapps.ProposalData_DeniedProposal, storedProposal(t, mp, 1).ProposalStatus)
+	assert.Equal(t, kapps.ProposalData_ApprovedProposal, storedProposal(t, mp, 2).ProposalStatus)
+
+	params := mp.GetActiveParameters()
+	assert.Equal(t, before[createValidator].Value, params[createValidator].Value)
+	assert.Equal(t, before[transfer].Value, params[transfer].Value)
+	assert.Equal(t, []byte("2000000000000"), params[threshold].Value)
+}
+
+// The live parameter set sits outside the accounts snapshot, so both revert paths reload
+// it from the KApp trie: otherwise a slot timeout, a failed commit or a sync rollback past
+// an epoch start leaves the parameters it settled in effect.
+func TestMetaProcessor_RevertReloadsProposalParameters(t *testing.T) {
+	t.Parallel()
+
+	key := int32(kapps.EnumParameter_KAppFeeCreateValidator)
+
+	t.Run("RevertStateToSnapshot", func(t *testing.T) {
+		t.Parallel()
+
+		arguments := createMockMetaArguments()
+		mpp, err := blproc.NewMetaProcessor(arguments)
+		require.NoError(t, err)
+		mp := blproc.NewMetaProcessorForTests(mpp)
+
+		// a committed value other than the default, so only a reload from the trie restores it
+		settleApprovedProposal(t, mp, map[int32][]byte{key: []byte("1234")})
+		_, err = arguments.AccountsDB[state.KAppAccountsState].Commit()
+		require.NoError(t, err)
+
+		settleApprovedProposals(t, mp, 2, 2, map[int32][]byte{key: []byte("5678")})
+		require.Equal(t, []byte("5678"), mp.GetActiveParameters()[key].Value)
+
+		// through the interface Worker.Extend calls it on
+		var blockProcessor process.BlockProcessor = mpp
+		blockProcessor.RevertStateToSnapshot(nil)
+
+		assert.Equal(t, []byte("1234"), mp.GetActiveParameters()[key].Value)
+	})
+
+	t.Run("RevertStateToBlock", func(t *testing.T) {
+		t.Parallel()
+
+		arguments := createMockMetaArguments()
+		arguments.AccountsDB[state.UserAccountsState] = &mock.AccountsStub{
+			RecreateTrieCalled: func([]byte) error { return nil },
+		}
+		mpp, err := blproc.NewMetaProcessor(arguments)
+		require.NoError(t, err)
+		mp := blproc.NewMetaProcessorForTests(mpp)
+
+		// a committed value other than the default, so only a reload from the trie restores it
+		settleApprovedProposal(t, mp, map[int32][]byte{key: []byte("1234")})
+		kappsRoot, err := arguments.AccountsDB[state.KAppAccountsState].Commit()
+		require.NoError(t, err)
+
+		settleApprovedProposals(t, mp, 2, 2, map[int32][]byte{key: []byte("5678")})
+		_, err = arguments.AccountsDB[state.KAppAccountsState].Commit()
+		require.NoError(t, err)
+		require.Equal(t, []byte("5678"), mp.GetActiveParameters()[key].Value)
+
+		err = mpp.RevertStateToBlock(&block.Block{Header: &block.BlockHeader{KAppsTrieRoot: kappsRoot}})
+		require.NoError(t, err)
+
+		assert.Equal(t, []byte("1234"), mp.GetActiveParameters()[key].Value)
+	})
+
+	// Genesis holds no proposal KApp (startup writes it, block 1 commits it), so rolling
+	// block 1 back must fall back to the defaults instead of failing the rollback.
+	t.Run("RevertStateToBlock to genesis", func(t *testing.T) {
+		t.Parallel()
+
+		arguments := createMockMetaArguments()
+		arguments.AccountsDB[state.UserAccountsState] = &mock.AccountsStub{
+			RecreateTrieCalled: func([]byte) error { return nil },
+		}
+		mpp, err := blproc.NewMetaProcessor(arguments)
+		require.NoError(t, err)
+		mp := blproc.NewMetaProcessorForTests(mpp)
+
+		settleApprovedProposal(t, mp, map[int32][]byte{key: []byte("1234")})
+		_, err = arguments.AccountsDB[state.KAppAccountsState].Commit()
+		require.NoError(t, err)
+
+		err = mpp.RevertStateToBlock(&block.Block{Header: &block.BlockHeader{KAppsTrieRoot: trie.EmptyTrieHash}})
+		require.NoError(t, err)
+
+		defaults := kapps.InitialProposalParameters(arguments.ForkController)
+		assert.Equal(t, defaults[key].Value, mp.GetActiveParameters()[key].Value)
+	})
+}
+
+// A node restarted on a committed chain has its epoch notifier at 0 until the first block
+// advances it. If that first block is rejected, the revert must restore the fork flags of the
+// committed head, not of epoch 0: the reload backfills the defaults of the forks active at the
+// restored epoch, and the smart contract ones (GasMultiplier among them) are not in the trie. At
+// epoch 0 they were dropped, every contract call then got 0 gas, and the block failed on its
+// fees on every retry.
+func TestMetaProcessor_RevertOfTheFirstBlockAfterRestartKeepsTheCommittedEpochDefaults(t *testing.T) {
+	t.Parallel()
+
+	const committedEpoch = uint32(5)
+	gasMultiplier := int32(kapps.EnumParameter_GasMultiplier)
+	maxGasPerTX := int32(kapps.EnumParameter_MaxGasPerTX)
+
+	epochNotifier := notifier.NewGenericEpochNotifier()
+	forkController, err := fork.NewForkController(config.EnableEpochs{SmartContracts: 1, FixAuditChanges: 1}, epochNotifier)
+	require.NoError(t, err)
+
+	arguments := createMockMetaArguments()
+	arguments.EpochNotifier = epochNotifier
+	arguments.ForkController = forkController
+	arguments.BlockChain = &mock.BlockChainMock{
+		GetGenesisHeaderCalled: createTestBlockchain().GetGenesisHeaderCalled,
+		GetCurrentBlockHeaderCalled: func() data.HeaderHandler {
+			return &block.Block{Header: &block.BlockHeader{Nonce: 0, Slot: 1, Epoch: committedEpoch}}
+		},
+	}
+	// fails once the epoch has been advanced, so it reaches the rollback of ProcessBlock
+	expectedErr := errors.New("block transactions failure")
+	arguments.TxCoordinator = &mock.TransactionCoordinatorMock{
+		ProcessBlockTransactionsCalled: func(*block.Block, func() time.Duration, bool) (data.ProcessResults, error) {
+			return nil, expectedErr
+		},
+	}
+	arguments.AccountsDB[state.UserAccountsState] = &mock.AccountsStub{
+		JournalLenCalled:       func() int { return 0 },
+		RevertToSnapshotCalled: func(_ int) error { return nil },
+	}
+
+	mpp, err := blproc.NewMetaProcessor(arguments)
+	require.NoError(t, err)
+	mp := blproc.NewMetaProcessorForTests(mpp)
+
+	// the committed trie holds the controller as it was stored before the smart contract fork
+	// defaults were ever merged into it
+	SetProposal(t, mp, func(pc *kapps.ProposalController, _ state.KAppAccountHandler, mp *blproc.MetaProcessorForTests) ([]byte, error) {
+		pc.ActiveParameters = kapps.InitialProposalParameters(forkController)
+		return mp.GetMarshalizer().Marshal(pc)
+	})
+	_, err = arguments.AccountsDB[state.KAppAccountsState].Commit()
+	require.NoError(t, err)
+	require.NotContains(t, kapps.InitialProposalParameters(forkController), gasMultiplier,
+		"precondition: at epoch 0 the smart contract defaults are not part of the initial set")
+
+	// the live set a node at the committed epoch holds, then the state right after a restart
+	epochNotifier.CheckEpoch(committedEpoch)
+	controller, err := kapps.NewProposalController(forkController)
+	require.NoError(t, err)
+	require.NoError(t, mpp.SetProposalController(controller))
+	require.Contains(t, mp.GetActiveParameters(), gasMultiplier)
+	epochNotifier.CheckEpoch(0)
+
+	// an ordinary block: only an epoch start block snapshots the parameters and puts them back
+	// after the revert, which would hide the loss
+	hdr := createEpochStartHeaderForProcess()
+	hdr.Header.IsEpochStart = false
+	hdr.Header.Epoch = committedEpoch
+	hdr.Header.Slot = 2
+
+	err = mpp.ProcessBlock(hdr, haveTime)
+	require.ErrorIs(t, err, expectedErr)
+
+	params := mp.GetActiveParameters()
+	assert.Contains(t, params, gasMultiplier, "a contract call would be given 0 gas")
+	assert.Contains(t, params, maxGasPerTX)
+	assert.True(t, forkController.EnableSmartContracts(), "fork flags must be those of the committed epoch")
 }
 
 func SetProposal(
@@ -2745,8 +3126,10 @@ func TestMetaProcessor_CommitBlockCallsEventsProcessor(t *testing.T) {
 	hdr.PubKeysBitmap = []byte{0x01}
 
 	marshalerMock := &mock.MarshalizerMock{}
+	committed := false
 	accounts := &mock.AccountsStub{
 		CommitCalled: func() ([]byte, error) {
+			committed = true
 			return rootHash, nil
 		},
 		RootHashCalled: func() ([]byte, error) {
@@ -2773,11 +3156,14 @@ func TestMetaProcessor_CommitBlockCallsEventsProcessor(t *testing.T) {
 	store := initStore()
 	store.AddStorer(retriever.BlockUnit, hdrUnit)
 
-	var saveBlockCalled bool
+	// the indexer resolves account documents from live state inside SaveBlock, so it
+	// must run after commitAll and before CommitBlock returns (KLR-68)
+	var saveBlockCalled, committedAtSave bool
 	eventsProc := &mock.EventsProcessorStub{
 		EnabledCalled: func() bool { return true },
 		SaveBlockCalled: func(args *indexer.ArgsSaveBlockData) {
 			saveBlockCalled = true
+			committedAtSave = committed
 		},
 	}
 
@@ -2815,6 +3201,7 @@ func TestMetaProcessor_CommitBlockCallsEventsProcessor(t *testing.T) {
 	err = mp.CommitBlock(hdr)
 	assert.Nil(t, err)
 	assert.True(t, saveBlockCalled)
+	assert.True(t, committedAtSave, "SaveBlock must see the committed state")
 }
 
 type epochAwareRequestHandler struct {
@@ -3117,4 +3504,471 @@ func TestMetaProcessor_ProcessBlockRestoresEpochStateWhenTimeIsOut(t *testing.T)
 	assert.False(t, trigger.IsEpochStart(), "epoch start trigger must leave epoch start state when processing times out")
 	assert.Equal(t, currentEpoch, epochNotifier.CurrentEpoch(), "epoch notifier must be restored when processing times out")
 	assert.Equal(t, currentEpoch, requestHandler.epoch, "request handler epoch must be restored when processing times out")
+}
+
+const (
+	nativeFPRInitialKLVSupply = int64(100_000_000_000_000)
+	// rewards accumulated in the epoch that the first roll closes, so the entry it
+	// appends is told apart from the empty ones the later rolls append
+	nativeFPRPendingKLV = int64(77)
+	nativeFPRPendingKFI = int64(33)
+)
+
+// seededKLVFPR and seededKFIFPR are four epochs of native rewards, each partly claimed by a
+// different amount so that every trimmed entry leaves its own unclaimed remainder:
+// KLV 900, 450, 1000, 750 and KFI 630, 500, 1099, 400.
+func seededKLVFPR() []*kapps.FPRData {
+	return []*kapps.FPRData{
+		{TotalAmount: 1000, TotalStaked: 50000, Epoch: 1, TotalClaimed: 100},
+		{TotalAmount: 500, TotalStaked: 52000, Epoch: 2, TotalClaimed: 50},
+		{TotalAmount: 1300, TotalStaked: 43000, Epoch: 3, TotalClaimed: 300},
+		{TotalAmount: 1000, TotalStaked: 30000, Epoch: 4, TotalClaimed: 250},
+	}
+}
+
+func seededKFIFPR() []*kapps.FPRData {
+	return []*kapps.FPRData{
+		{TotalAmount: 700, TotalStaked: 9000, Epoch: 1, TotalClaimed: 70},
+		{TotalAmount: 900, TotalStaked: 9100, Epoch: 2, TotalClaimed: 400},
+		{TotalAmount: 1100, TotalStaked: 9200, Epoch: 3, TotalClaimed: 1},
+		{TotalAmount: 600, TotalStaked: 9300, Epoch: 4, TotalClaimed: 200},
+	}
+}
+
+// nativeFPRHarness drives the production epochStartNativeStakingKapps over a trie backed KApp
+// accounts DB and the real proposal controller.
+type nativeFPRHarness struct {
+	t              *testing.T
+	mp             *blproc.MetaProcessorForTests
+	controller     kapps.ActiveProposalController
+	forkController core.ForkController
+	epochNotifier  process.EpochNotifier
+}
+
+func newNativeFPRHarness(
+	t *testing.T,
+	fixAuditChangesV6 bool,
+	maxEpochsUnclaimed int64,
+	klvFPR, kfiFPR []*kapps.FPRData,
+) *nativeFPRHarness {
+	t.Helper()
+
+	forkController := mock.NewForkControllerStub().SetFork("FixAuditChangesV6", fixAuditChangesV6)
+
+	return newNativeFPRHarnessWithFork(t, forkController, nil, maxEpochsUnclaimed, klvFPR, kfiFPR)
+}
+
+// newNativeFPRHarnessActivatingAt answers the gate from the production fork controller, fed by
+// the epoch notifier the way ProcessBlock and CreateBlock feed it, with FixAuditChangesV6
+// enabled at the given epoch.
+func newNativeFPRHarnessActivatingAt(
+	t *testing.T,
+	fixAuditChangesV6Epoch uint32,
+	maxEpochsUnclaimed int64,
+	klvFPR, kfiFPR []*kapps.FPRData,
+) *nativeFPRHarness {
+	t.Helper()
+
+	epochNotifier := notifier.NewGenericEpochNotifier()
+	forkController, err := fork.NewForkController(
+		config.EnableEpochs{FixAuditChangesV6: fixAuditChangesV6Epoch},
+		epochNotifier,
+	)
+	require.NoError(t, err)
+
+	return newNativeFPRHarnessWithFork(t, forkController, epochNotifier, maxEpochsUnclaimed, klvFPR, kfiFPR)
+}
+
+func newNativeFPRHarnessWithFork(
+	t *testing.T,
+	forkController core.ForkController,
+	epochNotifier process.EpochNotifier,
+	maxEpochsUnclaimed int64,
+	klvFPR, kfiFPR []*kapps.FPRData,
+) *nativeFPRHarness {
+	t.Helper()
+
+	hasher := &sha256.Sha256{}
+	marshalizer := marshal.NewProtoMarshalizer()
+
+	cache, err := storageUnit.NewCache(storageUnit.CacheConfig{Type: storageUnit.LRUCache, Capacity: 10, Shards: 1})
+	require.NoError(t, err)
+	persister, err := memorydb.NewlruDB(100000)
+	require.NoError(t, err)
+	unit, err := storageUnit.NewStorageUnit(cache, persister)
+	require.NoError(t, err)
+
+	trieStorage, err := trie.NewTrieStorageManagerWithoutPruning(unit)
+	require.NoError(t, err)
+	tr, err := trie.NewTrie(trieStorage, marshalizer, hasher, 5)
+	require.NoError(t, err)
+	adb, err := state.NewAccountsDB(tr, hasher, marshalizer, factory.NewKAppAccountCreator(), core.Normal)
+	require.NoError(t, err)
+
+	kdaAcc, err := adb.LoadAccount(kapps.KDAKAppAddress)
+	require.NoError(t, err)
+	kdaKapp := kdaAcc.(state.KAppAccountHandler)
+
+	stakingAcc, err := adb.LoadAccount(kapps.StakingKAppAddress)
+	require.NoError(t, err)
+	stakingKapp := stakingAcc.(state.KAppAccountHandler)
+
+	save := func(kappAcc state.KAppAccountHandler, key []byte, value interface{}) {
+		raw, errMarshal := marshalizer.Marshal(value)
+		require.NoError(t, errMarshal)
+		require.NoError(t, kappAcc.DataTrieTracker().SaveKeyValue(key, raw))
+	}
+
+	save(stakingKapp, kdautils.KLVKey, &kapps.StakingData{
+		InterestType:     kapps.StakingData_FPRI,
+		TotalStaked:      61000,
+		CurrentFPRAmount: nativeFPRPendingKLV,
+		FPR:              klvFPR,
+	})
+	save(stakingKapp, kdautils.KFIKey, &kapps.StakingData{
+		InterestType:     kapps.StakingData_FPRI,
+		TotalStaked:      9400,
+		CurrentFPRAmount: nativeFPRPendingKFI,
+		FPR:              kfiFPR,
+	})
+	save(kdaKapp, kdautils.KLVKey, &kapps.KDAData{
+		ID:                kdautils.KLVIdentifier,
+		AssetType:         kapps.KDAData_Fungible,
+		Name:              kdautils.KLVIdentifier,
+		Ticker:            kdautils.KLVIdentifier,
+		Precision:         6,
+		CirculatingSupply: nativeFPRInitialKLVSupply,
+		MaxSupply:         90_000_000_000_000_000,
+	})
+	require.NoError(t, adb.SaveAccounts(kdaKapp, stakingKapp))
+
+	mp, controller, err := blproc.NewMetaProcessorForEpochStartTests(adb, hasher, marshalizer, forkController, epochNotifier)
+	require.NoError(t, err)
+
+	h := &nativeFPRHarness{
+		t:              t,
+		mp:             mp,
+		controller:     controller,
+		forkController: forkController,
+		epochNotifier:  epochNotifier,
+	}
+	h.setMaxEpochsUnclaimed(maxEpochsUnclaimed)
+
+	return h
+}
+
+// setMaxEpochsUnclaimed writes the parameter the way a settled proposal does. It goes around
+// ParseParamAndValidate on purpose: what the trim does with a value is under test here, not
+// which values governance may still vote in.
+func (h *nativeFPRHarness) setMaxEpochsUnclaimed(value int64) {
+	h.t.Helper()
+
+	h.controller.UpdateParameters(map[int32]*kapps.Parameter{
+		int32(kapps.EnumParameter_MaxEpochsUnclaimed): {
+			Type:  kapps.EnumType_Int64,
+			Value: []byte(strconv.FormatInt(value, 10)),
+		},
+	})
+	require.Equal(h.t, value, h.controller.GetParameterInt(kapps.EnumParameter_MaxEpochsUnclaimed))
+}
+
+// roll runs one epoch start and returns what the header reports as burned. The epoch is
+// confirmed first, as block processing does before it reaches the epoch start.
+func (h *nativeFPRHarness) roll(epoch uint32) int64 {
+	h.t.Helper()
+
+	if h.epochNotifier != nil {
+		h.epochNotifier.CheckEpoch(epoch)
+	}
+
+	header := &block.Block{Header: &block.BlockHeader{Nonce: uint64(epoch), Epoch: epoch, IsEpochStart: true}}
+	require.NoError(h.t, h.mp.EpochStartNativeStakingKapps(header))
+
+	return header.GetBurnedUnclaimed()
+}
+
+func (h *nativeFPRHarness) staking() (*kapps.StakingData, *kapps.StakingData) {
+	h.t.Helper()
+
+	klv, kfi, err := h.mp.GetNativeStakingKApps()
+	require.NoError(h.t, err)
+
+	return klv, kfi
+}
+
+// epochs returns the epochs the KLV and the KFI lists currently hold, oldest first.
+func (h *nativeFPRHarness) epochs() ([]uint32, []uint32) {
+	h.t.Helper()
+
+	klv, kfi := h.staking()
+
+	return fprEpochs(klv.FPR), fprEpochs(kfi.FPR)
+}
+
+func fprEpochs(fprs []*kapps.FPRData) []uint32 {
+	epochs := make([]uint32, 0, len(fprs))
+	for _, fpr := range fprs {
+		epochs = append(epochs, fpr.GetEpoch())
+	}
+
+	return epochs
+}
+
+// klvBurned returns what left the KLV circulating supply since the harness was built.
+func (h *nativeFPRHarness) klvBurned() int64 {
+	h.t.Helper()
+
+	acnt, err := h.mp.GetKAppAdapter().LoadAccount(kapps.KDAKAppAddress)
+	require.NoError(h.t, err)
+
+	raw, err := acnt.(state.KAppAccountHandler).DataTrieTracker().RetrieveValue(kdautils.KLVKey)
+	require.NoError(h.t, err)
+
+	klv := &kapps.KDAData{}
+	require.NoError(h.t, h.mp.GetMarshalizer().Unmarshal(klv, raw))
+	require.Equal(h.t, nativeFPRInitialKLVSupply-klv.CirculatingSupply, klv.BurnedValue,
+		"the supply and the burned counter must move together")
+
+	return klv.BurnedValue
+}
+
+// A proposal that lowers MaxEpochsUnclaimed below the current length used to leave the equality
+// trim unreachable: the lists then grew by one entry per epoch and nothing was burned again.
+func TestMetaProcessor_NativeFPRTrim_LoweredParameterTrimsTheExcess(t *testing.T) {
+	t.Parallel()
+
+	h := newNativeFPRHarness(t, true, 4, seededKLVFPR(), seededKFIFPR())
+	h.setMaxEpochsUnclaimed(2)
+
+	// epochs 1, 2 and 3 no longer fit: KLV 900+450+1000 and KFI 630+500+1099
+	burned := h.roll(5)
+	assert.Equal(t, int64(2350+2229), burned)
+	assert.Equal(t, int64(2350+2229), h.klvBurned())
+
+	klvEpochs, kfiEpochs := h.epochs()
+	assert.Equal(t, []uint32{4, 5}, klvEpochs)
+	assert.Equal(t, []uint32{4, 5}, kfiEpochs)
+
+	// the entry appended for the closing epoch carries what that epoch accumulated
+	klv, kfi := h.staking()
+	require.Len(t, klv.FPR, 2)
+	require.Len(t, kfi.FPR, 2)
+	assert.Equal(t, nativeFPRPendingKLV, klv.FPR[1].GetTotalAmount())
+	assert.Equal(t, int64(61000), klv.FPR[1].GetTotalStaked())
+	assert.Zero(t, klv.FPR[1].GetTotalClaimed())
+	assert.Equal(t, nativeFPRPendingKFI, kfi.FPR[1].GetTotalAmount())
+	assert.Equal(t, int64(9400), kfi.FPR[1].GetTotalStaked())
+	assert.Zero(t, kfi.FPR[1].GetTotalClaimed())
+	// the survivor of the trim is untouched
+	assert.Equal(t, int64(1000), klv.FPR[0].GetTotalAmount())
+	assert.Equal(t, int64(250), klv.FPR[0].GetTotalClaimed())
+	assert.Equal(t, int64(600), kfi.FPR[0].GetTotalAmount())
+	assert.Equal(t, int64(200), kfi.FPR[0].GetTotalClaimed())
+	assert.Zero(t, klv.CurrentFPRAmount)
+	assert.Zero(t, kfi.CurrentFPRAmount)
+
+	// from here on it is one entry out, one entry in: epoch 4 (750+400), then epoch 5 (77+33),
+	// then the empty epoch 6
+	assert.Equal(t, int64(750+400), h.roll(6))
+	assert.Equal(t, nativeFPRPendingKLV+nativeFPRPendingKFI, h.roll(7))
+	assert.Zero(t, h.roll(8))
+
+	klvEpochs, kfiEpochs = h.epochs()
+	assert.Equal(t, []uint32{7, 8}, klvEpochs)
+	assert.Equal(t, []uint32{7, 8}, kfiEpochs)
+	assert.Equal(t, int64(2350+2229+750+400+77+33), h.klvBurned())
+}
+
+// The lists are trimmed independently, so one that is already within the new limit keeps its
+// entries while the other sheds its excess.
+func TestMetaProcessor_NativeFPRTrim_KLVAndKFIAreTrimmedIndependently(t *testing.T) {
+	t.Parallel()
+
+	h := newNativeFPRHarness(t, true, 2, seededKLVFPR(), seededKFIFPR()[3:])
+
+	// KLV sheds epochs 1, 2 and 3; KFI only holds epoch 4 and keeps it
+	assert.Equal(t, int64(2350), h.roll(5))
+
+	klvEpochs, kfiEpochs := h.epochs()
+	assert.Equal(t, []uint32{4, 5}, klvEpochs)
+	assert.Equal(t, []uint32{4, 5}, kfiEpochs)
+}
+
+// Where the parameter was never lowered the loop runs at most once per epoch, so the fork
+// changes neither the lists nor the burn.
+func TestMetaProcessor_NativeFPRTrim_UnchangedOrRaisedParameterMatchesBothSidesOfTheFork(t *testing.T) {
+	t.Parallel()
+
+	type roll struct {
+		burned int64
+		epochs []uint32
+	}
+
+	tests := []struct {
+		name               string
+		maxEpochsUnclaimed int64
+		rolls              []roll
+	}{
+		{
+			name:               "unchanged parameter trims one entry per epoch",
+			maxEpochsUnclaimed: 4,
+			rolls: []roll{
+				{burned: 900 + 630, epochs: []uint32{2, 3, 4, 5}},
+				{burned: 450 + 500, epochs: []uint32{3, 4, 5, 6}},
+				{burned: 1000 + 1099, epochs: []uint32{4, 5, 6, 7}},
+				{burned: 750 + 400, epochs: []uint32{5, 6, 7, 8}},
+				{burned: 77 + 33, epochs: []uint32{6, 7, 8, 9}},
+			},
+		},
+		{
+			name:               "raised parameter grows to the new limit and holds there",
+			maxEpochsUnclaimed: 6,
+			rolls: []roll{
+				{burned: 0, epochs: []uint32{1, 2, 3, 4, 5}},
+				{burned: 0, epochs: []uint32{1, 2, 3, 4, 5, 6}},
+				{burned: 900 + 630, epochs: []uint32{2, 3, 4, 5, 6, 7}},
+				{burned: 450 + 500, epochs: []uint32{3, 4, 5, 6, 7, 8}},
+			},
+		},
+		{
+			name:               "a parameter beyond any list length never trims",
+			maxEpochsUnclaimed: math.MaxInt64,
+			rolls: []roll{
+				{burned: 0, epochs: []uint32{1, 2, 3, 4, 5}},
+				{burned: 0, epochs: []uint32{1, 2, 3, 4, 5, 6}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		for _, fixAuditChangesV6 := range []bool{false, true} {
+			t.Run(tt.name+"/FixAuditChangesV6="+strconv.FormatBool(fixAuditChangesV6), func(t *testing.T) {
+				t.Parallel()
+
+				h := newNativeFPRHarness(t, fixAuditChangesV6, tt.maxEpochsUnclaimed, seededKLVFPR(), seededKFIFPR())
+
+				total := int64(0)
+				for i, want := range tt.rolls {
+					burned := h.roll(uint32(5 + i))
+					total += want.burned
+
+					klvEpochs, kfiEpochs := h.epochs()
+					assert.Equal(t, want.burned, burned, "roll %d", i)
+					assert.Equal(t, want.epochs, klvEpochs, "roll %d", i)
+					assert.Equal(t, want.epochs, kfiEpochs, "roll %d", i)
+				}
+				assert.Equal(t, total, h.klvBurned())
+			})
+		}
+	}
+}
+
+// A window of no epochs at all cannot hold any closed entry: every one of them is burned and each
+// list is left with just the entry of the epoch being closed, the same as a window of one.
+func TestMetaProcessor_NativeFPRTrim_ParameterOfOneOrLessKeepsOnlyTheNewEntry(t *testing.T) {
+	t.Parallel()
+
+	for _, maxEpochsUnclaimed := range []int64{1, 0, -1, math.MinInt64} {
+		t.Run(strconv.FormatInt(maxEpochsUnclaimed, 10), func(t *testing.T) {
+			t.Parallel()
+
+			h := newNativeFPRHarness(t, true, maxEpochsUnclaimed, seededKLVFPR(), seededKFIFPR())
+
+			// all four seeded epochs: KLV 900+450+1000+750 and KFI 630+500+1099+400
+			require.NotPanics(t, func() {
+				assert.Equal(t, int64(3100+2629), h.roll(5))
+			})
+
+			klvEpochs, kfiEpochs := h.epochs()
+			assert.Equal(t, []uint32{5}, klvEpochs)
+			assert.Equal(t, []uint32{5}, kfiEpochs)
+
+			require.NotPanics(t, func() {
+				assert.Equal(t, nativeFPRPendingKLV+nativeFPRPendingKFI, h.roll(6))
+			})
+
+			klvEpochs, kfiEpochs = h.epochs()
+			assert.Equal(t, []uint32{6}, klvEpochs)
+			assert.Equal(t, []uint32{6}, kfiEpochs)
+			assert.Equal(t, int64(3100+2629+77+33), h.klvBurned())
+		})
+	}
+}
+
+// With nothing to trim the loop must not reach for the first entry: the equality check did so
+// when both the list length and the parameter were zero.
+func TestMetaProcessor_NativeFPRTrim_ZeroParameterOnEmptyListsDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	h := newNativeFPRHarness(t, true, 0, nil, nil)
+
+	require.NotPanics(t, func() {
+		assert.Zero(t, h.roll(5))
+	})
+
+	klvEpochs, kfiEpochs := h.epochs()
+	assert.Equal(t, []uint32{5}, klvEpochs)
+	assert.Equal(t, []uint32{5}, kfiEpochs)
+	assert.Zero(t, h.klvBurned())
+}
+
+// Before FixAuditChangesV6 the equality trim is kept as it was, so a lowered parameter still
+// leaves the lists growing with nothing burned.
+func TestMetaProcessor_NativeFPRTrim_LoweredParameterBeforeTheForkKeepsGrowing(t *testing.T) {
+	t.Parallel()
+
+	h := newNativeFPRHarness(t, false, 4, seededKLVFPR(), seededKFIFPR())
+	h.setMaxEpochsUnclaimed(2)
+
+	for epoch := uint32(5); epoch < 10; epoch++ {
+		assert.Zero(t, h.roll(epoch), "epoch %d", epoch)
+	}
+
+	klvEpochs, kfiEpochs := h.epochs()
+	assert.Equal(t, []uint32{1, 2, 3, 4, 5, 6, 7, 8, 9}, klvEpochs)
+	assert.Equal(t, []uint32{1, 2, 3, 4, 5, 6, 7, 8, 9}, kfiEpochs)
+	assert.Zero(t, h.klvBurned())
+}
+
+// One chain across the activation epoch, with the gate answered by the production fork controller.
+// The parameter is lowered while the fork is still ahead: up to the last epoch before it the lists
+// keep growing with nothing burned, and the epoch start of the activation epoch itself trims all
+// that piled up and burns it.
+func TestMetaProcessor_NativeFPRTrim_AcrossTheForkActivationEpoch(t *testing.T) {
+	t.Parallel()
+
+	const activationEpoch = uint32(7)
+
+	h := newNativeFPRHarnessActivatingAt(t, activationEpoch, 4, seededKLVFPR(), seededKFIFPR())
+	h.setMaxEpochsUnclaimed(2)
+
+	// pre fork: the equality never matches again
+	for epoch := uint32(5); epoch < activationEpoch; epoch++ {
+		assert.Zero(t, h.roll(epoch), "epoch %d", epoch)
+		require.False(t, h.forkController.FixAuditChangesV6(), "epoch %d", epoch)
+	}
+
+	klvEpochs, kfiEpochs := h.epochs()
+	assert.Equal(t, []uint32{1, 2, 3, 4, 5, 6}, klvEpochs)
+	assert.Equal(t, []uint32{1, 2, 3, 4, 5, 6}, kfiEpochs)
+	assert.Zero(t, h.klvBurned())
+
+	// activation: epochs 1 to 5 no longer fit, KLV 900+450+1000+750+77 and KFI 630+500+1099+400+33
+	burned := h.roll(activationEpoch)
+	require.True(t, h.forkController.FixAuditChangesV6())
+	assert.Equal(t, int64(3177+2662), burned)
+	assert.Equal(t, int64(3177+2662), h.klvBurned())
+
+	klvEpochs, kfiEpochs = h.epochs()
+	assert.Equal(t, []uint32{6, 7}, klvEpochs)
+	assert.Equal(t, []uint32{6, 7}, kfiEpochs)
+
+	// post fork: one entry out, one entry in; epochs 6 and 7 accumulated nothing
+	assert.Zero(t, h.roll(activationEpoch+1))
+	assert.Zero(t, h.roll(activationEpoch+2))
+
+	klvEpochs, kfiEpochs = h.epochs()
+	assert.Equal(t, []uint32{8, 9}, klvEpochs)
+	assert.Equal(t, []uint32{8, 9}, kfiEpochs)
+	assert.Equal(t, int64(3177+2662), h.klvBurned())
 }

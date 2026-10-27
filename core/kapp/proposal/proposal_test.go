@@ -1253,3 +1253,74 @@ func TestCreateRejectsAZeroDurationProposalAfterTheFork(t *testing.T) {
 		})
 	}
 }
+
+// From FixAuditChangesV6, Create rejects a value outside its static bounds with the receipt a
+// client sees, so it never reaches settlement. Before the fork it is accepted as it always was.
+func TestCreateRejectsAnOutOfBoundsParameterAfterTheFork(t *testing.T) {
+	cases := []struct {
+		name     string
+		fixV6    bool
+		value    string
+		rejected bool
+	}{
+		{"negative fee after the fork", true, "-1", true},
+		{"fee at its floor after the fork", true, "0", false},
+		{"negative fee before the fork", false, "-1", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			proposalKApp, accCacher, forkController, kappController := setupVoteTest(t)
+			forkController.FixAuditChangesV6Value = tc.fixV6
+
+			receipts := mock.NewReceiptsContextStub()
+			kappController.GetCurrentKAppContextCalled = func() kapp.KappContext {
+				return &mock.KAppContextStub{
+					BlockCalled: func() *block.Block {
+						return &block.Block{Header: &block.BlockHeader{Epoch: 5, Timestamp: 1234567890}}
+					},
+					ContractIDCalled: func() int { return 1 },
+					ReceiptsCalled:   func() kapp.ReceiptsContext { return receipts },
+				}
+			}
+			kappController.GetProposalControllerCalled = func() kapps.ActiveProposalController {
+				return &mock.ProposalControllerStub{
+					GetParameterIntCalled: func(param kapps.EnumParameter) int64 {
+						if param == kapps.EnumParameter_MinKFIStakedToEnableProposals {
+							return 1000
+						}
+						return 0
+					},
+					GetParameterUintCalled: func(kapps.EnumParameter) uint64 { return 40 }, // ProposalMaxEpochsDuration
+				}
+			}
+
+			proposalKappAcc, err := accCacher.LoadKApp(kapps.ProposalKAppAddress)
+			require.NoError(t, err)
+			_, err = proposalKappAcc.StartProposalsKApp(forkController)
+			require.NoError(t, err)
+			require.NoError(t, accCacher.UpdateKapp(proposalKappAcc))
+			createVoterAccount(t, accCacher, proposerAddr, 1000)
+
+			code, err := proposalKApp.Create(proposerAddr, &transaction.ProposalContract{
+				EpochsDuration: 10,
+				Parameters: map[int32][]byte{
+					int32(kapps.EnumParameter_KAppFeeTransfer): []byte(tc.value),
+				},
+			})
+
+			if !tc.rejected {
+				require.NoError(t, err)
+				require.Equal(t, transaction.Transaction_Ok, code)
+				require.Empty(t, receipts.GetErrors())
+				return
+			}
+
+			require.ErrorIs(t, err, common.ErrInvalidParameter)
+			require.Equal(t, transaction.Transaction_ParameterInvalid, code)
+			errs := receipts.GetErrors()
+			require.Len(t, errs, 1)
+			require.Equal(t, common.ErrFieldInvalidProposalParams, string(errs[0].Data[1]))
+		})
+	}
+}

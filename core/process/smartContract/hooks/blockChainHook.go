@@ -772,17 +772,11 @@ func (bh *BlockChainHookImpl) makeCompiledSCStorage() error {
 	return nil
 }
 
-// GetSnapshot gets the number of entries in the journal as a snapshot id
-func (bh *BlockChainHookImpl) GetSnapshot() int {
-	return 0 //not needed as we use accounts cacher
-}
-
-// RevertToSnapshot reverts snapshots up to the specified one
-func (bh *BlockChainHookImpl) RevertToSnapshot(snapshot int) error {
-	return nil ////not needed as we use accounts cacher
-}
-
-// TransferValueOnly transfers KLV from one account to another
+// TransferValueOnly transfers KLV from one account to another.
+//
+// This and KDATransfer settle straight into the accounts cacher. There is no sub-transaction
+// rollback; every VM error path must abort the transaction. The only rollback boundary is
+// txProcess, which calls accountsCacher.SaveAll on success and ResetAll otherwise.
 func (bh *BlockChainHookImpl) TransferValueOnly(destination []byte, sender []byte, value *big.Int) error {
 	log.Trace("TransferValueOnly", "destination", destination, "sender", sender, "value", value)
 

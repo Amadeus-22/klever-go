@@ -6,6 +6,7 @@ import (
 	"math"
 	"testing"
 
+	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
@@ -1979,6 +1980,10 @@ func TestMarketKApp_ExecuteBuyMarket_MultiRecipientGuardMidLoop(t *testing.T) {
 
 	marketKApp, accCacher, fc := createTestMarketKApp(t)
 	fc.FixMarketBuyOverflowValue = true
+	// The guard fires inside the settlement loop only before FixAuditChangesV6; after it,
+	// checkSettlementControls refuses the same overflow before any credit (see
+	// TestMarketAssetControls_SplitOverflowRefusedBeforeAnyCredit).
+	fc.FixAuditChangesV6Value = false
 
 	seller := defaultAddr
 	bidder := defaultOther
@@ -2539,4 +2544,154 @@ func TestMarketKApp_ExecuteBuyMarket_EmptySnapshottedReferralStillSettles(t *tes
 	sellerAcc, err := accCacher.LoadUser(seller)
 	require.NoError(t, err)
 	require.Equal(t, bid, sellerAcc.GetBalance(kdautils.KLVIdentifier, false))
+}
+
+// An ended auction whose reserve was met has a single exit: Claim, which settles through
+// executeBuyMarket. The percentage royalty used to load its receiver with
+// GetExistingUserAccount, so a collection owner could point ChangeRoyaltiesReceiver at an
+// address that never had an account and every Claim failed from then on. CancelOrder refuses
+// expired orders, so the asset and the bid stayed in escrow (KLC-2751).
+//
+// Once FixAuditChangesV6 is active the receiver is loaded like every other settlement payee,
+// creating the account when it is missing. Before the fork the failure is kept, so a replay
+// of history returns the same result.
+func TestMarketKApp_Claim_EndedAuctionRoyaltyReceiverWithoutAccount(t *testing.T) {
+	t.Parallel()
+
+	const (
+		bid        = int64(1000000)
+		blockTime  = int64(1000000)
+		royaltyPct = uint32(1000) // 10%
+	)
+	collectionID := []byte("NOACC-COLL")
+	assetID := []byte("1")
+	marketplaceID := []byte("mp-noacc")
+	orderID := []byte("order-noacc")
+
+	seller := defaultAddr
+	bidder := defaultOther
+	creator := makeAddress("creator")
+	receiver := makeAddress("receiver-no-account")
+
+	// Eight zero bytes followed by the WASM VM type: the layout of a smart contract address.
+	scReceiver := make([]byte, 32)
+	copy(scReceiver[core.NumInitCharactersForScAddress-core.VMTypeLen:], common.WasmVirtualMachine)
+	copy(scReceiver[core.NumInitCharactersForScAddress:], []byte("sc-receiver"))
+	require.True(t, core.IsSmartContractAddress(scReceiver))
+
+	type settlement struct {
+		status      transaction.Transaction_TXResultCode
+		err         error
+		accCacher   state.AccountsCacher
+		storedOrder *kapps.MarketOrderData
+	}
+
+	// settleViaClaim stores an expired auction whose winning bid clears the reserve and
+	// settles it through Claim(). royaltiesReceiver is the asset's royalties address at
+	// settlement and never had an account created.
+	settleViaClaim := func(t *testing.T, fixEnabled bool, royaltiesReceiver []byte) settlement {
+		marketKApp, accCacher, fc := createTestMarketKApp(t)
+		fc.FixMarketBuyOverflowValue = true
+		fc.KdaFprValue = true
+		fc.FixAuditChangesV6Value = fixEnabled
+
+		for _, addr := range [][]byte{seller, bidder, creator} {
+			acc, err := accCacher.LoadUser(addr)
+			require.NoError(t, err)
+			require.NoError(t, accCacher.UpdateUser(acc))
+		}
+
+		marketKappAcc, err := accCacher.LoadKApp(kapps.MarketKAppAddress)
+		require.NoError(t, err)
+		require.NoError(t, marketKApp.SetMarketplace(marketKappAcc, &kapps.Marketplace{
+			ID: marketplaceID, OwnerAddress: seller, Name: []byte("noacc"),
+		}))
+		require.NoError(t, marketKappAcc.AddInternalKDA(collectionID, assetID, []byte("nft-data")))
+
+		order := &kapps.MarketOrderData{
+			ID: orderID, MarketplaceID: marketplaceID,
+			MarketType: kapps.MarketOrderData_Auction, OwnerAddress: seller,
+			CollectionID: collectionID, AssetID: assetID, CurrencyID: kdautils.KLVIdentifier,
+			Price: bid, ReservePrice: bid, CurrentBid: bid, CurrentBidder: bidder,
+			EndTime:           blockTime - 1, // expired auction → settles on claim
+			RoyaltyPercentage: royaltyPct, RoyaltySnapshotted: true,
+		}
+		require.NoError(t, marketKApp.SetMarketOrder(marketKappAcc, order))
+		require.NoError(t, accCacher.UpdateKapp(marketKappAcc))
+
+		asset := &kapps.KDAData{
+			OwnerAddress: creator,
+			Royalties: &kapps.RoyaltiesData{
+				Address:          royaltiesReceiver,
+				MarketPercentage: royaltyPct,
+				SplitRoyalties:   make(map[string]*kapps.RoyaltySplitData),
+			},
+		}
+
+		blk := &block.Block{Header: &block.BlockHeader{Timestamp: blockTime}}
+		receiptsStub := mock.NewReceiptsContextStub()
+		ctx := &mock.KAppContextStub{
+			ContractIDCalled: func() int { return 0 },
+			ReceiptsCalled:   func() kapp.ReceiptsContext { return receiptsStub },
+			BlockCalled:      func() *block.Block { return blk },
+		}
+		require.NoError(t, marketKApp.SetKAppController(&stub.KAppControllerStub{
+			GetCurrentKAppContextCalled: func() kapp.KappContext { return ctx },
+			GetKDAKAppCalled: func() kapp.KDAKapp {
+				return &stub.KDAKappStub{
+					GetKDACalled: func(_ []byte) (state.KAppAccountHandler, *kapps.KDAData, error) {
+						return nil, asset, nil
+					},
+				}
+			},
+		}))
+
+		status, err := marketKApp.Claim(bidder, &transaction.ClaimContract{
+			ClaimType: transaction.ClaimContract_MarketClaim,
+			ID:        orderID,
+		})
+
+		_, storedOrder, e := marketKApp.GetMarketOrder(orderID)
+		require.NoError(t, e)
+		return settlement{status: status, err: err, accCacher: accCacher, storedOrder: storedOrder}
+	}
+
+	balanceOf := func(t *testing.T, s settlement, addr []byte) int64 {
+		acc, err := s.accCacher.GetExistingUser(addr)
+		require.NoError(t, err)
+		return acc.GetBalance(kdautils.KLVIdentifier, false)
+	}
+
+	requireStuck := func(t *testing.T, s settlement, missing []byte) {
+		require.ErrorIs(t, s.err, common.ErrAccNotFound)
+		require.Equal(t, transaction.Transaction_LoadAccountError, s.status)
+		require.False(t, s.storedOrder.IsClaimed, "the failed claim must leave the order unsettled")
+		_, err := s.accCacher.GetExistingUser(missing)
+		require.ErrorIs(t, err, common.ErrAccNotFound, "the legacy path must not create the receiver")
+		require.Zero(t, balanceOf(t, s, seller))
+	}
+
+	requireSettled := func(t *testing.T, s settlement, paid []byte) {
+		require.NoError(t, s.err)
+		require.Equal(t, transaction.Transaction_Ok, s.status)
+		require.True(t, s.storedOrder.IsClaimed)
+		require.Equal(t, int64(100000), balanceOf(t, s, paid), "10%% of the bid must reach the royalty receiver")
+		require.Equal(t, int64(900000), balanceOf(t, s, seller), "the seller keeps the rest of the bid")
+	}
+
+	t.Run("ForkInactive_ClaimFailsAndOrderStaysStuck", func(t *testing.T) {
+		requireStuck(t, settleViaClaim(t, false, receiver), receiver)
+	})
+
+	t.Run("ForkActive_ClaimSettlesAndCreditsReceiver", func(t *testing.T) {
+		requireSettled(t, settleViaClaim(t, true, receiver), receiver)
+	})
+
+	t.Run("ForkInactive_SmartContractReceiverFails", func(t *testing.T) {
+		requireStuck(t, settleViaClaim(t, false, scReceiver), scReceiver)
+	})
+
+	t.Run("ForkActive_SmartContractReceiverIsCredited", func(t *testing.T) {
+		requireSettled(t, settleViaClaim(t, true, scReceiver), scReceiver)
+	})
 }

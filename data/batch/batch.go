@@ -9,15 +9,16 @@ import (
 	//lz4 "github.com/DataDog/golz4"
 
 	"github.com/klever-io/klever-go/common"
+	"github.com/klever-io/klever-go/network/p2p"
 	"github.com/klever-io/klever-go/tools/marshal"
 )
 
 // MaxBatchWireSize caps the COMPRESSED wire payload at the multi-data interceptor
 // pre-Unmarshal site. Equal to libp2p's DefaultMaxMessageSize; coordinated with
-// the tighter outbound network/p2p/libp2p.maxSendBuffSize (1 MiB − 64 KiB framing).
+// the tighter outbound network/p2p.MaxSendBuffSize (1 MiB − 64 KiB framing).
 // Does NOT bound Decompress output — see MaxDecompressedBatchSize for that.
 // See GHSA-74m6-4hjp-7226 / KLC-2352 (CWE-409), GHSA-w342-mj6g-v9c4.
-const MaxBatchWireSize = 1 << 20 // 1 MiB
+const MaxBatchWireSize = p2p.MaxFramedMessageSize // 1 MiB
 
 // MaxDecompressedBatchSize caps the INFLATED output of Batch.Decompress.
 // Sized at 2 MiB — ~2× the worst-case legitimate marshaled batch, which is a

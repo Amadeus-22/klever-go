@@ -4,6 +4,5 @@ package address
 // track the constant instead of restating it.
 const MaxAssetsPerClaimList = maxAssetsPerClaimList
 
-// MaxConcurrentClaimLookups exposes the per-request lookup concurrency bound so the
-// concurrency tests assert the real limit rather than a restated copy of it.
-const MaxConcurrentClaimLookups = maxConcurrentClaimLookups
+// AvailableClaimListTimeout exposes the claim-list request deadline to the context tests.
+const AvailableClaimListTimeout = availableClaimListTimeout

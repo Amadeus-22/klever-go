@@ -17,6 +17,10 @@ import (
 
 var log = logger.GetOrCreate("subscribe")
 
+// subscribePanicWarn budgets the recovered-panic line of the subscription goroutine: the
+// reconnect rate behind a panic a peer can reproduce is the peer's.
+var subscribePanicWarn = websocket.NewDropWarner(websocket.PeerDrivenLogWindow)
+
 const (
 	subscribeReadTimeout = 30 * time.Second
 	subscribeOp          = "ws.Subscribe"
@@ -93,7 +97,7 @@ func handleSubscribe(c *gin.Context, hub *websocket.SocketHub, limiter *ConnLimi
 		return
 	}
 
-	shared.SafeGo(log, subscribeOp, conn, func() { processSubscription(conn, hub, release) })
+	shared.SafeGo(log, subscribeOp, conn, subscribePanicWarn, func() { processSubscription(conn, hub, release) })
 }
 
 // rejectHandshake answers a bad subscribe with a reason and closes. The write is bounded

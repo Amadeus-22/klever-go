@@ -1,6 +1,9 @@
 package block
 
 import (
+	"github.com/klever-io/klever-go/core"
+	"github.com/klever-io/klever-go/core/process"
+	"github.com/klever-io/klever-go/crypto/hashing"
 	"github.com/klever-io/klever-go/data"
 	"github.com/klever-io/klever-go/data/block"
 	"github.com/klever-io/klever-go/data/state"
@@ -49,12 +52,56 @@ func (m *MetaProcessorForTests) SetProposalKApp(kdaKapp state.KAppAccountHandler
 }
 
 func (m *MetaProcessorForTests) GetActiveParameters() map[int32]*kapps.Parameter {
-	return m.proposalController.GetActiveParameters()
+	return m.proposalController.Get().GetActiveParameters()
 }
 
 // UpdateState exposes the updateState method for testing
 func (m *MetaProcessorForTests) UpdateState(lastMetaBlock data.HeaderHandler) {
 	m.updateState(lastMetaBlock)
+}
+
+// NewMetaProcessorForEpochStartTests builds a metaProcessor holding only what the epoch start
+// needs: the given KApp accounts DB, fork controller and epoch notifier, plus a fresh proposal
+// controller, returned so that tests can set the governance parameters
+func NewMetaProcessorForEpochStartTests(
+	kappAccountsDB state.AccountsAdapter,
+	hasher hashing.Hasher,
+	marshalizer marshal.Marshalizer,
+	forkController core.ForkController,
+	epochNotifier process.EpochNotifier,
+) (*MetaProcessorForTests, kapps.ActiveProposalController, error) {
+	controller, err := kapps.NewProposalController(forkController)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	mp := &metaProcessor{
+		baseProcessor: &baseProcessor{
+			accountsDB:     map[state.AccountsDbIdentifier]state.AccountsAdapter{state.KAppAccountsState: kappAccountsDB},
+			hasher:         hasher,
+			marshalizer:    marshalizer,
+			forkController: forkController,
+			epochNotifier:  epochNotifier,
+		},
+	}
+	err = mp.SetProposalController(controller)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &MetaProcessorForTests{metaProcessor: mp}, controller, nil
+}
+
+// EpochStartNativeStakingKapps exposes the epochStartNativeStakingKapps method for testing
+func (m *MetaProcessorForTests) EpochStartNativeStakingKapps(blk data.HeaderHandler) error {
+	return m.epochStartNativeStakingKapps(blk)
+}
+
+// GetNativeStakingKApps returns the KLV and the KFI staking data for testing
+func (m *MetaProcessorForTests) GetNativeStakingKApps() (*kapps.StakingData, *kapps.StakingData, error) {
+	_, klv, kfi, err := m.getNativeStakingKApps()
+
+	return klv, kfi, err
 }
 
 // GetAccountsDB returns the accountsDB for testing

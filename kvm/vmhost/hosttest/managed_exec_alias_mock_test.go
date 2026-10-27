@@ -45,7 +45,7 @@ func TestManagedExecAliasDoesNotRetargetChildStorageMock(t *testing.T) {
 						argsHandle := managed.NewManagedBuffer()
 						resultHandle := managed.NewManagedBuffer()
 
-						managed.WriteManagedVecOfManagedBuffers([][]byte{storageKey, storageValue}, argsHandle)
+						require.NoError(t, managed.WriteManagedVecOfManagedBuffers([][]byte{storageKey, storageValue}, argsHandle))
 
 						returnValue := hooks.ManagedExecuteOnDestContext(
 							100000,

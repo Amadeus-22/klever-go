@@ -1786,6 +1786,372 @@ func TestUserAccount_Claim_APR_UpdatesCirculatingSupply(t *testing.T) {
 	assert.Equal(t, klvGains, kda.MintedValue)
 }
 
+const aprClaimStart = int64(1000)
+
+func aprClaimInputs(stake int64, aprs ...*kapps.APRData) (*kapps.UserKDA, *kapps.StakingData) {
+	userKDA := &kapps.UserKDA{
+		LastClaim: &kapps.LastClaim{Timestamp: aprClaimStart, Epoch: 1},
+		Buckets: map[string]*kapps.UserBucket{
+			"KLV": {Value: stake, StakedEpoch: 1, UnstakedEpoch: core.DefaultUnstakedEpoch},
+		},
+	}
+	staking := &kapps.StakingData{
+		InterestType: kapps.StakingData_APRI,
+		APR:          aprs,
+	}
+
+	return userKDA, staking
+}
+
+func claimOneYearAtFullAPR(t *testing.T, kda *kapps.KDAData, fixV6 bool) (map[string]int64, error) {
+	t.Helper()
+
+	account := state.NewEmptyUserAccount()
+	userKDA, staking := aprClaimInputs(1_000_000, &kapps.APRData{Timestamp: aprClaimStart, Value: core.HundredPercent})
+
+	return account.Claim(
+		transaction.ClaimContract_StakingClaim,
+		kdautils.KLVIdentifier, 2, aprClaimStart+core.OneYearTimestamp,
+		staking, kda, userKDA, mock.NewForkControllerStub().SetFork("FixAuditChangesV6", fixV6),
+	)
+}
+
+func TestUserAccount_Claim_APR_CreditsGainWithinRemainingSupply(t *testing.T) {
+	t.Parallel()
+
+	kda := &kapps.KDAData{MaxSupply: 2_000_000, CirculatingSupply: 1_000_000, MintedValue: 1_000_000}
+
+	gains, err := claimOneYearAtFullAPR(t, kda, true)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1_000_000), gains["KLV"])
+	assert.Equal(t, int64(2_000_000), kda.CirculatingSupply)
+	assert.Equal(t, int64(2_000_000), kda.MintedValue)
+}
+
+func TestUserAccount_Claim_APR_DropsGainAboveRemainingSupply(t *testing.T) {
+	t.Parallel()
+
+	kda := &kapps.KDAData{
+		MaxSupply:         math.MaxInt64 - 100_000,
+		CirculatingSupply: math.MaxInt64 - 500_000,
+		MintedValue:       math.MaxInt64 - 500_000,
+	}
+
+	_, err := claimOneYearAtFullAPR(t, kda, true)
+	assert.ErrorIs(t, err, state.ErrAPRGainDropped)
+	assert.ErrorIs(t, err, common.ErrMaxSupplyExceeded)
+	assert.Equal(t, int64(math.MaxInt64-500_000), kda.CirculatingSupply)
+	assert.Equal(t, int64(math.MaxInt64-500_000), kda.MintedValue)
+}
+
+func TestUserAccount_Claim_APR_KeepsLegacySupplyArithmeticWithoutV6(t *testing.T) {
+	t.Parallel()
+
+	kda := &kapps.KDAData{
+		MaxSupply:         math.MaxInt64 - 100_000,
+		CirculatingSupply: math.MaxInt64 - 500_000,
+		MintedValue:       math.MaxInt64 - 500_000,
+	}
+
+	_, err := claimOneYearAtFullAPR(t, kda, false)
+	assert.NoError(t, err)
+	assert.Less(t, kda.CirculatingSupply, int64(0))
+	assert.Less(t, kda.MintedValue, int64(0))
+}
+
+func TestUserAccount_Claim_APR_ForfeitsGainOverflowingUncappedSupply(t *testing.T) {
+	t.Parallel()
+
+	kda := &kapps.KDAData{
+		MaxSupply:         0,
+		CirculatingSupply: math.MaxInt64 - 500_000,
+		MintedValue:       math.MaxInt64 - 500_000,
+	}
+
+	gains, err := claimOneYearAtFullAPR(t, kda, true)
+	assert.ErrorIs(t, err, state.ErrAPRGainDropped)
+	assert.ErrorIs(t, err, common.ErrInt64Overflow)
+	assert.Zero(t, gains["KLV"])
+	assert.Equal(t, int64(math.MaxInt64-500_000), kda.CirculatingSupply)
+	assert.Equal(t, int64(math.MaxInt64-500_000), kda.MintedValue)
+}
+
+func TestUserAccount_Claim_APR_ForfeitsSaturatedGain(t *testing.T) {
+	t.Parallel()
+
+	account := state.NewEmptyUserAccount()
+	userKDA, staking := aprClaimInputs(1_000_000_000_000_000_000, &kapps.APRData{Timestamp: aprClaimStart, Value: core.MaxStakingAPR})
+	kda := &kapps.KDAData{MaxSupply: 0, CirculatingSupply: 1_000_000_000_000_000_000, MintedValue: 1_000_000_000_000_000_000}
+
+	gains, err := account.Claim(
+		transaction.ClaimContract_StakingClaim,
+		kdautils.KLVIdentifier, 2, aprClaimStart+core.OneYearTimestamp,
+		staking, kda, userKDA, mock.NewForkControllerStub().SetFork("FixAuditChangesV6", true),
+	)
+	assert.ErrorIs(t, err, state.ErrAPRGainDropped)
+	assert.ErrorIs(t, err, common.ErrInt64Overflow)
+	assert.Zero(t, gains["KLV"])
+	assert.Equal(t, int64(1_000_000_000_000_000_000), kda.CirculatingSupply)
+	assert.Equal(t, int64(1_000_000_000_000_000_000), kda.MintedValue)
+}
+
+func TestUserAccount_Claim_APR_SaturatesMintedValue(t *testing.T) {
+	t.Parallel()
+
+	kda := &kapps.KDAData{
+		MaxSupply:         0,
+		CirculatingSupply: 1_000,
+		MintedValue:       math.MaxInt64 - 500_000,
+	}
+
+	gains, err := claimOneYearAtFullAPR(t, kda, true)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1_000_000), gains["KLV"])
+	assert.Equal(t, int64(1_001_000), kda.CirculatingSupply)
+	assert.Equal(t, int64(math.MaxInt64), kda.MintedValue)
+}
+
+func TestUserAccount_Claim_APR_ForfeitsGainOnNegativeSupply(t *testing.T) {
+	t.Parallel()
+
+	kda := &kapps.KDAData{MaxSupply: 0, CirculatingSupply: -1, MintedValue: 1_000}
+
+	gains, err := claimOneYearAtFullAPR(t, kda, true)
+	assert.ErrorIs(t, err, state.ErrAPRGainDropped)
+	assert.ErrorIs(t, err, state.ErrNegativeCirculatingSupply)
+	assert.Zero(t, gains["KLV"])
+	assert.Equal(t, int64(-1), kda.CirculatingSupply)
+	assert.Equal(t, int64(1_000), kda.MintedValue)
+}
+
+func TestUserAccount_Claim_APR_CreditsGainWithNegativeMintedValue(t *testing.T) {
+	t.Parallel()
+
+	kda := &kapps.KDAData{MaxSupply: 0, CirculatingSupply: 1_000, MintedValue: -1_000_000_000}
+
+	gains, err := claimOneYearAtFullAPR(t, kda, true)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1_000_000), gains["KLV"])
+	assert.Equal(t, int64(1_001_000), kda.CirculatingSupply)
+	assert.Equal(t, int64(-999_000_000), kda.MintedValue)
+}
+
+func TestUserAccount_Claim_APR_SkipsOverflowingGainOnNegativeSupply(t *testing.T) {
+	t.Parallel()
+
+	account := state.NewEmptyUserAccount()
+	userKDA, staking := aprClaimInputs(1_000_000_000_000_000, &kapps.APRData{Timestamp: aprClaimStart, Value: math.MaxUint32})
+	kda := &kapps.KDAData{MaxSupply: 0, CirculatingSupply: -1, MintedValue: 1_000}
+
+	gains, err := account.Claim(
+		transaction.ClaimContract_StakingClaim,
+		kdautils.KLVIdentifier, 2, aprClaimStart+9*86400,
+		staking, kda, userKDA, mock.NewForkControllerStub().SetFork("FixAuditChangesV6", true),
+	)
+	assert.ErrorIs(t, err, state.ErrAPRGainDropped)
+	assert.ErrorIs(t, err, common.ErrInt64Overflow)
+	assert.Zero(t, gains["KLV"])
+	assert.Equal(t, int64(-1), kda.CirculatingSupply)
+	assert.Equal(t, int64(1_000), kda.MintedValue)
+}
+
+func TestUserAccount_Claim_APR_ZeroGainAboveMaxSupply(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		fixV6         bool
+		expectedError error
+	}{
+		{name: "with fix", fixV6: true, expectedError: nil},
+		{name: "before fix", fixV6: false, expectedError: common.ErrMaxSupplyExceeded},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			account := state.NewEmptyUserAccount()
+			userKDA, staking := aprClaimInputs(1_000_000, &kapps.APRData{Timestamp: aprClaimStart, Value: core.HundredPercent})
+			userKDA.LastClaim = nil
+			kda := &kapps.KDAData{MaxSupply: 10, CirculatingSupply: 20, MintedValue: 20}
+
+			_, err := account.Claim(
+				transaction.ClaimContract_StakingClaim,
+				kdautils.KLVIdentifier, 2, aprClaimStart+core.OneYearTimestamp,
+				staking, kda, userKDA, mock.NewForkControllerStub().SetFork("FixAuditChangesV6", tt.fixV6),
+			)
+			assert.Equal(t, tt.expectedError, err)
+			assert.Equal(t, int64(20), kda.CirculatingSupply)
+			assert.Equal(t, int64(20), kda.MintedValue)
+		})
+	}
+}
+
+func TestUserAccount_ComputeClaimAPR_SameGainWithAndWithoutV6(t *testing.T) {
+	t.Parallel()
+
+	account := state.NewEmptyUserAccount()
+	compute := func(fixV6 bool) int64 {
+		userKDA, staking := aprClaimInputs(1_000_000, &kapps.APRData{Timestamp: aprClaimStart, Value: 1000})
+		gains, err := account.ComputeAvailableClaim(
+			kdautils.KLVIdentifier, 2, aprClaimStart+86400, userKDA, staking, mock.NewForkControllerStub().SetFork("FixAuditChangesV6", fixV6),
+		)
+		assert.NoError(t, err)
+
+		return gains["KLV"]
+	}
+
+	withV6 := compute(true)
+	assert.Equal(t, int64(273), withV6)
+	assert.Equal(t, compute(false), withV6)
+}
+
+func TestUserAccount_ComputeClaimAPR_GainLimits(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		stake         int64
+		aprs          []*kapps.APRData
+		claimAt       int64
+		fixV6         bool
+		expectedGain  int64
+		expectedError error
+	}{
+		{
+			name:          "saturated gain with fix",
+			stake:         10_000_000_000_000_000,
+			aprs:          []*kapps.APRData{{Timestamp: aprClaimStart, Value: math.MaxUint32}},
+			claimAt:       aprClaimStart + 2*86400,
+			fixV6:         true,
+			expectedError: common.ErrInt64Overflow,
+		},
+		{
+			name:         "saturated gain before fix",
+			stake:        10_000_000_000_000_000,
+			aprs:         []*kapps.APRData{{Timestamp: aprClaimStart, Value: math.MaxUint32}},
+			claimAt:      aprClaimStart + 2*86400,
+			expectedGain: math.MaxInt64,
+		},
+		{
+			name:  "overflowing segment sum with fix",
+			stake: 5_000_000_000_000_000_000,
+			aprs: []*kapps.APRData{
+				{Timestamp: aprClaimStart, Value: core.HundredPercent},
+				{Timestamp: aprClaimStart + core.OneYearTimestamp, Value: core.HundredPercent},
+			},
+			claimAt:       aprClaimStart + 2*core.OneYearTimestamp,
+			fixV6:         true,
+			expectedError: common.ErrInt64Overflow,
+		},
+		{
+			name:  "overflowing segment sum before fix",
+			stake: 5_000_000_000_000_000_000,
+			aprs: []*kapps.APRData{
+				{Timestamp: aprClaimStart, Value: core.HundredPercent},
+				{Timestamp: aprClaimStart + core.OneYearTimestamp, Value: core.HundredPercent},
+			},
+			claimAt:      aprClaimStart + 2*core.OneYearTimestamp,
+			expectedGain: -8_446_744_073_709_551_616,
+		},
+		{
+			name:          "negative gain with fix",
+			stake:         1_000_000_000_000,
+			aprs:          []*kapps.APRData{{Timestamp: aprClaimStart - 500, Value: 1000}},
+			claimAt:       aprClaimStart - 100,
+			fixV6:         true,
+			expectedError: common.ErrNegativeValue,
+		},
+		{
+			name:          "single gain at 2^63",
+			stake:         math.MaxInt64,
+			aprs:          []*kapps.APRData{{Timestamp: aprClaimStart, Value: core.HundredPercent}},
+			claimAt:       aprClaimStart + core.OneYearTimestamp,
+			fixV6:         true,
+			expectedError: common.ErrInt64Overflow,
+		},
+		{
+			name:         "single gain below 2^63",
+			stake:        1<<63 - 1<<44,
+			aprs:         []*kapps.APRData{{Timestamp: aprClaimStart, Value: core.HundredPercent}},
+			claimAt:      aprClaimStart + core.OneYearTimestamp,
+			fixV6:        true,
+			expectedGain: 1<<63 - 1<<44,
+		},
+		{
+			name:  "segment sum at 2^63",
+			stake: 1 << 61,
+			aprs: []*kapps.APRData{
+				{Timestamp: aprClaimStart, Value: core.HundredPercent},
+				{Timestamp: aprClaimStart + core.OneYearTimestamp, Value: 3 * core.HundredPercent},
+			},
+			claimAt:       aprClaimStart + 2*core.OneYearTimestamp,
+			fixV6:         true,
+			expectedError: common.ErrInt64Overflow,
+		},
+		{
+			name:  "segment sum below 2^63",
+			stake: 1<<61 - 1<<43,
+			aprs: []*kapps.APRData{
+				{Timestamp: aprClaimStart, Value: core.HundredPercent},
+				{Timestamp: aprClaimStart + core.OneYearTimestamp, Value: 3 * core.HundredPercent},
+			},
+			claimAt:      aprClaimStart + 2*core.OneYearTimestamp,
+			fixV6:        true,
+			expectedGain: 1<<63 - 1<<45,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			account := state.NewEmptyUserAccount()
+			userKDA, staking := aprClaimInputs(tt.stake, tt.aprs...)
+
+			gains, err := account.ComputeAvailableClaim(
+				kdautils.KLVIdentifier, 2, tt.claimAt, userKDA, staking, mock.NewForkControllerStub().SetFork("FixAuditChangesV6", tt.fixV6),
+			)
+			assert.Equal(t, tt.expectedError, err)
+			assert.Equal(t, tt.expectedGain, gains["KLV"])
+		})
+	}
+}
+
+func TestAPRGainDropReason(t *testing.T) {
+	t.Parallel()
+
+	apr := &kapps.StakingData{InterestType: kapps.StakingData_APRI}
+	gains := map[string]int64{"KLV": 1_000}
+
+	tests := []struct {
+		name       string
+		staking    *kapps.StakingData
+		kda        *kapps.KDAData
+		gains      map[string]int64
+		computeErr error
+		fixV6      bool
+		reason     error
+	}{
+		{name: "gain overflowing int64", staking: apr, kda: &kapps.KDAData{}, computeErr: common.ErrInt64Overflow, fixV6: true, reason: common.ErrInt64Overflow},
+		{name: "gain on negative supply", staking: apr, kda: &kapps.KDAData{CirculatingSupply: -1}, gains: gains, fixV6: true, reason: state.ErrNegativeCirculatingSupply},
+		{name: "gain overflowing uncapped supply", staking: apr, kda: &kapps.KDAData{CirculatingSupply: math.MaxInt64 - 999}, gains: gains, fixV6: true, reason: common.ErrInt64Overflow},
+		{name: "gain fitting uncapped supply", staking: apr, kda: &kapps.KDAData{CirculatingSupply: math.MaxInt64 - 1_000}, gains: gains, fixV6: true},
+		{name: "gain above the cap", staking: apr, kda: &kapps.KDAData{MaxSupply: 10, CirculatingSupply: 10}, gains: gains, fixV6: true, reason: common.ErrMaxSupplyExceeded},
+		{name: "gain filling the cap", staking: apr, kda: &kapps.KDAData{MaxSupply: 10_000, CirculatingSupply: 9_000}, gains: gains, fixV6: true},
+		{name: "zero gain on negative supply", staking: apr, kda: &kapps.KDAData{CirculatingSupply: -1}, fixV6: true},
+		{name: "other computation error", staking: apr, kda: &kapps.KDAData{CirculatingSupply: -1}, gains: gains, computeErr: common.ErrNegativeValue, fixV6: true},
+		{name: "FPR staking", staking: &kapps.StakingData{InterestType: kapps.StakingData_FPRI}, kda: &kapps.KDAData{CirculatingSupply: -1}, gains: gains, fixV6: true},
+		{name: "before fix", staking: apr, kda: &kapps.KDAData{CirculatingSupply: -1}, gains: gains, computeErr: common.ErrInt64Overflow},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason := state.APRGainDropReason(
+				tt.staking, tt.kda, tt.gains, kdautils.KLVIdentifier, tt.computeErr, mock.NewForkControllerStub().SetFork("FixAuditChangesV6", tt.fixV6),
+			)
+			assert.Equal(t, tt.reason, reason)
+		})
+	}
+}
+
 func TestUserAccount_GetBalanceWithNonce_CustomAsset(t *testing.T) {
 	t.Parallel()
 

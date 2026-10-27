@@ -19,7 +19,7 @@ type RateChange struct {
 
 type ValidatorsKapp interface {
 	SetKAppController(controller KAppController) error
-	Register(tc *transaction.CreateValidatorContract) (transaction.Transaction_TXResultCode, error)
+	Register(sender []byte, tc *transaction.CreateValidatorContract) (transaction.Transaction_TXResultCode, error)
 	UpdateValidator(sender []byte, tc *transaction.ValidatorConfigContract) (transaction.Transaction_TXResultCode, error)
 	Delegate(sender []byte, blockTime int64, blockEpoch uint32, tc *transaction.DelegateContract) (transaction.Transaction_TXResultCode, [][]byte, error)
 	Undelegate(blockEpoch uint32, validator []byte, sender []byte, tc *transaction.UndelegateContract) (transaction.Transaction_TXResultCode, error)

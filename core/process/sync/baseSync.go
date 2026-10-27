@@ -550,6 +550,15 @@ func (boot *baseBootstrap) doJobOnSyncBlockFail(headerHandler data.HeaderHandler
 		return
 	}
 
+	if isBlockBodyRejected(err) && !check.IfNil(headerHandler) {
+		log.Debug("block body was rejected, dropping it from the pool",
+			"nonce", headerHandler.GetNonce(),
+			"error", err.Error())
+		hash := boot.removeHeaderFromPools(headerHandler)
+		boot.requestHandler.RemoveHeaderRequests(headerHandler.GetNonce(), hash)
+		return
+	}
+
 	processBlockStarted := !check.IfNil(headerHandler)
 	isProcessWithError := processBlockStarted && err != process.ErrTimeIsOut
 
@@ -575,6 +584,12 @@ func (boot *baseBootstrap) doJobOnSyncBlockFail(headerHandler data.HeaderHandler
 			boot.removeHeadersHigherThanNonceFromPool(boot.getNonceForCurrentBlock())
 		}
 	}
+}
+
+func isBlockBodyRejected(err error) bool {
+	return errors.Is(err, process.ErrBlockBodyNotMatchingHeader) ||
+		errors.Is(err, process.ErrTransactionResultMismatch) ||
+		errors.Is(err, process.ErrBlockExecutionNotMatchingHeader)
 }
 
 // postponeSync records the chronology position a header was postponed at, so the

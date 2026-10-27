@@ -72,10 +72,10 @@ type VMHost interface {
 	IsInterfaceNil() bool
 }
 
-// BlockchainContext defines the functionality needed for interacting with the blockchain context
+// BlockchainContext defines the functionality needed for interacting with the blockchain context.
+// Unlike the other contexts it has no state stack: transfers settle into the accounts cacher
+// immediately and cannot be reverted below the transaction, so every VM error path must abort it.
 type BlockchainContext interface {
-	StateStack
-
 	NewAddress(creatorAddress []byte) ([]byte, error)
 	AccountExists(addr []byte) bool
 	GetBalance(addr []byte) []byte
@@ -105,8 +105,6 @@ type BlockchainContext interface {
 	GetSFTMeta(tokenID []byte, nonce uint64) (*kapps.MetaV2, error)
 	GetUserAccount(address []byte) (state.UserAccountHandler, error)
 	ProcessBuiltInFunction(input *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error)
-	GetSnapshot() int
-	RevertToSnapshot(snapshot int)
 	TransferValueOnly(destination []byte, sender []byte, value *big.Int) error
 	IncreaseNonce(address []byte)
 	KDATransfer(sender []byte, tc *transaction.TransferContract) error
@@ -142,6 +140,8 @@ type RuntimeContext interface {
 	DisarmPendingCodeVerification()
 	SetRuntimeBreakpointValue(value BreakpointValue)
 	GetRuntimeBreakpointValue() BreakpointValue
+	RequestTimeoutInterruption()
+	ClearTimeoutInterruption()
 	GetInstanceStackSize() uint64
 	CountSameContractInstancesOnStack(address []byte) uint64
 	IsFunctionImported(name string) bool
@@ -181,13 +181,16 @@ type InstanceTracker interface {
 	TrackedInstances() map[string]executor.Instance
 }
 
-// ManagedTypesContext defines the functionality needed for interacting with the big int context
+// ManagedTypesContext defines the functionality needed for interacting with the big int context.
+// Once FixAuditChangesV6 is active its PushState moves the active values onto the stack and leaves
+// an empty active state, so a push must be undone with PopSetActiveState, never PopDiscard.
 type ManagedTypesContext interface {
 	StateStack
 
 	GetRandReader() io.Reader
 	ConsumeGasForThisBigIntNumberOfBytes(byteLen *big.Int) error
 	ConsumeGasForThisIntNumberOfBytes(byteLen int)
+	ConsumeGasForThisIntNumberOfBytesBounded(byteLen int64) error
 	ConsumeGasForBytes(bytes []byte)
 	ConsumeGasForByteLenBounded(byteLen uint64) error
 	ConsumeGasForAppend(mBufferHandle int32, dataLength int32) error
@@ -203,6 +206,7 @@ type ManagedTypesContext interface {
 	BigFloatExpIsNotValid(exponent int) bool
 	BigFloatIsNotCanonical(bigFloat *big.Float) bool
 	EncodedBigFloatIsNotValid(encodedBigFloat []byte) bool
+	EncodedBigFloatLenIsNotValid(length int32) bool
 	GetBigFloatOrCreate(handle int32) (*big.Float, error)
 	GetBigFloat(handle int32) (*big.Float, error)
 	GetTwoBigFloats(handle1 int32, handle2 int32) (*big.Float, *big.Float, error)
@@ -224,7 +228,7 @@ type ManagedTypesContext interface {
 	DeleteSlice(mBufferHandle int32, startPosition int32, lengthOfSlice int32) ([]byte, error)
 	InsertSlice(mBufferHandle int32, startPosition int32, slice []byte) ([]byte, error)
 	ReadManagedVecOfManagedBuffers(managedVecHandle int32) ([][]byte, uint64, error)
-	WriteManagedVecOfManagedBuffers(data [][]byte, destinationHandle int32)
+	WriteManagedVecOfManagedBuffers(data [][]byte, destinationHandle int32) error
 	NewManagedMap() int32
 	ManagedMapPut(mMapHandle int32, keyHandle int32, valueHandle int32) error
 	ManagedMapGet(mMapHandle int32, keyHandle int32, outValueHandle int32) error

@@ -3,11 +3,13 @@ package sharding
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/crypto/hashing/sha256"
 	"github.com/klever-io/klever-go/data/block"
+	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/sharding/mock"
 	"github.com/klever-io/klever-go/tools/check"
 	"github.com/stretchr/testify/assert"
@@ -422,6 +424,63 @@ func TestNewNodesCoordinator_EpochStart(t *testing.T) {
 	require.NotNil(t, validators)
 }
 
+// The epoch-start notifier goroutine reads validatorsInfo through EpochStartPrepare
+// while block processing writes it through SetEpochValidatorsInfo. Run with -race.
+func TestNodesCoordinator_SetEpochValidatorsInfoConcurrentWithEpochStartPrepare(t *testing.T) {
+	t.Parallel()
+
+	ihgs, err := NewNodesCoordinator(createArguments())
+	require.Nil(t, err)
+
+	validatorsInfo := make([]*state.ValidatorInfo, 0)
+	for i := uint32(0); i < 4; i++ {
+		pk := []byte(fmt.Sprintf("pk%d_elected", i))
+		validatorsInfo = append(validatorsInfo, &state.ValidatorInfo{
+			OwnerAddress: pk,
+			PublicKey:    pk,
+			List:         string(core.ElectedList),
+			Index:        i,
+		})
+	}
+
+	const numEpochs = uint32(200)
+	errs := make([]error, numEpochs+1)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for epoch := uint32(1); epoch <= numEpochs; epoch++ {
+			errs[epoch] = ihgs.SetEpochValidatorsInfo(epoch, validatorsInfo)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for epoch := uint32(1); epoch <= numEpochs; epoch++ {
+			ihgs.EpochStartPrepare(&block.Block{
+				Header: &block.BlockHeader{
+					PrevRandSeed: []byte("rand seed"),
+					IsEpochStart: true,
+					Epoch:        epoch,
+				},
+			})
+		}
+	}()
+	wg.Wait()
+
+	for _, err := range errs {
+		require.Nil(t, err)
+	}
+
+	// only the last three epochs are kept
+	ihgs.mutValidatorsInfo.RLock()
+	defer ihgs.mutValidatorsInfo.RUnlock()
+	require.Len(t, ihgs.validatorsInfo, 3)
+	for epoch := numEpochs - 2; epoch <= numEpochs; epoch++ {
+		require.Len(t, ihgs.validatorsInfo[epoch], len(validatorsInfo))
+	}
+}
+
 func TestNodesCoordinator_EpochStart_ElectedSortedAscendingByIndex(t *testing.T) {
 	t.Parallel()
 
@@ -558,74 +617,29 @@ func TestNodesCoordinator_computeNodesConfigFromList_NoValidators(t *testing.T) 
 	assert.True(t, errors.Is(err, ErrListSizeZero))
 }
 
-func TestNodesCoordinator_allValidatorsInfo_EpochNodesConfigDoesNotExist(t *testing.T) {
+func TestNodesCoordinator_GetAllValidatorsKeys_EpochNodesConfigDoesNotExist(t *testing.T) {
 	t.Parallel()
 
-	electedList := createDummyNodesList(6, "elected")
-	eligibleList := createDummyNodesList(0, "eligible")
-
-	shufflerArgs := &NodesShufflerArgs{
-		Nodes:                5,
-		MaxNodesEnableConfig: nil,
-	}
-	nodeShuffler, err := NewHashValidatorsShuffler(shufflerArgs)
+	ihgs, err := NewNodesCoordinator(createArguments())
 	require.Nil(t, err)
 
-	epochStartSubscriber := &mock.EpochStartNotifierStub{}
-	bootStorer := mock.NewStorerMock()
-
-	arguments := ArgNodesCoordinator{
-		ConsensusGroupSize:  5,
-		Marshalizer:         &mock.MarshalizerMock{},
-		Hasher:              &mock.HasherMock{},
-		Shuffler:            nodeShuffler,
-		EpochStartNotifier:  epochStartSubscriber,
-		BootStorer:          bootStorer,
-		ElectedNodes:        electedList,
-		EligibleNodes:       eligibleList,
-		SelfPublicKey:       []byte("test"),
-		ConsensusGroupCache: &mock.NodesCoordinatorCacheMock{},
+	missingEpoch := uint32(1)
+	getters := map[string]func(epoch uint32, ownerKey bool) ([][]byte, error){
+		"elected":  ihgs.GetAllElectedValidatorsKeys,
+		"eligible": ihgs.GetAllEligibleValidatorsKeys,
+		"waiting":  ihgs.GetAllWaitingValidatorsKeys,
 	}
 
-	ihgs, err := NewNodesCoordinator(arguments)
-	require.Nil(t, err)
+	for name, getter := range getters {
+		for _, ownerKey := range []bool{false, true} {
+			keys, err := getter(missingEpoch, ownerKey)
+			require.Nil(t, keys, name)
+			require.True(t, errors.Is(err, ErrEpochNodesConfigDoesNotExist), name)
+		}
 
-	ihgs.currentEpoch.Store(1)
-}
-
-func TestNodesCoordinator_allValidatorsInfo_KeepLeavingIfNotEnoughValidators(t *testing.T) {
-	t.Parallel()
-
-	electedList := createDummyNodesList(6, "elected")
-	eligibleList := createDummyNodesList(0, "eligible")
-
-	shufflerArgs := &NodesShufflerArgs{
-		Nodes:                5,
-		MaxNodesEnableConfig: nil,
+		_, err := getter(0, false)
+		require.Nil(t, err, name)
 	}
-	nodeShuffler, err := NewHashValidatorsShuffler(shufflerArgs)
-	require.Nil(t, err)
-
-	epochStartSubscriber := &mock.EpochStartNotifierStub{}
-	bootStorer := mock.NewStorerMock()
-
-	arguments := ArgNodesCoordinator{
-		ConsensusGroupSize:  5,
-		Marshalizer:         &mock.MarshalizerMock{},
-		Hasher:              &mock.HasherMock{},
-		Shuffler:            nodeShuffler,
-		EpochStartNotifier:  epochStartSubscriber,
-		BootStorer:          bootStorer,
-		ElectedNodes:        electedList,
-		EligibleNodes:       eligibleList,
-		SelfPublicKey:       []byte("test"),
-		ConsensusGroupCache: &mock.NodesCoordinatorCacheMock{},
-	}
-
-	ihgs, err := NewNodesCoordinator(arguments)
-	require.Nil(t, err)
-
-	ihgs.nodesConfig[0].leavingList = append(ihgs.nodesConfig[0].leavingList, electedList[0])
 }
 
 func TestNodesCoordinator_computeNodesConfigFromList_NilPk(t *testing.T) {
@@ -659,6 +673,58 @@ func TestNodesCoordinator_computeNodesConfigFromList_NilPk(t *testing.T) {
 	assert.Nil(t, newNodesConfig)
 	assert.NotNil(t, err)
 	assert.Equal(t, ErrNilPubKey, err)
+}
+
+func TestNodesCoordinator_computeNodesConfigFromList_ObserverLeavingAndUnknownAreInNoList(t *testing.T) {
+	t.Parallel()
+
+	arguments := createArguments()
+	arguments.SelfPublicKey = []byte("pk")
+	ihgs, _ := NewNodesCoordinator(arguments)
+
+	newValidatorInfo := func(pk string, list string, index uint32) *block.EValidatorInfo {
+		return &block.EValidatorInfo{
+			OwnerAddress: []byte(pk),
+			PublicKey:    []byte(pk),
+			List:         list,
+			Index:        index,
+			TempRating:   2,
+		}
+	}
+
+	excluded := []*block.EValidatorInfo{
+		newValidatorInfo("pkObserver", string(core.ObserverList), 4),
+		newValidatorInfo("pkLeaving", string(core.LeavingList), 5),
+		newValidatorInfo("pkUnknown", "notAList", 6),
+	}
+	validatorInfos := append([]*block.EValidatorInfo{
+		newValidatorInfo("pkElected", string(core.ElectedList), 1),
+		newValidatorInfo("pkEligible", string(core.EligibleList), 2),
+		newValidatorInfo("pkWaiting", string(core.WaitingList), 3),
+	}, excluded...)
+
+	newNodesConfig, err := ihgs.computeNodesConfigFromList(validatorInfos)
+	require.Nil(t, err)
+
+	require.Len(t, newNodesConfig.electedList, 1)
+	require.Len(t, newNodesConfig.eligibleList, 1)
+	require.Len(t, newNodesConfig.waitingList, 1)
+	require.Empty(t, newNodesConfig.leavingList)
+
+	lists := map[string][]Validator{
+		"elected":  newNodesConfig.electedList,
+		"eligible": newNodesConfig.eligibleList,
+		"waiting":  newNodesConfig.waitingList,
+		"leaving":  newNodesConfig.leavingList,
+	}
+	for name, list := range lists {
+		for _, validator := range list {
+			for _, validatorInfo := range excluded {
+				require.NotEqual(t, validatorInfo.PublicKey, validator.PubKey(),
+					"%s validator must not be in the %s list", validatorInfo.List, name)
+			}
+		}
+	}
 }
 
 func TestNodesCoordinator_computeNodesConfigFromList_Validators(t *testing.T) {

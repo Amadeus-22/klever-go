@@ -34,6 +34,11 @@ func (tlp *printTxLogProcessor) EnableLogToBeSavedInCache() {
 func (tlp *printTxLogProcessor) Clean() {
 }
 
+// SaveLogsToStorage -
+func (tlp *printTxLogProcessor) SaveLogsToStorage() error {
+	return nil
+}
+
 // GetAllCurrentLogs -
 func (tlp *printTxLogProcessor) GetAllCurrentLogs() []*data.LogData {
 	return []*data.LogData{}

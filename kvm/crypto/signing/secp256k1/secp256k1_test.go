@@ -48,6 +48,49 @@ func TestWrongSizeForRSShouldNotPanic(t *testing.T) {
 	assert.NotEmpty(t, sig)
 }
 
+// TestWrongSizeForPlainMsgShouldNotPanic pins what this layer does with a plain message that is
+// not a 32-byte digest: the curve reads only the first 32 bytes and zero-extends a shorter one.
+// That truncation is legacy behaviour that pre-fork blocks replay against, so it stays here and
+// the rejection lives in the verify hooks behind FixAuditChangesV6 (isSecp256k1PlainMessage
+// in kvm/vmhost/vmhooks/cryptoei.go). If this test starts failing because the layer rejects, the
+// hook guard is redundant and the fork gate must be revisited.
+func TestWrongSizeForPlainMsgShouldNotPanic(t *testing.T) {
+	t.Parallel()
+
+	msg, _ := hex.DecodeString("ce0677bb30baa8cf067c88db9811f4333d131bf8bcf12fe7065d211dce971008")
+	r, _ := hex.DecodeString("90f27b8b488db00b00606796d2987f6a5f59ae62ea05effe84fef5b8b0e54998")
+	s, _ := hex.DecodeString("4a691139ad57a3f0b906637673aa2f63d1f55cb1a69199d4009eea23ceaddc93")
+	key, _ := hex.DecodeString("04e32df42865e97135acfb65f3bae71bdc86f4d49150ad6a440b6f15878109880a0a2b2667f7e725ceea70c673093bf67663e0312623c8e091b13cf2c0f11ef652")
+
+	verifier := NewSecp256k1()
+	sig, err := verifier.EncodeSecp256k1DERSignature(r, s)
+	require.Nil(t, err)
+
+	appended := append(append([]byte{}, msg...), []byte("unsigned tail")...)
+
+	testCases := []struct {
+		name        string
+		msg         []byte
+		expectedErr error
+	}{
+		{name: "exact 32-byte digest", msg: msg, expectedErr: nil},
+		{name: "digest with appended bytes is truncated and still verifies", msg: appended, expectedErr: nil},
+		{name: "31-byte prefix is zero-extended to a different digest", msg: msg[:31], expectedErr: signing.ErrInvalidSignature},
+		{name: "empty message", msg: []byte{}, expectedErr: signing.ErrInvalidSignature},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.NotPanics(t, func() {
+				err := verifier.VerifySecp256k1(key, tc.msg, sig, byte(ECDSAPlainMsg))
+				assert.Equal(t, tc.expectedErr, err)
+			})
+		})
+	}
+}
+
 func TestBitcoinSig(t *testing.T) {
 	t.Parallel()
 

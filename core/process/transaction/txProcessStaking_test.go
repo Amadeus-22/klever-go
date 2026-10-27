@@ -1,7 +1,9 @@
 package transaction_test
 
 import (
+	"bytes"
 	"math"
+	"math/big"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/fork"
 	"github.com/klever-io/klever-go/core/kapp"
+	"github.com/klever-io/klever-go/core/kapp/builtInFunctions"
 	kappcontroller "github.com/klever-io/klever-go/core/kapp/kappController"
 	"github.com/klever-io/klever-go/core/process"
 	"github.com/klever-io/klever-go/core/process/kda/kdautils"
@@ -21,6 +24,7 @@ import (
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
 	"github.com/klever-io/klever-go/kapps"
+	"github.com/klever-io/klever-go/vmcommon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -103,9 +107,6 @@ func NewController(t *testing.T) *Controller {
 	execTx, err := pTX.NewTxProcessor(args)
 	require.NoError(t, err)
 
-	err = execTx.SetProposalController(pc)
-	require.NoError(t, err)
-
 	c := &Controller{userDB, kappDB, peersDB, accCacher, kdaKapp, stakingKapp, validatorsKapp, marketplaceKapp, pc, args.KAppController, execTx, t}
 	c.CreateMainAssets()
 	c.CreateAPRAsset()
@@ -125,8 +126,6 @@ func (c *Controller) RecreateTxProcessor(cfg config.EnableEpochs) {
 	SetupKappController(c.t, &args)
 
 	execTx, _ := pTX.NewTxProcessor(args)
-
-	_ = execTx.SetProposalController(c.proposalController)
 
 	c.execTx = execTx
 
@@ -159,9 +158,6 @@ func (c *Controller) UpdateForkController(cfg config.EnableEpochs) {
 	InitKapps(args.KAppController, c.accCacher, c.proposalController)
 
 	execTx, err := pTX.NewTxProcessor(args)
-	require.NoError(c.t, err)
-
-	err = execTx.SetProposalController(c.proposalController)
 	require.NoError(c.t, err)
 
 	c.kappController = args.KAppController
@@ -430,7 +426,7 @@ func (c *Controller) RunDelegateTX(blk *block.Block, ownerAddress []byte, bucket
 
 }
 
-func (c *Controller) RunClaimTX(blk *block.Block, ty transaction.ClaimContract_EnumClaimType, ownerAddress, assetID []byte, errorType error) {
+func (c *Controller) RunClaimTX(blk *block.Block, ty transaction.ClaimContract_EnumClaimType, ownerAddress, assetID []byte, errorType error) *transaction.Transaction {
 	claimContract := transaction.ClaimContract{
 		ClaimType: ty,
 		ID:        assetID,
@@ -441,7 +437,9 @@ func (c *Controller) RunClaimTX(blk *block.Block, ty transaction.ClaimContract_E
 	assert.Nil(c.t, err)
 
 	err = c.execTx.ProcessTransaction(blk, hash, tx)
-	assert.Equal(c.t, errorType, err)
+	assert.ErrorIs(c.t, err, errorType)
+
+	return tx
 }
 
 func (c *Controller) RunUnfreezeTX(blk *block.Block, ownerAddress, assetID, bucketID []byte, errorType error) {
@@ -1009,6 +1007,487 @@ func TestStakingTxProcessor_APR_Pos_Fork_Updates_More_Than_100_Times(t *testing.
 	assert.NotEqual(t, aprAssetMinted, simulatedRewardsPreFork)
 }
 
+const aprSupplyStart = int64(1_700_000_000)
+const aprFixedSupply = int64(10_000_000_000_000_000)
+const aprLargeSupply = int64(8_000_000_000_000_000_000)
+
+func setAPRAssetSupply(t *testing.T, c *Controller, circulating, maxSupply int64) {
+	t.Helper()
+
+	updateAPRAsset(t, c, func(asset *kapps.KDAData) {
+		asset.InitialSupply = circulating
+		asset.CirculatingSupply = circulating
+		asset.MintedValue = circulating
+		asset.MaxSupply = maxSupply
+	})
+}
+
+func updateAPRAsset(t *testing.T, c *Controller, update func(asset *kapps.KDAData)) {
+	t.Helper()
+
+	asset, err := c.GetAsset(APRIdentifier)
+	require.NoError(t, err)
+
+	update(asset)
+
+	data, err := marshalizer.Marshal(asset)
+	require.NoError(t, err)
+	require.NoError(t, c.kdaKapp.DataTrieTracker().SaveKeyValue(kdautils.ToKDAKey(APRIdentifier, nil), data))
+	require.NoError(t, c.kappDB.SaveAccount(c.kdaKapp))
+}
+
+func getAPRAsset(t *testing.T, c *Controller) *kapps.KDAData {
+	t.Helper()
+
+	asset, err := c.GetAsset(APRIdentifier)
+	require.NoError(t, err)
+
+	return asset
+}
+
+func stakeAPRSupplyAfterRaise(t *testing.T, c *Controller, circulating, maxSupply int64, apr uint32) int64 {
+	t.Helper()
+
+	setAPRAssetSupply(t, c, circulating, maxSupply)
+	c.AddUser(OwnerAddress, circulating, APRIdentifier)
+
+	blk := c.CreateBlockHeader(aprSupplyStart, 1, 1)
+	c.RunTriggerUpdateAPR(blk, APRIdentifier, apr, 0, 0, 0)
+
+	stakedAt := aprSupplyStart + 3600
+	blk = c.CreateBlockHeader(stakedAt, 1, 2)
+	c.RunFreezeTX(blk, OwnerAddress, APRIdentifier, circulating)
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+
+	return stakedAt
+}
+
+func TestStakingTxProcessor_APRClaim_SaturatedGain_PreFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	stakedAt := stakeAPRSupplyAfterRaise(t, c, aprFixedSupply, aprFixedSupply, math.MaxUint32)
+
+	c.RunClaimTX(c.CreateBlockHeader(stakedAt+3600, 2, 3), transaction.ClaimContract_StakingClaim, OwnerAddress, APRIdentifier, common.ErrMaxSupplyExceeded)
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+
+	c.RunClaimTX(c.CreateBlockHeader(stakedAt+2*86400, 2, 4), transaction.ClaimContract_StakingClaim, OwnerAddress, APRIdentifier, nil)
+	c.CheckBalance(OwnerAddress, APRIdentifier, math.MaxInt64)
+
+	asset := getAPRAsset(t, c)
+	assert.Less(t, asset.CirculatingSupply, int64(0))
+	assert.Less(t, asset.MintedValue, int64(0))
+}
+
+func TestStakingTxProcessor_APRClaim_SaturatedGain_PostFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	stakedAt := stakeAPRSupplyAfterRaise(t, c, aprFixedSupply, aprFixedSupply, math.MaxUint32)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	atCap := c.RunClaimTX(c.CreateBlockHeader(stakedAt+3600, 2, 3), transaction.ClaimContract_StakingClaim, OwnerAddress, APRIdentifier, common.ErrMaxSupplyExceeded)
+	assert.Equal(t, transaction.Transaction_MaxSupplyExceeded, atCap.GetResultCode())
+	assert.False(t, hasAPRGainDroppedReceipt(atCap.GetReceipts()))
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+
+	overflow := c.RunClaimTX(c.CreateBlockHeader(stakedAt+2*86400, 2, 4), transaction.ClaimContract_StakingClaim, OwnerAddress, APRIdentifier, common.ErrInt64Overflow)
+	assert.Equal(t, transaction.Transaction_ClaimError, overflow.GetResultCode())
+	assert.False(t, hasAPRGainDroppedReceipt(overflow.GetReceipts()))
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+
+	asset := getAPRAsset(t, c)
+	assert.Equal(t, aprFixedSupply, asset.CirculatingSupply)
+	assert.Equal(t, aprFixedSupply, asset.MintedValue)
+}
+
+func stakeAPRSupplyBeforeRaise(t *testing.T, c *Controller, kept int64) {
+	t.Helper()
+
+	setAPRAssetSupply(t, c, aprFixedSupply, aprFixedSupply)
+	c.AddUser(OwnerAddress, aprFixedSupply, APRIdentifier)
+
+	blk := c.CreateBlockHeader(aprSupplyStart, 1, 1)
+	c.RunTriggerUpdateAPR(blk, APRIdentifier, 1000, 0, 0, 0)
+	c.RunFreezeTX(c.CreateBlockHeader(aprSupplyStart+1, 1, 2), OwnerAddress, APRIdentifier, aprFixedSupply-kept)
+
+	c.RunTriggerUpdateAPR(c.CreateBlockHeader(aprSupplyStart+3600, 1, 3), APRIdentifier, math.MaxUint32, 0, 0, 0)
+}
+
+func TestStakingTxProcessor_APRClaim_OverflowingSegmentsOnFreeze_PreFix(t *testing.T) {
+	kept := int64(1_000)
+
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+	stakeAPRSupplyBeforeRaise(t, c, kept)
+
+	freeze := &transaction.FreezeContract{AssetID: APRIdentifier, Amount: kept}
+	runStakingContractTx(t, c, c.CreateBlockHeader(aprSupplyStart+2*86400, 2, 4), freeze, transaction.TXContract_FreezeContractType, OwnerAddress, nil)
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+
+	asset := getAPRAsset(t, c)
+	assert.Less(t, asset.CirculatingSupply, int64(0))
+	assert.Less(t, asset.MintedValue, int64(0))
+}
+
+func TestStakingTxProcessor_APRClaim_OverflowingSegmentsOnFreeze_PostFix(t *testing.T) {
+	kept := int64(1_000)
+
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+	stakeAPRSupplyBeforeRaise(t, c, kept)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	freeze := &transaction.FreezeContract{AssetID: APRIdentifier, Amount: kept}
+	runStakingContractTx(t, c, c.CreateBlockHeader(aprSupplyStart+2*86400, 2, 4), freeze, transaction.TXContract_FreezeContractType, OwnerAddress, nil)
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+
+	asset := getAPRAsset(t, c)
+	assert.Equal(t, aprFixedSupply, asset.CirculatingSupply)
+	assert.Equal(t, aprFixedSupply, asset.MintedValue)
+}
+
+func TestStakingTxProcessor_APRClaim_NearInt64MaxSupply_PreFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	stakedAt := stakeAPRSupplyAfterRaise(t, c, aprLargeSupply, math.MaxInt64, core.HundredPercent)
+
+	c.RunClaimTX(c.CreateBlockHeader(stakedAt+core.OneYearTimestamp/10, 2, 3), transaction.ClaimContract_StakingClaim, OwnerAddress, APRIdentifier, nil)
+	firstGain := loadUserAccount(c.accCacher, OwnerAddress).GetBalance(APRIdentifier, true)
+	assert.Greater(t, firstGain, int64(0))
+	assert.Equal(t, aprLargeSupply+firstGain, getAPRAsset(t, c).CirculatingSupply)
+
+	c.RunClaimTX(c.CreateBlockHeader(stakedAt+core.OneYearTimestamp/5, 2, 4), transaction.ClaimContract_StakingClaim, OwnerAddress, APRIdentifier, nil)
+	assert.Less(t, getAPRAsset(t, c).CirculatingSupply, int64(0))
+}
+
+func TestStakingTxProcessor_APRClaim_NearInt64MaxSupply_PostFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	stakedAt := stakeAPRSupplyAfterRaise(t, c, aprLargeSupply, math.MaxInt64, core.HundredPercent)
+
+	c.RunClaimTX(c.CreateBlockHeader(stakedAt+core.OneYearTimestamp/10, 2, 3), transaction.ClaimContract_StakingClaim, OwnerAddress, APRIdentifier, nil)
+	firstGain := loadUserAccount(c.accCacher, OwnerAddress).GetBalance(APRIdentifier, true)
+	assert.Greater(t, firstGain, int64(0))
+	assert.Equal(t, aprLargeSupply+firstGain, getAPRAsset(t, c).CirculatingSupply)
+
+	c.RunClaimTX(c.CreateBlockHeader(stakedAt+core.OneYearTimestamp/5, 2, 4), transaction.ClaimContract_StakingClaim, OwnerAddress, APRIdentifier, common.ErrMaxSupplyExceeded)
+	c.CheckBalance(OwnerAddress, APRIdentifier, firstGain)
+	assert.Equal(t, aprLargeSupply+firstGain, getAPRAsset(t, c).CirculatingSupply)
+}
+
+func TestStakingTxProcessor_APRClaim_UncappedSupply_PreFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	stakedAt := stakeAPRSupplyAfterRaise(t, c, aprFixedSupply, 0, math.MaxUint32)
+
+	c.RunClaimTX(c.CreateBlockHeader(stakedAt+2*86400, 2, 3), transaction.ClaimContract_StakingClaim, OwnerAddress, APRIdentifier, nil)
+	c.CheckBalance(OwnerAddress, APRIdentifier, math.MaxInt64)
+	assert.Less(t, getAPRAsset(t, c).CirculatingSupply, int64(0))
+}
+
+func TestStakingTxProcessor_APRClaim_UncappedSupply_PostFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	stakedAt := stakeAPRSupplyAfterRaise(t, c, aprFixedSupply, 0, math.MaxUint32)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	c.RunClaimTX(c.CreateBlockHeader(stakedAt+2*86400, 2, 3), transaction.ClaimContract_StakingClaim, OwnerAddress, APRIdentifier, common.ErrInt64Overflow)
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+	assert.Equal(t, aprFixedSupply, getAPRAsset(t, c).CirculatingSupply)
+}
+
+func hasAPRGainDroppedReceipt(receipts []*transaction.Transaction_Receipt) bool {
+	for _, receipt := range receipts {
+		data := receipt.GetData()
+		if len(data) == 3 && data[0][0] == byte(pTX.Warning) && string(data[1]) == common.ErrFieldAPRGainDropped && bytes.Equal(data[2], APRIdentifier) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func withdrawAPRStakeAfterOneYear(t *testing.T, c *Controller, stake int64, apr uint32, update func(asset *kapps.KDAData)) (int64, *kapps.KDAData, bool) {
+	t.Helper()
+
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+	setAPRAssetSupply(t, c, stake, 0)
+	updateAPRAsset(t, c, update)
+	c.AddUser(OwnerAddress, stake, APRIdentifier)
+
+	c.RunTriggerUpdateAPR(c.CreateBlockHeader(aprSupplyStart, 1, 1), APRIdentifier, apr, 0, 0, 0)
+	c.RunFreezeTX(c.CreateBlockHeader(aprSupplyStart+3600, 1, 2), OwnerAddress, APRIdentifier, stake)
+
+	blk := c.CreateBlockHeader(aprSupplyStart+3600+core.OneYearTimestamp, 2, 3)
+	unfreeze := &transaction.UnfreezeContract{AssetID: APRIdentifier, BucketID: APRIdentifier}
+	unfreezeTx := runStakingContractTx(t, c, blk, unfreeze, transaction.TXContract_UnfreezeContractType, OwnerAddress, nil)
+	withdraw := &transaction.WithdrawContract{AssetID: APRIdentifier, WithdrawType: transaction.WithdrawContract_Staking}
+	runStakingContractTx(t, c, blk, withdraw, transaction.TXContract_WithdrawContractType, OwnerAddress, nil)
+
+	balance := loadUserAccount(c.accCacher, OwnerAddress).GetBalance(APRIdentifier, true)
+
+	return balance - stake, getAPRAsset(t, c), hasAPRGainDroppedReceipt(unfreezeTx.GetReceipts())
+}
+
+func TestStakingTxProcessor_APRClaim_UnfreezeWithOverflowingGain_PostFix(t *testing.T) {
+	stake := int64(1_000_000_000_000_000_000)
+	gain, asset, dropped := withdrawAPRStakeAfterOneYear(t, NewController(t), stake, core.MaxStakingAPR, func(asset *kapps.KDAData) {})
+
+	assert.True(t, dropped)
+	assert.Zero(t, gain)
+	assert.Equal(t, stake, asset.CirculatingSupply)
+	assert.Equal(t, stake, asset.MintedValue)
+}
+
+func TestStakingTxProcessor_APRClaim_UnfreezeWithFullyMintedSupply_PostFix(t *testing.T) {
+	gain, asset, dropped := withdrawAPRStakeAfterOneYear(t, NewController(t), aprFixedSupply, core.HundredPercent, func(asset *kapps.KDAData) {
+		asset.MaxSupply = asset.CirculatingSupply
+	})
+
+	assert.True(t, dropped)
+	assert.Zero(t, gain)
+	assert.Equal(t, aprFixedSupply, asset.CirculatingSupply)
+	assert.Equal(t, aprFixedSupply, asset.MintedValue)
+}
+
+func TestStakingTxProcessor_APRClaim_UnfreezeWithMintedValueNearLimit_PostFix(t *testing.T) {
+	gain, asset, dropped := withdrawAPRStakeAfterOneYear(t, NewController(t), aprFixedSupply, core.HundredPercent, func(asset *kapps.KDAData) {
+		asset.MintedValue = math.MaxInt64 - 1
+	})
+
+	assert.False(t, dropped)
+	assert.Greater(t, gain, int64(0))
+	assert.Equal(t, aprFixedSupply+gain, asset.CirculatingSupply)
+	assert.Equal(t, int64(math.MaxInt64), asset.MintedValue)
+}
+
+func TestStakingTxProcessor_APRClaim_UnfreezeWithNegativeMintedValue_PostFix(t *testing.T) {
+	gain, asset, dropped := withdrawAPRStakeAfterOneYear(t, NewController(t), aprFixedSupply, core.HundredPercent, func(asset *kapps.KDAData) {
+		asset.MintedValue = -1_000
+	})
+
+	assert.False(t, dropped)
+	assert.Greater(t, gain, int64(0))
+	assert.Equal(t, aprFixedSupply+gain, asset.CirculatingSupply)
+	assert.Equal(t, -1_000+gain, asset.MintedValue)
+}
+
+func TestStakingTxProcessor_APRClaim_UnfreezeWithNegativeSupply_PostFix(t *testing.T) {
+	gain, asset, dropped := withdrawAPRStakeAfterOneYear(t, NewController(t), aprFixedSupply, core.HundredPercent, func(asset *kapps.KDAData) {
+		asset.CirculatingSupply = -1
+	})
+
+	assert.True(t, dropped)
+	assert.Zero(t, gain)
+	assert.Equal(t, int64(-1), asset.CirculatingSupply)
+	assert.Equal(t, aprFixedSupply, asset.MintedValue)
+}
+
+func TestStakingTxProcessor_APRClaim_ClaimAndFreezeWithNegativeSupply_PostFix(t *testing.T) {
+	half := aprFixedSupply / 2
+
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+	setAPRAssetSupply(t, c, aprFixedSupply, 0)
+	updateAPRAsset(t, c, func(asset *kapps.KDAData) {
+		asset.CirculatingSupply = -1
+	})
+	c.AddUser(OwnerAddress, aprFixedSupply, APRIdentifier)
+
+	c.RunTriggerUpdateAPR(c.CreateBlockHeader(aprSupplyStart, 1, 1), APRIdentifier, core.HundredPercent, 0, 0, 0)
+	firstFreeze := &transaction.FreezeContract{AssetID: APRIdentifier, Amount: half}
+	firstFreezeTx := runStakingContractTx(t, c, c.CreateBlockHeader(aprSupplyStart+3600, 1, 2), firstFreeze, transaction.TXContract_FreezeContractType, OwnerAddress, nil)
+	assert.False(t, hasAPRGainDroppedReceipt(firstFreezeTx.GetReceipts()))
+
+	blk := c.CreateBlockHeader(aprSupplyStart+3600+core.OneYearTimestamp, 2, 3)
+	claim := &transaction.ClaimContract{ClaimType: transaction.ClaimContract_StakingClaim, ID: APRIdentifier}
+	claimTx := runStakingContractTx(t, c, blk, claim, transaction.TXContract_ClaimContractType, OwnerAddress, state.ErrNegativeCirculatingSupply)
+	assert.False(t, hasAPRGainDroppedReceipt(claimTx.GetReceipts()))
+	topUp := &transaction.FreezeContract{AssetID: APRIdentifier, Amount: half}
+	topUpTx := runStakingContractTx(t, c, blk, topUp, transaction.TXContract_FreezeContractType, OwnerAddress, nil)
+	assert.True(t, hasAPRGainDroppedReceipt(topUpTx.GetReceipts()))
+
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+	c.CheckFrozenBalance(OwnerAddress, APRIdentifier, aprFixedSupply)
+	assert.Equal(t, int64(-1), getAPRAsset(t, c).CirculatingSupply)
+}
+
+func builtinArg(value int64) []byte {
+	return big.NewInt(value).Bytes()
+}
+
+func runStakingBuiltin[T vmcommon.BuiltinFunction](
+	t *testing.T,
+	c *Controller,
+	blk *block.Block,
+	newBuiltin func(uint64, vmcommon.Marshalizer, state.AccountsCacher, core.ForkController, kapp.KAppController) (T, error),
+	args ...[]byte,
+) error {
+	t.Helper()
+
+	builtin, err := newBuiltin(0, marshalizer, c.accCacher, commonMock.NewForkControllerStub(), c.kappController)
+	require.NoError(t, err)
+
+	c.kappController.SetCurrentKAppContext(kapp.NewKappContext(kapp.ArgsNewKAppContext{
+		OriginalSender: OwnerAddress,
+		Block:          blk,
+	}))
+
+	_, err = builtin.ProcessBuiltinFunction(&vmcommon.ContractCallInput{
+		VMInput: vmcommon.VMInput{
+			CallerAddr:  OwnerAddress,
+			Arguments:   args,
+			GasProvided: 1_000_000,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	require.NoError(t, c.accCacher.SaveAll())
+
+	return nil
+}
+
+func runContractStakingClaim(t *testing.T, c *Controller, blk *block.Block) error {
+	t.Helper()
+
+	return runStakingBuiltin(t, c, blk, builtInFunctions.NewKleverClaimFunc, builtinArg(int64(transaction.ClaimContract_StakingClaim)), APRIdentifier)
+}
+
+func TestStakingTxProcessor_APRClaim_ContractClaimSaturatedGain_PreFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	stakedAt := stakeAPRSupplyAfterRaise(t, c, aprFixedSupply, aprFixedSupply, math.MaxUint32)
+
+	err := runContractStakingClaim(t, c, c.CreateBlockHeader(stakedAt+2*86400, 2, 3))
+	assert.NoError(t, err)
+	c.CheckBalance(OwnerAddress, APRIdentifier, math.MaxInt64)
+	assert.Less(t, getAPRAsset(t, c).CirculatingSupply, int64(0))
+}
+
+func TestStakingTxProcessor_APRClaim_ContractClaimSaturatedGain_PostFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	stakedAt := stakeAPRSupplyAfterRaise(t, c, aprFixedSupply, aprFixedSupply, math.MaxUint32)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	err := runContractStakingClaim(t, c, c.CreateBlockHeader(stakedAt+3600, 2, 3))
+	assert.ErrorIs(t, err, common.ErrMaxSupplyExceeded)
+
+	err = runContractStakingClaim(t, c, c.CreateBlockHeader(stakedAt+2*86400, 2, 4))
+	assert.ErrorIs(t, err, common.ErrInt64Overflow)
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+	assert.Equal(t, aprFixedSupply, getAPRAsset(t, c).CirculatingSupply)
+}
+
+func TestStakingTxProcessor_APRClaim_ContractFreezeOverflowingSegments_PreFix(t *testing.T) {
+	kept := int64(1_000)
+
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+	stakeAPRSupplyBeforeRaise(t, c, kept)
+
+	err := runStakingBuiltin(t, c, c.CreateBlockHeader(aprSupplyStart+2*86400, 2, 4), builtInFunctions.NewKleverFreezeFunc, APRIdentifier, builtinArg(kept))
+	assert.NoError(t, err)
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+	assert.Less(t, getAPRAsset(t, c).CirculatingSupply, int64(0))
+}
+
+func TestStakingTxProcessor_APRClaim_ContractFreezeOverflowingSegments_PostFix(t *testing.T) {
+	kept := int64(1_000)
+
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+	stakeAPRSupplyBeforeRaise(t, c, kept)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	err := runStakingBuiltin(t, c, c.CreateBlockHeader(aprSupplyStart+2*86400, 2, 4), builtInFunctions.NewKleverFreezeFunc, APRIdentifier, builtinArg(kept))
+	assert.NoError(t, err)
+	assert.True(t, hasAPRGainDroppedReceipt(c.kappController.GetCurrentKAppContext().Receipts().Get()))
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+	assert.Equal(t, aprFixedSupply, getAPRAsset(t, c).CirculatingSupply)
+}
+
+func TestStakingTxProcessor_APRClaim_ContractUnfreezeSaturatedGain_PreFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	stakedAt := stakeAPRSupplyAfterRaise(t, c, aprFixedSupply, aprFixedSupply, math.MaxUint32)
+
+	err := runStakingBuiltin(t, c, c.CreateBlockHeader(stakedAt+2*86400, 2, 3), builtInFunctions.NewKleverUnfreezeFunc, APRIdentifier, APRIdentifier)
+	assert.NoError(t, err)
+	c.CheckBalance(OwnerAddress, APRIdentifier, math.MaxInt64)
+	assert.Less(t, getAPRAsset(t, c).CirculatingSupply, int64(0))
+}
+
+func TestStakingTxProcessor_APRClaim_ContractUnfreezeSaturatedGain_PostFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	stakedAt := stakeAPRSupplyAfterRaise(t, c, aprFixedSupply, aprFixedSupply, math.MaxUint32)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	blk := c.CreateBlockHeader(stakedAt+2*86400, 2, 3)
+	err := runStakingBuiltin(t, c, blk, builtInFunctions.NewKleverUnfreezeFunc, APRIdentifier, APRIdentifier)
+	assert.NoError(t, err)
+	assert.True(t, hasAPRGainDroppedReceipt(c.kappController.GetCurrentKAppContext().Receipts().Get()))
+	c.CheckBalance(OwnerAddress, APRIdentifier, 0)
+
+	c.RunWithdrawTX(blk, OwnerAddress, APRIdentifier, nil)
+	c.CheckBalance(OwnerAddress, APRIdentifier, aprFixedSupply)
+	assert.Equal(t, aprFixedSupply, getAPRAsset(t, c).CirculatingSupply)
+}
+
+func runContractUpdateStaking(t *testing.T, c *Controller, apr uint32) error {
+	t.Helper()
+
+	return runStakingBuiltin(t, c, c.CreateBlockHeader(aprSupplyStart, 1, 1), builtInFunctions.NewKleverAssetTriggerFunc,
+		builtinArg(int64(transaction.AssetTriggerContract_UpdateStaking)),
+		APRIdentifier,
+		builtinArg(int64(transaction.StakingInfo_APRI)),
+		builtinArg(int64(apr)),
+		builtinArg(0),
+		builtinArg(0),
+		builtinArg(0),
+	)
+}
+
+func lastStoredAPR(t *testing.T, c *Controller) uint32 {
+	t.Helper()
+
+	aprs := c.GetStakingKDA(APRIdentifier).GetAPR()
+	require.NotEmpty(t, aprs)
+
+	return aprs[len(aprs)-1].GetValue()
+}
+
+func TestStakingTxProcessor_APRClaim_ContractUpdateStakingAPRLimit_PreFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	assert.NoError(t, runContractUpdateStaking(t, c, core.MaxStakingAPR+1))
+	assert.Equal(t, core.MaxStakingAPR+1, lastStoredAPR(t, c))
+}
+
+func TestStakingTxProcessor_APRClaim_ContractUpdateStakingAPRLimit_PostFix(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	assert.NoError(t, runContractUpdateStaking(t, c, core.MaxStakingAPR))
+	assert.Equal(t, core.MaxStakingAPR, lastStoredAPR(t, c))
+
+	assert.Equal(t, common.ErrAPRAboveMaximum, runContractUpdateStaking(t, c, core.MaxStakingAPR+1))
+	assert.Equal(t, core.MaxStakingAPR, lastStoredAPR(t, c))
+}
+
 func TestStakingTxProcessor_KDA_FPRClaim(t *testing.T) {
 	initialKLVBalance := int64(2_000_000_000)
 	initialFPRBalance := int64(2_000_000_000)
@@ -1126,7 +1605,8 @@ func TestStakingTxProcessor_KDA_FPRClaim_Unfreeze_Before_Maturity_PreFix(t *test
 
 	c := NewController(t)
 	// Activate FixStakingBuckets only; keep FixAuditChangesV3 inactive to reproduce the bug.
-	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV3: math.MaxUint32})
+	// FixAuditChangesV6 stays inactive too: from it on the expired pool goes to the asset's owner.
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV3: math.MaxUint32, FixAuditChangesV6: math.MaxUint32})
 	c.AddUser(RefAddress, initialKLVBalance, nil)
 	c.AddUser(OwnerAddress, initialFPRBalance, FPRIdentifier)
 	c.AddUser(OwnerAddress, initialKLVBalance, nil)
@@ -1441,7 +1921,8 @@ func expireTopUpPool(t *testing.T, c *Controller, blk *block.Block) {
 
 func TestStakingTxProcessor_KDA_FPRClaim_TopUpBeforeMaturity_RawTx_PreFix(t *testing.T) {
 	c := NewController(t)
-	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV5: math.MaxUint32})
+	// FixAuditChangesV6 stays inactive too: from it on the expired pool goes to the asset's owner.
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV5: math.MaxUint32, FixAuditChangesV6: math.MaxUint32})
 
 	blk := stakeFPRAndDepositReward(t, c)
 	topUpWhileClaimWindowShut(t, c, blk, topUpRewardEpoch)
@@ -1480,6 +1961,141 @@ func TestStakingTxProcessor_KDA_FPRClaim_TopUpBeforeMaturity_RawTx_PostFix(t *te
 	expireTopUpPool(t, c, blk)
 	c.CheckBalance(RefAddress, kdautils.KLVIdentifier,
 		topUpInitialKLV-topUpRewardPool-topUpExpiryDeposit)
+}
+
+const (
+	residualRefFPR  = int64(1_000_000)
+	residualFPRPool = int64(200_000)
+)
+
+func depositFPRReward(t *testing.T, c *Controller, blk *block.Block, sender, currencyID []byte, amount int64) {
+	t.Helper()
+
+	runStakingContractTx(t, c, blk, &transaction.DepositContract{
+		DepositType: transaction.DepositContract_FPRDeposit,
+		ID:          FPRIdentifier,
+		CurrencyID:  currencyID,
+		Amount:      amount,
+	}, transaction.TXContract_DepositContractType, sender, nil)
+}
+
+// fundUnclaimedFPRPool has RefAddress, a holder of the deposit role that does not own the asset,
+// fund the reward epoch with topUpRewardPool of KLV and residualFPRPool of the staked asset.
+// Nobody claims it, so the whole pool is the residual once the epoch expires.
+func fundUnclaimedFPRPool(t *testing.T, c *Controller) *block.Block {
+	t.Helper()
+
+	c.AddUser(RefAddress, residualRefFPR, FPRIdentifier)
+	blk := stakeFPRAndDepositReward(t, c)
+	depositFPRReward(t, c, blk, RefAddress, FPRIdentifier, residualFPRPool)
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	require.Equal(t, residualFPRPool, staking.FPR[0].KDAS[string(FPRIdentifier)].TotalAmount)
+
+	return blk
+}
+
+func checkFPRResidualBalances(c *Controller, refKLV, refFPR, ownerKLV, ownerFPR int64) {
+	c.CheckBalance(RefAddress, kdautils.KLVIdentifier, refKLV)
+	c.CheckBalance(RefAddress, FPRIdentifier, refFPR)
+	c.CheckBalance(OwnerAddress, kdautils.KLVIdentifier, ownerKLV)
+	c.CheckBalance(OwnerAddress, FPRIdentifier, ownerFPR)
+}
+
+// Before FixAuditChangesV6 the expired residual of every currency is paid to whoever deposits next.
+func TestStakingTxProcessor_KDA_FPRExpiredResidual_PaidToTheNextDepositor_PreFork(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	blk := fundUnclaimedFPRPool(t, c)
+	expireTopUpPool(t, c, blk)
+
+	checkFPRResidualBalances(c,
+		topUpInitialKLV-topUpExpiryDeposit, residualRefFPR,
+		topUpInitialKLV, topUpInitialFPR-topUpBaseStake)
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	assert.Equal(t, topUpExpiryEpoch+1, staking.FPR[0].Epoch)
+}
+
+// From FixAuditChangesV6 on the expired residual of every currency is paid to the staking asset's
+// owner, and the depositor that triggered the expiry only pays its own deposit.
+func TestStakingTxProcessor_KDA_FPRExpiredResidual_PaidToTheAssetOwner_PostFork(t *testing.T) {
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	blk := fundUnclaimedFPRPool(t, c)
+	expireTopUpPool(t, c, blk)
+
+	checkFPRResidualBalances(c,
+		topUpInitialKLV-topUpRewardPool-topUpExpiryDeposit, residualRefFPR-residualFPRPool,
+		topUpInitialKLV+topUpRewardPool, topUpInitialFPR-topUpBaseStake+residualFPRPool)
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	assert.Equal(t, topUpExpiryEpoch+1, staking.FPR[0].Epoch)
+}
+
+// When the owner is the one that deposits next, the residual reaches the same account on both
+// sides of the fork.
+func TestStakingTxProcessor_KDA_FPRExpiredResidual_OwnerDepositsNext(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		v6   uint32
+	}{
+		{name: "pre fork", v6: math.MaxUint32},
+		{name: "post fork", v6: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewController(t)
+			c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: tt.v6})
+
+			blk := fundUnclaimedFPRPool(t, c)
+			blk.Header.Epoch = topUpExpiryEpoch
+			depositFPRReward(t, c, blk, OwnerAddress, kdautils.KLVIdentifier, topUpExpiryDeposit)
+
+			checkFPRResidualBalances(c,
+				topUpInitialKLV-topUpRewardPool, residualRefFPR-residualFPRPool,
+				topUpInitialKLV+topUpRewardPool-topUpExpiryDeposit, topUpInitialFPR-topUpBaseStake+residualFPRPool)
+		})
+	}
+}
+
+// The same pool crosses the fork: the epoch that expires before FixAuditChangesV6 pays the
+// depositor, the one that expires after it pays the owner.
+func TestStakingTxProcessor_KDA_FPRExpiredResidual_AcrossTheFork(t *testing.T) {
+	const (
+		secondPool        = int64(300_000)
+		secondExpiryEpoch = topUpExpiryEpoch + 102
+	)
+
+	c := NewController(t)
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: math.MaxUint32})
+
+	blk := fundUnclaimedFPRPool(t, c)
+
+	// pre fork: the deposit that funds the second pool expires the first one, and collects it
+	blk.Header.Epoch = topUpExpiryEpoch
+	depositFPRReward(t, c, blk, RefAddress, kdautils.KLVIdentifier, secondPool)
+	checkFPRResidualBalances(c,
+		topUpInitialKLV-secondPool, residualRefFPR,
+		topUpInitialKLV, topUpInitialFPR-topUpBaseStake)
+
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV6: 0})
+
+	// post fork: the second pool expires on the next deposit, and goes to the owner
+	blk.Header.Epoch = secondExpiryEpoch
+	depositFPRReward(t, c, blk, RefAddress, kdautils.KLVIdentifier, topUpExpiryDeposit)
+	checkFPRResidualBalances(c,
+		topUpInitialKLV-secondPool-topUpExpiryDeposit, residualRefFPR,
+		topUpInitialKLV+secondPool, topUpInitialFPR-topUpBaseStake)
+
+	staking := c.GetStakingKDA(FPRIdentifier)
+	require.Len(t, staking.FPR, 1)
+	assert.Equal(t, secondExpiryEpoch+1, staking.FPR[0].Epoch)
+	assert.Equal(t, topUpExpiryDeposit, staking.FPR[0].TotalAmount)
 }
 
 func TestStakingTxProcessor_KDA_FPRClaim_RepeatedTopUpsKeepClaimWindow_PostFix(t *testing.T) {
@@ -1997,8 +2613,9 @@ func TestStakingTxProcessor_KDA_FPRClaim_UnfreezeBeforeMaturity_RawTx_PreFix(t *
 		expiryDeposit     = int64(1)
 	)
 	c := NewController(t)
-	// Disable FixAuditChangesV3 to reproduce the pre-fix behavior.
-	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV3: math.MaxUint32})
+	// Disable FixAuditChangesV3 to reproduce the pre-fix behavior. FixAuditChangesV6 stays
+	// inactive too: from it on the expired pool goes to the asset's owner.
+	c.UpdateForkController(config.EnableEpochs{FixAuditChangesV3: math.MaxUint32, FixAuditChangesV6: math.MaxUint32})
 	c.AddUser(OwnerAddress, initialKLVBalance, kdautils.KLVIdentifier)
 	c.AddUser(OwnerAddress, initialFPRBalance, FPRIdentifier)
 	c.AddUser(RefAddress, initialKLVBalance, kdautils.KLVIdentifier)

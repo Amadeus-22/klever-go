@@ -23,23 +23,46 @@ const (
 	int64finishName                  = "int64finish"
 )
 
-// SmallIntGetUnsignedArgument VMHooks implementation.
-// @autogenerate(VMHooks)
-func (context *VMHooksImpl) SmallIntGetUnsignedArgument(id int32) int64 {
+// chargeSmallIntArgument charges a SmallInt argument getter's flat gas and returns argument id for
+// it to parse, or false after a fault. From FixAuditChangesV6 the flat gas is bounded and an
+// oversized argument is paid for before it is parsed
+func (context *VMHooksImpl) chargeSmallIntArgument(hookName string, id int32) ([]byte, bool) {
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.Int64GetArgument
-	metering.UseGasAndAddTracedGas(smallIntGetUnsignedArgumentName, gasToUse)
+	err := startTracingAndUseGas(context.host, hookName, gasToUse)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return nil, false
+	}
 
 	args := runtime.Arguments()
 	// #nosec G115
 	if id < 0 || id >= int32(len(args)) {
 		_ = context.WithFault(vmhost.ErrArgIndexOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return 0
+		return nil, false
 	}
 
 	arg := args[id]
+	if context.host.ForkController().FixAuditChangesV6() {
+		err = context.GetManagedTypesContext().ConsumeGasForThisIntNumberOfBytesBounded(int64(len(arg)))
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return nil, false
+		}
+	}
+
+	return arg, true
+}
+
+// SmallIntGetUnsignedArgument VMHooks implementation.
+// @autogenerate(VMHooks)
+func (context *VMHooksImpl) SmallIntGetUnsignedArgument(id int32) int64 {
+	runtime := context.GetRuntimeContext()
+	arg, ok := context.chargeSmallIntArgument(smallIntGetUnsignedArgumentName, id)
+	if !ok {
+		return 0
+	}
+
 	argBigInt := big.NewInt(0).SetBytes(arg)
 	if !argBigInt.IsUint64() {
 		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
@@ -52,19 +75,11 @@ func (context *VMHooksImpl) SmallIntGetUnsignedArgument(id int32) int64 {
 // @autogenerate(VMHooks)
 func (context *VMHooksImpl) SmallIntGetSignedArgument(id int32) int64 {
 	runtime := context.GetRuntimeContext()
-	metering := context.GetMeteringContext()
-
-	gasToUse := metering.GasSchedule().BaseOpsAPICost.Int64GetArgument
-	metering.UseGasAndAddTracedGas(smallIntGetSignedArgumentName, gasToUse)
-
-	args := runtime.Arguments()
-	// #nosec G115
-	if id < 0 || id >= int32(len(args)) {
-		_ = context.WithFault(vmhost.ErrArgIndexOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+	arg, ok := context.chargeSmallIntArgument(smallIntGetSignedArgumentName, id)
+	if !ok {
 		return 0
 	}
 
-	arg := args[id]
 	argBigInt := twos.SetBytes(big.NewInt(0), arg)
 	if !argBigInt.IsInt64() {
 		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
@@ -107,9 +122,7 @@ func (context *VMHooksImpl) SmallIntStorageStoreUnsigned(keyOffset executor.MemP
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.Int64StorageStore
-	metering.UseGasAndAddTracedGas(smallIntStorageStoreSignedName, gasToUse)
-
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, err := context.chargeAndLoadKey(context.GetVMHost(), smallIntStorageStoreUnsignedName, gasToUse, keyOffset, keyLength)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
@@ -131,9 +144,7 @@ func (context *VMHooksImpl) SmallIntStorageStoreSigned(keyOffset executor.MemPtr
 	metering := context.GetMeteringContext()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.Int64StorageStore
-	metering.UseGasAndAddTracedGas(smallIntStorageStoreSignedName, gasToUse)
-
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, err := context.chargeAndLoadKey(context.GetVMHost(), smallIntStorageStoreSignedName, gasToUse, keyOffset, keyLength)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
@@ -154,7 +165,7 @@ func (context *VMHooksImpl) SmallIntStorageLoadUnsigned(keyOffset executor.MemPt
 	storage := context.GetStorageContext()
 	metering := context.GetMeteringContext()
 
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, _, err := context.memLoadCharged(context.GetVMHost(), keyOffset, keyLength)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 0
 	}
@@ -169,6 +180,11 @@ func (context *VMHooksImpl) SmallIntStorageLoadUnsigned(keyOffset executor.MemPt
 		int64(trieDepth),
 		metering.GasSchedule().BaseOpsAPICost.Int64StorageLoad,
 		usedCache)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
+
+	err = useGasForCachedStorageValue(context.GetVMHost(), data, usedCache)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
@@ -189,7 +205,7 @@ func (context *VMHooksImpl) SmallIntStorageLoadSigned(keyOffset executor.MemPtr,
 	storage := context.GetStorageContext()
 	metering := context.GetMeteringContext()
 
-	key, err := context.MemLoad(keyOffset, keyLength)
+	key, _, err := context.memLoadCharged(context.GetVMHost(), keyOffset, keyLength)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 0
 	}
@@ -204,6 +220,11 @@ func (context *VMHooksImpl) SmallIntStorageLoadSigned(keyOffset executor.MemPtr,
 		int64(trieDepth),
 		metering.GasSchedule().BaseOpsAPICost.Int64StorageLoad,
 		usedCache)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
+
+	err = useGasForCachedStorageValue(context.GetVMHost(), data, usedCache)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}

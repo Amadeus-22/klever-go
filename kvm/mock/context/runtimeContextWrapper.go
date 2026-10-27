@@ -56,6 +56,10 @@ type RuntimeContextWrapper struct {
 	// function that will be called by the corresponding RuntimeContext function implementation (by default this will call the same wrapped context function)
 	GetRuntimeBreakpointValueFunc func() vmhost.BreakpointValue
 	// function that will be called by the corresponding RuntimeContext function implementation (by default this will call the same wrapped context function)
+	RequestTimeoutInterruptionFunc func()
+	// function that will be called by the corresponding RuntimeContext function implementation (by default this will call the same wrapped context function)
+	ClearTimeoutInterruptionFunc func()
+	// function that will be called by the corresponding RuntimeContext function implementation (by default this will call the same wrapped context function)
 	GetInstanceStackSizeFunc func() uint64
 	// function that will be called by the corresponding RuntimeContext function implementation (by default this will call the same wrapped context function)
 	CountSameContractInstancesOnStackFunc func(address []byte) uint64
@@ -204,6 +208,14 @@ func NewRuntimeContextWrapper(inputRuntimeContext *vmhost.RuntimeContext) *Runti
 
 	runtimeWrapper.GetRuntimeBreakpointValueFunc = func() vmhost.BreakpointValue {
 		return runtimeWrapper.runtimeContext.GetRuntimeBreakpointValue()
+	}
+
+	runtimeWrapper.RequestTimeoutInterruptionFunc = func() {
+		runtimeWrapper.runtimeContext.RequestTimeoutInterruption()
+	}
+
+	runtimeWrapper.ClearTimeoutInterruptionFunc = func() {
+		runtimeWrapper.runtimeContext.ClearTimeoutInterruption()
 	}
 
 	runtimeWrapper.GetInstanceStackSizeFunc = func() uint64 {
@@ -429,6 +441,16 @@ func (contextWrapper *RuntimeContextWrapper) SetRuntimeBreakpointValue(value vmh
 // GetRuntimeBreakpointValue calls corresponding xxxFunc function, that by default in turn calls the original method of the wrapped RuntimeContext
 func (contextWrapper *RuntimeContextWrapper) GetRuntimeBreakpointValue() vmhost.BreakpointValue {
 	return contextWrapper.GetRuntimeBreakpointValueFunc()
+}
+
+// RequestTimeoutInterruption calls corresponding xxxFunc function, that by default in turn calls the original method of the wrapped RuntimeContext
+func (contextWrapper *RuntimeContextWrapper) RequestTimeoutInterruption() {
+	contextWrapper.RequestTimeoutInterruptionFunc()
+}
+
+// ClearTimeoutInterruption calls corresponding xxxFunc function, that by default in turn calls the original method of the wrapped RuntimeContext
+func (contextWrapper *RuntimeContextWrapper) ClearTimeoutInterruption() {
+	contextWrapper.ClearTimeoutInterruptionFunc()
 }
 
 // CountSameContractInstancesOnStack calls corresponding xxxFunc function, that by default in turn calls the original method of the wrapped RuntimeContext

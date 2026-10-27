@@ -22,6 +22,7 @@ type TransactionCoordinatorMock struct {
 	CreateAndProcessBlockTransactionsCalled func(blk *block.Block, haveTime func() bool) (data.ProcessResults, error)
 	RemoveBlockDataFromPoolCalled           func(body *block.Block) error
 	GetAllCurrentLogsCalled                 func() []*data.LogData
+	SaveLogsToStorageCalled                 func() error
 }
 
 // CreateReceiptsHash -
@@ -134,6 +135,15 @@ func (tcm *TransactionCoordinatorMock) RemoveBlockDataFromPool(blk *block.Block)
 		return nil
 	}
 	return tcm.RemoveBlockDataFromPoolCalled(blk)
+}
+
+// SaveLogsToStorage -
+func (tcm *TransactionCoordinatorMock) SaveLogsToStorage() error {
+	if tcm.SaveLogsToStorageCalled == nil {
+		return nil
+	}
+
+	return tcm.SaveLogsToStorageCalled()
 }
 
 // GetAllCurrentLogs returns all current logs

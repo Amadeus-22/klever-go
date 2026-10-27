@@ -15,7 +15,12 @@ import (
 // FunctionNames (alias) is a map of function names
 type FunctionNames = map[string]struct{}
 
-// BlockchainHook is the interface for VM blockchain callbacks
+// BlockchainHook is the interface for VM blockchain callbacks.
+//
+// There is no sub-transaction rollback: TransferValueOnly and KDATransfer settle into the
+// accounts cacher immediately, and the only rollback boundary is the transaction (the cacher is
+// saved when it succeeds and reset otherwise). Every VM error path must therefore abort the
+// transaction.
 type BlockchainHook interface {
 	// NewAddress yields the address of a new SC account, when one such account is created.
 	// The result should only depend on the creator address and nonce.
@@ -98,12 +103,6 @@ type BlockchainHook interface {
 
 	// GetSFTMeta loads the SFT metadata for the given key
 	GetSFTMeta(tokenID []byte, nonce uint64) (*kapps.MetaV2, error)
-
-	// GetSnapshot gets the number of entries in the journal as a snapshot id
-	GetSnapshot() int
-
-	// RevertToSnapshot reverts snapshots up to the specified one
-	RevertToSnapshot(snapshot int) error
 
 	// ExecuteSmartContractCallOnOtherVM executes a smart contract call on another VM
 	ExecuteSmartContractCallOnOtherVM(input *ContractCallInput) (*VMOutput, error)

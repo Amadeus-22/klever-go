@@ -352,11 +352,11 @@ func createMockSmartContractProcessorArguments() ArgsNewSmartContractProcessor {
 
 			},
 		},
-		GasSchedule:         notifierMock.NewGasScheduleNotifierMock(gasSchedule),
-		WasmVMChangeLocker:  &sync.RWMutex{},
-		VMOutputCacher:      txcache.NewDisabledCache(),
-		ForkController:      forkController,
-		IsGenesisProcessing: true,
+		GasSchedule:        notifierMock.NewGasScheduleNotifierMock(gasSchedule),
+		WasmVMChangeLocker: &sync.RWMutex{},
+		VMOutputCacher:     txcache.NewDisabledCache(),
+		ForkController:     forkController,
+		AllowDeploy:        true,
 	}
 }
 
@@ -1237,6 +1237,195 @@ func TestScProcessor_ExecuteSmartContractTransactionBadParser(t *testing.T) {
 	_, err = sc.ExecuteSmartContractTransaction(ctx, tc, acntSrc, acntDst)
 	require.True(t, called)
 	require.Equal(t, tmpError, err)
+}
+
+func TestScProcessor_CheckUpgradePermission(t *testing.T) {
+	t.Parallel()
+
+	owner := []byte("owner-address")
+	other := []byte("other-address")
+	upgradeable := (&vmcommon.CodeMetadata{Upgradeable: true}).ToBytes()
+	notUpgradeable := (&vmcommon.CodeMetadata{Upgradeable: false}).ToBytes()
+
+	newContract := func(codeMetadata []byte) state.UserAccountHandler {
+		acnt, err := state.NewUserAccount([]byte("contract-address"))
+		require.Nil(t, err)
+		acnt.SetCodeMetadata(codeMetadata)
+		acnt.SetOwnerAddress(owner)
+		return acnt
+	}
+
+	tests := []struct {
+		name     string
+		function string
+		contract state.UserAccountHandler
+		caller   []byte
+		expected error
+	}{
+		{
+			name:     "not an upgrade call",
+			function: "doSomething",
+			contract: nil,
+			caller:   other,
+			expected: nil,
+		},
+		{
+			name:     "existing account without code metadata is not a contract",
+			function: upgradeFunctionName,
+			contract: newContract(nil),
+			caller:   owner,
+			expected: process.ErrUpgradeContractNotFound,
+		},
+		{
+			name:     "metadata shorter than two bytes decodes as not upgradeable",
+			function: upgradeFunctionName,
+			contract: newContract([]byte{vmcommon.MetadataUpgradeable}),
+			caller:   owner,
+			expected: process.ErrUpgradeContractNotUpgradeable,
+		},
+		{
+			name:     "metadata longer than two bytes decodes as not upgradeable",
+			function: upgradeFunctionName,
+			contract: newContract([]byte{vmcommon.MetadataUpgradeable, 0x00, 0x00}),
+			caller:   owner,
+			expected: process.ErrUpgradeContractNotUpgradeable,
+		},
+		{
+			name:     "upgradeable contract with no owner refuses any caller",
+			function: upgradeFunctionName,
+			contract: func() state.UserAccountHandler {
+				acnt := newContract(upgradeable)
+				acnt.SetOwnerAddress(nil)
+				return acnt
+			}(),
+			caller:   other,
+			expected: process.ErrUpgradeCallerNotOwner,
+		},
+		{
+			name:     "owner on non-upgradeable contract",
+			function: upgradeFunctionName,
+			contract: newContract(notUpgradeable),
+			caller:   owner,
+			expected: process.ErrUpgradeContractNotUpgradeable,
+		},
+		{
+			name:     "non-owner on upgradeable contract",
+			function: upgradeFunctionName,
+			contract: newContract(upgradeable),
+			caller:   other,
+			expected: process.ErrUpgradeCallerNotOwner,
+		},
+		{
+			name:     "non-owner on non-upgradeable contract reports not upgradeable",
+			function: upgradeFunctionName,
+			contract: newContract(notUpgradeable),
+			caller:   other,
+			expected: process.ErrUpgradeContractNotUpgradeable,
+		},
+		{
+			name:     "owner on upgradeable contract",
+			function: upgradeFunctionName,
+			contract: newContract(upgradeable),
+			caller:   owner,
+			expected: nil,
+		},
+	}
+
+	sc, err := NewSmartContractProcessor(createMockSmartContractProcessorArguments())
+	require.Nil(t, err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vmInput := &vmcommon.ContractCallInput{Function: tt.function}
+			vmInput.CallerAddr = tt.caller
+
+			err := sc.checkUpgradePermission(tt.contract, vmInput)
+			require.Equal(t, tt.expected, err)
+		})
+	}
+}
+
+// The refusal text travels through ProcessIfError to the caller unchanged, with
+// the result code still VMUserError.
+func TestScProcessor_ExecuteSmartContractTransactionUpgradeNotUpgradeable(t *testing.T) {
+	t.Parallel()
+
+	argParser := &contextmock.ArgumentParserMock{}
+	vmContainer := &contextmock.VMContainerMock{}
+	arguments := createMockSmartContractProcessorArguments()
+	arguments.VmContainer = vmContainer
+	arguments.ArgsParser = argParser
+
+	contract := transaction.SmartContract{
+		Type:      transaction.SmartContract_SCInvoke,
+		CallValue: map[string]*transaction.CallValue{"KLV": {Amount: 45}},
+		Address:   core.ZeroAddress,
+	}
+	tx, _ := createTransactionMock(&contract, transaction.TXContract_SmartContractType, []byte("SRC"), 0, [][]byte{[]byte("upgradeContract@0500@0000")})
+
+	computedHash, err := tools.CalculateHash(arguments.Marshalizer, arguments.Hasher, tx.RawData)
+	require.Nil(t, err)
+
+	ctx := kapp.NewKappContext(kapp.ArgsNewKAppContext{
+		OriginalSender: tx.GetSender(),
+		ContractID:     0,
+		ContractType:   tx.RawData.GetContract()[0].Type,
+		Block:          &block.Block{},
+		TxHash:         computedHash,
+		TX:             tx,
+		IsScSimulation: true,
+	})
+
+	tc, err := tx.RawData.Contract[ctx.ContractID()].GetSmartContract()
+	require.Nil(t, err)
+
+	arguments.BlockChainHook = &contextmock.BlockchainHookStub{
+		GetKAppControllerCalled: func() kapp.KAppController {
+			kappArgs := kappcontroller.ArgsNewKApp{
+				Hasher:         arguments.Hasher,
+				Marshalizer:    arguments.Marshalizer,
+				PubkeyConv:     arguments.PubkeyConv,
+				ForkController: arguments.ForkController,
+				AccountsCacher: arguments.AccountsCacher,
+				RatingsData:    &commommock.RatingsInfoMock{},
+			}
+
+			kappCtrl, err := kappcontroller.NewKappController(kappArgs)
+			require.Nil(t, err)
+			_ = kappCtrl.GetAccountsKApp().SetAccountsCacher(arguments.AccountsCacher)
+			_ = kappCtrl.GetAccountsKApp().SetKAppController(kappCtrl)
+			_ = kappCtrl.GetKDAKApp().SetAccountsCacher(arguments.AccountsCacher)
+			_ = kappCtrl.GetKDAKApp().SetKAppController(kappCtrl)
+
+			kappCtrl.SetCurrentKAppContext(ctx)
+
+			return kappCtrl
+		},
+	}
+
+	sc, err := NewSmartContractProcessor(arguments)
+	require.NotNil(t, sc)
+	require.Nil(t, err)
+
+	acntSrc, acntDst := initAccounts(tx, arguments.AccountsCacher, contract.CallValue["KLV"].Amount*2)
+
+	// the sender owns the contract, but it was deployed without the upgradeable flag
+	acntDst.SetCode([]byte("code"))
+	acntDst.SetCodeMetadata((&vmcommon.CodeMetadata{Upgradeable: false}).ToBytes())
+	acntDst.SetOwnerAddress(tx.GetSender())
+	argParser.ParseCallDataCalled = func(data string) (string, [][]byte, error) {
+		return upgradeFunctionName, nil, nil
+	}
+	vmCalled := false
+	vmContainer.GetCalled = func(key []byte) (vmcommon.VMExecutionHandler, error) {
+		vmCalled = true
+		return nil, errors.New("vm must not be reached")
+	}
+
+	returnCode, err := sc.ExecuteSmartContractTransaction(ctx, tc, acntSrc, acntDst)
+	require.False(t, vmCalled)
+	require.Equal(t, vmcommon.VMUserError, returnCode)
+	require.EqualError(t, err, process.ErrUpgradeContractNotUpgradeable.Error())
 }
 
 func TestScProcessor_ExecuteSmartContractTransactionVMRunError(t *testing.T) {
@@ -2250,6 +2439,208 @@ func TestScProcessor_DeleteAccounts(t *testing.T) {
 	}
 }
 
+// sharedCodeProcessor drives deploy and delete VM outputs through processVMOutput on a
+// real trie-backed accounts cacher, one transaction at a time, and reads the reference
+// count of the code entry shared by every contract deployed from the same bytecode.
+type sharedCodeProcessor struct {
+	t           *testing.T
+	sc          *scProcessor
+	adb         *state.AccountsDB
+	trieGet     func([]byte) ([]byte, error)
+	cacher      state.AccountsCacher
+	marshalizer marshal.Marshalizer
+	code        []byte
+	codeHash    []byte
+	metadata    []byte
+}
+
+func newSharedCodeProcessor(t *testing.T, fixV6 bool) *sharedCodeProcessor {
+	hasher := &sha256.Sha256{}
+	marshalizer := marshal.NewProtoMarshalizer()
+	storageManager, err := trie.NewTrieStorageManagerWithoutPruning(createMemUnit())
+	require.Nil(t, err)
+	tr, err := trie.NewTrie(storageManager, marshalizer, hasher, 5)
+	require.Nil(t, err)
+	adb, err := state.NewAccountsDB(tr, hasher, marshalizer, factory.NewAccountCreator(), core.Normal)
+	require.Nil(t, err)
+	cacher, err := state.NewAccountsCacher(state.ArgsAcccountCacher{Accounts: adb, Kapps: adb, Peers: adb})
+	require.Nil(t, err)
+
+	args := createMockSmartContractProcessorArguments()
+	args.AccountsCacher = cacher
+	args.ForkController = commommock.NewForkControllerStub().SetFork("FixAuditChangesV6", fixV6)
+	args.BlockChainHook = &contextmock.BlockchainHookStub{
+		FilterCodeMetadataForUpgradeCalled: func(input []byte) ([]byte, error) {
+			return input, nil
+		},
+	}
+	sc, err := NewSmartContractProcessor(args)
+	require.Nil(t, err)
+
+	code := []byte("shared contract bytecode")
+	return &sharedCodeProcessor{
+		t:           t,
+		sc:          sc,
+		adb:         adb,
+		trieGet:     tr.Get,
+		cacher:      cacher,
+		marshalizer: marshalizer,
+		code:        code,
+		codeHash:    hasher.Compute(string(code)),
+		metadata:    []byte{vmcommon.MetadataUpgradeable, 0},
+	}
+}
+
+func sharedCodeSCAddress(id byte) []byte {
+	address := make([]byte, 32)
+	copy(address[core.NumInitCharactersForScAddress-core.VMTypeLen:], common.WasmVirtualMachine)
+	address[31] = id
+	return address
+}
+
+func (p *sharedCodeProcessor) processTx(vmOutput *vmcommon.VMOutput) {
+	p.cacher.ResetAll(true)
+	ctx := kapp.NewKappContext(kapp.ArgsNewKAppContext{Block: &block.Block{}, IsScSimulation: true})
+	require.Nil(p.t, p.sc.processVMOutput(ctx, vmOutput))
+	require.Nil(p.t, p.cacher.SaveAll())
+}
+
+func (p *sharedCodeProcessor) deploy(address, owner []byte) {
+	p.processTx(&vmcommon.VMOutput{
+		OutputAccounts: map[string]*vmcommon.OutputAccount{
+			string(address): {
+				Address:             address,
+				Code:                p.code,
+				CodeMetadata:        p.metadata,
+				CodeDeployerAddress: owner,
+			},
+		},
+	})
+}
+
+func (p *sharedCodeProcessor) delete(deleted ...[]byte) {
+	p.processTx(&vmcommon.VMOutput{DeletedAccounts: deleted})
+}
+
+// references returns NumReferences of the shared code entry, or 0 once it is removed.
+func (p *sharedCodeProcessor) references() uint32 {
+	raw, err := p.trieGet(p.codeHash)
+	require.Nil(p.t, err)
+	if len(raw) == 0 {
+		return 0
+	}
+
+	entry := &state.CodeEntry{}
+	require.Nil(p.t, p.marshalizer.Unmarshal(entry, raw))
+	return entry.NumReferences
+}
+
+func (p *sharedCodeProcessor) codeLoadable(address []byte) bool {
+	p.cacher.ResetAll(true)
+	acc, err := p.cacher.GetExistingUser(address)
+	require.Nil(p.t, err)
+	return len(p.cacher.GetCode(acc.GetCodeHash())) != 0
+}
+
+func TestScProcessor_DeleteAccountsSharedCode(t *testing.T) {
+	t.Parallel()
+
+	first := sharedCodeSCAddress(1)
+	second := sharedCodeSCAddress(2)
+	firstOwner := []byte("first-owner-address-00000000000")
+	secondOwner := []byte("second-owner-address-0000000000")
+
+	newDeployed := func(t *testing.T, fixV6 bool) *sharedCodeProcessor {
+		p := newSharedCodeProcessor(t, fixV6)
+		p.deploy(first, firstOwner)
+		p.deploy(second, secondOwner)
+		require.Equal(t, uint32(2), p.references())
+		return p
+	}
+
+	t.Run("single delete decrements the shared entry once", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		p.delete(second)
+
+		require.Equal(t, uint32(1), p.references())
+		require.True(t, p.codeLoadable(first))
+		require.False(t, p.codeLoadable(second))
+	})
+
+	t.Run("address listed more than once decrements once", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		p.delete(second, second, second)
+
+		require.Equal(t, uint32(1), p.references())
+		require.True(t, p.codeLoadable(first))
+	})
+
+	t.Run("deleting again in later transactions has no effect", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		for i := 0; i < 3; i++ {
+			p.delete(second)
+		}
+
+		require.Equal(t, uint32(1), p.references())
+		require.True(t, p.codeLoadable(first))
+	})
+
+	t.Run("repeated deploy and delete keeps the count", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		for i := byte(0); i < 5; i++ {
+			other := sharedCodeSCAddress(10 + i)
+			p.deploy(other, secondOwner)
+			p.delete(other)
+			require.Equal(t, uint32(2), p.references())
+		}
+		require.True(t, p.codeLoadable(first))
+	})
+
+	t.Run("revert restores the shared entry", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		snapshot := p.adb.JournalLen()
+		p.delete(second)
+		require.Equal(t, uint32(1), p.references())
+
+		require.Nil(t, p.adb.RevertToSnapshot(snapshot))
+
+		require.Equal(t, uint32(2), p.references())
+		require.True(t, p.codeLoadable(second))
+	})
+
+	t.Run("deleting the last reference removes the entry", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, true)
+		p.delete(second)
+		p.delete(first)
+
+		require.Equal(t, uint32(0), p.references())
+		require.False(t, p.codeLoadable(first))
+	})
+
+	// Below FixAuditChangesV6 the legacy accounting is reproduced so that pre-fork
+	// blocks replay to the same state.
+	t.Run("before FixAuditChangesV6 the legacy accounting is kept", func(t *testing.T) {
+		t.Parallel()
+
+		p := newDeployed(t, false)
+		p.delete(second)
+
+		require.Equal(t, uint32(0), p.references())
+	})
+}
+
 // TestSetVMExecutionMode tests setting the execution mode
 func TestSetVMExecutionMode(t *testing.T) {
 	t.Parallel()
@@ -2320,7 +2711,7 @@ func TestScProcessor_ProcessSCOutputAccountsRejectsProtectedKeyWrite(t *testing.
 	tx, _ := createTransactionMock(&contract, transaction.TXContract_SmartContractType, []byte("SRC"), 0, [][]byte{[]byte("data")})
 	ctx := createDefaultContext(tx)
 
-	address := []byte("output-account-address")
+	address := []byte("output-account-address-32-bytes!")
 	buildAccounts := func(offset []byte, written bool) []*vmcommon.OutputAccount {
 		return []*vmcommon.OutputAccount{
 			{
@@ -2351,4 +2742,308 @@ func TestScProcessor_ProcessSCOutputAccountsRejectsProtectedKeyWrite(t *testing.
 		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts([]byte(kapps.ProtectedKleverKeyPrefix+"VM@box"), true))
 		require.NoError(t, err)
 	})
+}
+
+func TestScProcessor_ProcessSCOutputAccountsRejectsOverLimitStorageKeyWrite(t *testing.T) {
+	t.Parallel()
+
+	arguments := createMockSmartContractProcessorArguments()
+	sc, err := NewSmartContractProcessor(arguments)
+	require.Nil(t, err)
+
+	preForkArguments := createMockSmartContractProcessorArguments()
+	preForkArguments.ForkController, err = fork.NewForkController(config.EnableEpochs{FixAuditChangesV6: 100}, &commommock.EpochNotifierStub{})
+	require.Nil(t, err)
+	preForkSc, err := NewSmartContractProcessor(preForkArguments)
+	require.Nil(t, err)
+
+	contract := transaction.SmartContract{
+		Type:      transaction.SmartContract_SCDeploy,
+		CallValue: map[string]*transaction.CallValue{"KLV": {Amount: 0}},
+	}
+	tx, _ := createTransactionMock(&contract, transaction.TXContract_SmartContractType, []byte("SRC"), 0, [][]byte{[]byte("data")})
+	ctx := createDefaultContext(tx)
+
+	address := []byte("output-account-address-32-bytes!")
+	buildAccounts := func(offset []byte, data []byte, written bool) []*vmcommon.OutputAccount {
+		return []*vmcommon.OutputAccount{
+			{
+				Address: address,
+				StorageUpdates: map[string]*vmcommon.StorageUpdate{
+					string(offset): {Offset: offset, Data: data, Written: written},
+				},
+			},
+		}
+	}
+
+	isPersisted := func(processor *scProcessor, key []byte) bool {
+		acc, errLoad := processor.getAccountFromAddress(address)
+		require.Nil(t, errLoad)
+		_, found := acc.DataTrieTracker().DirtyData()[string(key)]
+		return found
+	}
+
+	keyAtLimit := bytes.Repeat([]byte("a"), common.MaxStorageKeyLength)
+	keyOverLimit := bytes.Repeat([]byte("b"), common.MaxStorageKeyLength+1)
+	readOnlyKeyOverLimit := bytes.Repeat([]byte("c"), common.MaxStorageKeyLength+1)
+	readOnlyKey := []byte("regular")
+
+	t.Run("written over-limit key is rejected", func(t *testing.T) {
+		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(keyOverLimit, []byte("data"), true))
+		require.Equal(t, process.ErrStorageKeyTooLong, err)
+		require.False(t, isPersisted(sc, keyOverLimit))
+	})
+
+	t.Run("read-only over-limit key is not persisted", func(t *testing.T) {
+		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(readOnlyKeyOverLimit, []byte("data"), false))
+		require.NoError(t, err)
+		require.False(t, isPersisted(sc, readOnlyKeyOverLimit))
+	})
+
+	t.Run("read-only regular key is not re-saved", func(t *testing.T) {
+		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(readOnlyKey, []byte("data"), false))
+		require.NoError(t, err)
+		require.False(t, isPersisted(sc, readOnlyKey))
+	})
+
+	t.Run("deleted over-limit key is not rejected", func(t *testing.T) {
+		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(keyOverLimit, nil, true))
+		require.NoError(t, err)
+		require.True(t, isPersisted(sc, keyOverLimit))
+	})
+
+	t.Run("key at the limit is persisted", func(t *testing.T) {
+		err := sc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(keyAtLimit, []byte("data"), true))
+		require.NoError(t, err)
+		require.True(t, isPersisted(sc, keyAtLimit))
+	})
+
+	t.Run("over-limit key is persisted before FixAuditChangesV6", func(t *testing.T) {
+		err := preForkSc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(keyOverLimit, []byte("data"), true))
+		require.NoError(t, err)
+		require.True(t, isPersisted(preForkSc, keyOverLimit))
+	})
+
+	t.Run("read-only key is re-saved before FixAuditChangesV6", func(t *testing.T) {
+		err := preForkSc.processSCOutputAccounts(ctx, &vmcommon.VMOutput{}, buildAccounts(readOnlyKeyOverLimit, []byte("data"), false))
+		require.NoError(t, err)
+		require.True(t, isPersisted(preForkSc, readOnlyKeyOverLimit))
+	})
+}
+
+func newOutputAccountAddressProcessor(t *testing.T, fixV6 bool) (*scProcessor, ArgsNewSmartContractProcessor) {
+	arguments := createMockSmartContractProcessorArguments()
+	if !fixV6 {
+		forkController, err := fork.NewForkController(config.EnableEpochs{FixAuditChangesV6: 100}, &commommock.EpochNotifierStub{})
+		require.Nil(t, err)
+		arguments.ForkController = forkController
+	}
+	sc, err := NewSmartContractProcessor(arguments)
+	require.Nil(t, err)
+
+	return sc, arguments
+}
+
+// userAccountExists reports whether a user account is held under address, first in the
+// accounts cacher and then, once flushed and reset, in the accounts trie
+func userAccountExists(t *testing.T, cacher state.AccountsCacher, address []byte) (bool, bool) {
+	_, errCached := cacher.GetExistingUser(address)
+	require.Nil(t, cacher.SaveAll())
+	cacher.ResetAll(true)
+	_, errStored := cacher.GetExistingUser(address)
+
+	return errCached == nil, errStored == nil
+}
+
+func TestScProcessor_ProcessSCOutputAccountsRejectsInvalidAddressLength(t *testing.T) {
+	t.Parallel()
+
+	contract := transaction.SmartContract{
+		Type:      transaction.SmartContract_SCInvoke,
+		CallValue: map[string]*transaction.CallValue{"KLV": {Amount: 0}},
+	}
+	tx, _ := createTransactionMock(&contract, transaction.TXContract_SmartContractType, []byte("SRC"), 0, [][]byte{[]byte("data")})
+
+	buildAccounts := func(address []byte) []*vmcommon.OutputAccount {
+		return []*vmcommon.OutputAccount{
+			{
+				Address: address,
+				StorageUpdates: map[string]*vmcommon.StorageUpdate{
+					"key": {Offset: []byte("key"), Data: []byte("data"), Written: true},
+				},
+			},
+		}
+	}
+
+	for _, addressLen := range []int{31, 33} {
+		address := bytes.Repeat([]byte{0x01}, addressLen)
+
+		t.Run(fmt.Sprintf("%d-byte account is rejected after FixAuditChangesV6", addressLen), func(t *testing.T) {
+			t.Parallel()
+
+			sc, arguments := newOutputAccountAddressProcessor(t, true)
+			err := sc.processSCOutputAccounts(createDefaultContext(tx), &vmcommon.VMOutput{}, buildAccounts(address))
+			require.ErrorIs(t, err, process.ErrInvalidOutputAccountAddressLength)
+
+			cached, stored := userAccountExists(t, arguments.AccountsCacher, address)
+			require.False(t, cached)
+			require.False(t, stored)
+		})
+
+		t.Run(fmt.Sprintf("%d-byte account is persisted before FixAuditChangesV6", addressLen), func(t *testing.T) {
+			t.Parallel()
+
+			sc, arguments := newOutputAccountAddressProcessor(t, false)
+			err := sc.processSCOutputAccounts(createDefaultContext(tx), &vmcommon.VMOutput{}, buildAccounts(address))
+			require.NoError(t, err)
+
+			cached, stored := userAccountExists(t, arguments.AccountsCacher, address)
+			require.True(t, cached)
+			require.True(t, stored)
+		})
+	}
+
+	for _, fixV6 := range []bool{true, false} {
+		t.Run(fmt.Sprintf("32-byte account is persisted (FixAuditChangesV6=%v)", fixV6), func(t *testing.T) {
+			t.Parallel()
+
+			address := bytes.Repeat([]byte{0x01}, 32)
+			sc, arguments := newOutputAccountAddressProcessor(t, fixV6)
+			err := sc.processSCOutputAccounts(createDefaultContext(tx), &vmcommon.VMOutput{}, buildAccounts(address))
+			require.NoError(t, err)
+
+			cached, stored := userAccountExists(t, arguments.AccountsCacher, address)
+			require.True(t, cached)
+			require.True(t, stored)
+		})
+	}
+}
+
+func TestScProcessor_ExecuteSmartContractTransactionInvalidOutputAccountAddressLength(t *testing.T) {
+	t.Parallel()
+
+	const gasLimit = uint64(1000)
+	const gasRemaining = uint64(400)
+
+	execute := func(t *testing.T, fixV6 bool, isSimulation bool, outputAddress []byte) (vmcommon.ReturnCode, kapp.KappContext, state.AccountsCacher, error) {
+		_, arguments := newOutputAccountAddressProcessor(t, fixV6)
+		arguments.ArgsParser = &contextmock.ArgumentParserMock{}
+		arguments.VmContainer = &contextmock.VMContainerMock{
+			GetCalled: func(key []byte) (vmcommon.VMExecutionHandler, error) {
+				return &contextmock.VMExecutionHandlerStub{
+					RunSmartContractCallCalled: func(input *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error) {
+						return &vmcommon.VMOutput{
+							ReturnCode:   vmcommon.Ok,
+							GasRemaining: gasRemaining,
+							OutputAccounts: map[string]*vmcommon.OutputAccount{
+								string(outputAddress): {Address: outputAddress},
+							},
+						}, nil
+					},
+				}, nil
+			},
+		}
+
+		contract := transaction.SmartContract{
+			Type:      transaction.SmartContract_SCInvoke,
+			CallValue: map[string]*transaction.CallValue{"KLV": {Amount: 45}},
+			Address:   core.ZeroAddress,
+		}
+		tx, _ := createTransactionMock(&contract, transaction.TXContract_SmartContractType, []byte("SRC"), 0, [][]byte{[]byte("abba@0500@0000")})
+		tx.GasLimit = gasLimit
+
+		computedHash, err := tools.CalculateHash(arguments.Marshalizer, arguments.Hasher, tx.RawData)
+		require.Nil(t, err)
+
+		ctx := kapp.NewKappContext(kapp.ArgsNewKAppContext{
+			OriginalSender: tx.GetSender(),
+			ContractID:     0,
+			ContractType:   tx.RawData.GetContract()[0].Type,
+			Block:          &block.Block{},
+			TxHash:         computedHash,
+			TX:             tx,
+			IsScSimulation: isSimulation,
+		})
+
+		tc, err := tx.RawData.Contract[ctx.ContractID()].GetSmartContract()
+		require.Nil(t, err)
+
+		arguments.BlockChainHook = &contextmock.BlockchainHookStub{
+			GetKAppControllerCalled: func() kapp.KAppController {
+				kappCtrl, errCtrl := kappcontroller.NewKappController(kappcontroller.ArgsNewKApp{
+					Hasher:         arguments.Hasher,
+					Marshalizer:    arguments.Marshalizer,
+					PubkeyConv:     arguments.PubkeyConv,
+					ForkController: arguments.ForkController,
+					AccountsCacher: arguments.AccountsCacher,
+					RatingsData:    &commommock.RatingsInfoMock{},
+				})
+				require.Nil(t, errCtrl)
+				_ = kappCtrl.GetAccountsKApp().SetAccountsCacher(arguments.AccountsCacher)
+				_ = kappCtrl.GetAccountsKApp().SetKAppController(kappCtrl)
+				_ = kappCtrl.GetKDAKApp().SetAccountsCacher(arguments.AccountsCacher)
+				_ = kappCtrl.GetKDAKApp().SetKAppController(kappCtrl)
+				kappCtrl.SetCurrentKAppContext(ctx)
+
+				return kappCtrl
+			},
+		}
+
+		sc, err := NewSmartContractProcessor(arguments)
+		require.Nil(t, err)
+
+		acntSrc, acntDst := initAccounts(tx, arguments.AccountsCacher, contract.CallValue["KLV"].Amount*2)
+		acntDst.SetCode([]byte("code"))
+
+		returnCode, err := sc.ExecuteSmartContractTransaction(ctx, tc, acntSrc, acntDst)
+		return returnCode, ctx, arguments.AccountsCacher, err
+	}
+
+	shortAddress := bytes.Repeat([]byte{0x01}, 31)
+
+	// the address check runs before processSCOutputAccounts' simulation guard, so each case runs on
+	// both paths: in a simulation, and in a real execution, which also saves storage updates
+	for _, isSimulation := range []bool{true, false} {
+		mode := fmt.Sprintf("simulation=%v", isSimulation)
+
+		t.Run(mode+"/short output account fails the transaction and charges the full gas after FixAuditChangesV6", func(t *testing.T) {
+			t.Parallel()
+
+			returnCode, ctx, cacher, err := execute(t, true, isSimulation, shortAddress)
+			require.Equal(t, vmcommon.VMExecutionFailed, returnCode)
+			require.EqualError(t, err, process.ErrInvalidOutputAccountAddressLength.Error())
+			require.Zero(t, ctx.GetGasLimit())
+
+			cached, stored := userAccountExists(t, cacher, shortAddress)
+			require.False(t, cached)
+			require.False(t, stored)
+		})
+
+		t.Run(mode+"/short output account succeeds before FixAuditChangesV6", func(t *testing.T) {
+			t.Parallel()
+
+			returnCode, ctx, cacher, err := execute(t, false, isSimulation, shortAddress)
+			require.Equal(t, vmcommon.Ok, returnCode)
+			require.NoError(t, err)
+			require.Equal(t, gasRemaining, ctx.GetGasLimit())
+
+			cached, stored := userAccountExists(t, cacher, shortAddress)
+			require.True(t, cached)
+			require.True(t, stored)
+		})
+
+		t.Run(mode+"/32-byte output account succeeds after FixAuditChangesV6", func(t *testing.T) {
+			t.Parallel()
+
+			address := bytes.Repeat([]byte{0x01}, 32)
+			returnCode, ctx, cacher, err := execute(t, true, isSimulation, address)
+			require.Equal(t, vmcommon.Ok, returnCode)
+			require.NoError(t, err)
+			require.Equal(t, gasRemaining, ctx.GetGasLimit())
+
+			cached, stored := userAccountExists(t, cacher, address)
+			require.True(t, cached)
+			require.True(t, stored)
+		})
+	}
 }

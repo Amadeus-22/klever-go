@@ -260,11 +260,11 @@ func (tc *transactionCoordinator) ProcessBlockTransactions(
 	}
 
 	if block.GetTxFees() != tc.feeHandler.GetAccumulatedTxFees() {
-		return nil, process.ErrInvalidTXFees
+		return nil, process.WrapBlockExecutionNotMatchingHeader(process.ErrInvalidTXFees)
 	}
 
 	if block.GetKAppFees() != tc.feeHandler.GetAccumulatedKAppFees() {
-		return nil, process.ErrInvalidKAppsFees
+		return nil, process.WrapBlockExecutionNotMatchingHeader(process.ErrInvalidKAppsFees)
 	}
 
 	if tc.forkController.EnableSmartContracts() {
@@ -336,6 +336,11 @@ func (tc *transactionCoordinator) GetAllCurrentUsedTxs() map[string]data.Transac
 // GetAllCurrentLogs return the cached logs data from current round
 func (tc *transactionCoordinator) GetAllCurrentLogs() []*data.LogData {
 	return tc.transactionsLogProcessor.GetAllCurrentLogs()
+}
+
+// SaveLogsToStorage persists the logs cached for the current block, once it passed validation
+func (tc *transactionCoordinator) SaveLogsToStorage() error {
+	return tc.transactionsLogProcessor.SaveLogsToStorage()
 }
 
 // setVMExecutionMode sets the execution mode directly on the smart contract processor

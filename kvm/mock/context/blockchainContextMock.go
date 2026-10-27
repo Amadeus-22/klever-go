@@ -20,26 +20,6 @@ type BlockchainContextMock struct {
 	GetSFTMetaCalled      func(asset []byte, nonce uint64) (*kapps.MetaV2, error)
 }
 
-// InitState -
-func (b *BlockchainContextMock) InitState() {
-}
-
-// PushState -
-func (b *BlockchainContextMock) PushState() {
-}
-
-// PopSetActiveState -
-func (b *BlockchainContextMock) PopSetActiveState() {
-}
-
-// PopDiscard -
-func (b *BlockchainContextMock) PopDiscard() {
-}
-
-// ClearStateStack -
-func (b *BlockchainContextMock) ClearStateStack() {
-}
-
 // NewAddress -
 func (b *BlockchainContextMock) NewAddress(creatorAddress []byte) ([]byte, error) {
 	return creatorAddress, nil
@@ -194,15 +174,6 @@ func (b *BlockchainContextMock) GetUserAccount(_ []byte) (state.UserAccountHandl
 // ProcessBuiltInFunction -
 func (b *BlockchainContextMock) ProcessBuiltInFunction(_ *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error) {
 	return &vmcommon.VMOutput{}, nil
-}
-
-// GetSnapshot -
-func (b *BlockchainContextMock) GetSnapshot() int {
-	return 0
-}
-
-// RevertToSnapshot -
-func (b *BlockchainContextMock) RevertToSnapshot(_ int) {
 }
 
 // IsLimitedTransfer -

@@ -12,6 +12,7 @@ import (
 	kvmmath "github.com/klever-io/klever-go/kvm/math"
 	contextmock "github.com/klever-io/klever-go/kvm/mock/context"
 	"github.com/klever-io/klever-go/kvm/vmhost"
+	hostmock "github.com/klever-io/klever-go/kvm/vmhost/mock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -34,11 +35,21 @@ func newInternalMockVMHostWithGas(fixAuditChangesV4 bool, gas uint64) *contextmo
 
 	forkController := commonMock.NewForkControllerStub()
 	forkController.FixAuditChangesV4Value = fixAuditChangesV4
+	// the stub enables every fork; V6 moves the argument data charge into getArgumentsFromMemory
+	// and is switched on only by the tests covering it
+	forkController.FixAuditChangesV6Value = false
 
 	return &contextmock.VMHostMock{
 		RuntimeContext:        mockRuntime,
 		MeteringContext:       mockMetering,
 		ForkControllerContext: forkController,
+		// prices the copy as managedTypesContext does, so the charge lands on the metering mock
+		ManagedTypesContext: &hostmock.ManagedTypesContextMock{
+			ConsumeGasForByteLenBoundedCalled: func(byteLen uint64) error {
+				dataCopyPerByte := mockMetering.GasSchedule().BaseOperationCost.DataCopyPerByte
+				return mockMetering.UseGasBounded(kvmmath.MulUint64(byteLen, dataCopyPerByte))
+			},
+		},
 	}
 }
 
@@ -336,5 +347,134 @@ func TestVMHooksImpl_getArgumentsFromMemory_argumentLengthsGasCharge(t *testing.
 			assert.Equal(t, int32(0), totalLen)
 			assert.Equal(t, uint64(1000), host.Metering().GasLeft())
 		}
+	})
+}
+
+func newInternalMockVMHostWithV6(gas uint64) *contextmock.VMHostMock {
+	host := newInternalMockVMHostWithGas(true, gas)
+	host.ForkControllerContext.(*commonMock.ForkControllerStub).FixAuditChangesV6Value = true
+	return host
+}
+
+// Before FixAuditChangesV6 the argument data was loaded first and charged by the caller afterwards,
+// so a contract could force up to maxTotalArgumentsBytes of copying before running out of gas.
+// After it the data is charged here, bounded, before MemLoadMultiple, and nothing is left for the caller.
+func TestVMHooksImpl_getArgumentsFromMemory_argumentDataGasCharge(t *testing.T) {
+	t.Parallel()
+
+	args := [][]byte{[]byte("arg1"), []byte("argument2")}
+	lengths := []int32{int32(len(args[0])), int32(len(args[1]))}
+	// DataCopyPerByte is 1 in the test gas schedule
+	const lengthsCharge = uint64(2 * 4)
+	dataCharge := uint64(len(args[0]) + len(args[1]))
+
+	t.Run("the data is charged and nothing is left uncharged", func(t *testing.T) {
+		host := newInternalMockVMHostWithV6(1000)
+		require.NoError(t, host.Runtime().GetInstance().MemStore(executor.MemPtr(0), encodeArgLengths(lengths)))
+		require.NoError(t, host.Runtime().GetInstance().MemStore(executor.MemPtr(100), append(append([]byte{}, args[0]...), args[1]...)))
+
+		result, uncharged, err := NewVMHooksImpl(host).getArgumentsFromMemory(host, 2, executor.MemPtr(0), executor.MemPtr(100))
+
+		require.NoError(t, err)
+		assert.Equal(t, args, result)
+		assert.Equal(t, int32(0), uncharged)
+		assert.Equal(t, 1000-lengthsCharge-dataCharge, host.Metering().GasLeft())
+	})
+
+	// the data offset is out of bounds, so reaching MemLoadMultiple would fail with a memory error instead
+	t.Run("one gas short fails before the data is loaded", func(t *testing.T) {
+		host := newInternalMockVMHostWithV6(lengthsCharge + dataCharge - 1)
+		require.NoError(t, host.Runtime().GetInstance().MemStore(executor.MemPtr(0), encodeArgLengths(lengths)))
+
+		result, uncharged, err := NewVMHooksImpl(host).getArgumentsFromMemory(host, 2, executor.MemPtr(0), executor.MemPtr(1<<20))
+
+		require.ErrorIs(t, err, vmhost.ErrNotEnoughGas)
+		assert.Nil(t, result)
+		assert.Equal(t, int32(0), uncharged)
+		assert.Equal(t, dataCharge-1, host.Metering().GasLeft())
+	})
+}
+
+func TestVMHooksImpl_memLoadCharged(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte("hello")
+	length := int32(len(payload))
+
+	t.Run("after V6 the bytes are charged before the load", func(t *testing.T) {
+		host := newInternalMockVMHostWithV6(1000)
+		require.NoError(t, host.Runtime().GetInstance().MemStore(executor.MemPtr(0), payload))
+
+		data, uncharged, err := NewVMHooksImpl(host).memLoadCharged(host, executor.MemPtr(0), length)
+
+		require.NoError(t, err)
+		assert.Equal(t, payload, data)
+		assert.Equal(t, int32(0), uncharged)
+		assert.Equal(t, uint64(1000-len(payload)), host.Metering().GasLeft())
+	})
+
+	t.Run("after V6 one gas short fails and charges nothing", func(t *testing.T) {
+		host := newInternalMockVMHostWithV6(uint64(length - 1))
+
+		data, uncharged, err := NewVMHooksImpl(host).memLoadCharged(host, executor.MemPtr(1<<20), length)
+
+		require.ErrorIs(t, err, vmhost.ErrNotEnoughGas)
+		assert.Nil(t, data)
+		assert.Equal(t, int32(0), uncharged)
+		assert.Equal(t, uint64(length-1), host.Metering().GasLeft())
+	})
+
+	t.Run("before V6 nothing is charged and the caller gets the full length", func(t *testing.T) {
+		host := newInternalMockVMHostWithGas(true, 1000)
+		require.NoError(t, host.Runtime().GetInstance().MemStore(executor.MemPtr(0), payload))
+
+		data, uncharged, err := NewVMHooksImpl(host).memLoadCharged(host, executor.MemPtr(0), length)
+
+		require.NoError(t, err)
+		assert.Equal(t, payload, data)
+		assert.Equal(t, length, uncharged)
+		assert.Equal(t, uint64(1000), host.Metering().GasLeft())
+	})
+
+	t.Run("after V6 a negative length is rejected by MemLoad, not by gas", func(t *testing.T) {
+		host := newInternalMockVMHostWithV6(1000)
+
+		data, uncharged, err := NewVMHooksImpl(host).memLoadCharged(host, executor.MemPtr(0), -1)
+
+		require.ErrorIs(t, err, executor.ErrMemoryNegativeLength)
+		assert.Nil(t, data)
+		assert.Equal(t, int32(0), uncharged)
+		assert.Equal(t, uint64(1000), host.Metering().GasLeft())
+	})
+}
+
+func TestVMHooksImpl_extractIndirectContractCallArguments_functionNameLength(t *testing.T) {
+	t.Parallel()
+
+	extract := func(host *contextmock.VMHostMock, functionLength int32) error {
+		_, err := NewVMHooksImpl(host).extractIndirectContractCallArgumentsWithoutValue(
+			host, executor.MemPtr(0), executor.MemPtr(100), functionLength, 0, executor.MemPtr(0), executor.MemPtr(0))
+		return err
+	}
+
+	t.Run("after V6 a name at the limit is rejected before it is charged", func(t *testing.T) {
+		host := newInternalMockVMHostWithV6(1000)
+
+		require.ErrorIs(t, extract(host, vmhost.MaxFunctionNameLength), vmhost.ErrInvalidFunctionName)
+		assert.Equal(t, uint64(1000), host.Metering().GasLeft())
+	})
+
+	t.Run("after V6 the longest callable name is charged and loaded", func(t *testing.T) {
+		host := newInternalMockVMHostWithV6(1000)
+
+		require.NoError(t, extract(host, vmhost.MaxFunctionNameLength-1))
+		assert.Equal(t, uint64(1000-(vmhost.MaxFunctionNameLength-1)), host.Metering().GasLeft())
+	})
+
+	t.Run("before V6 a name at the limit is still loaded, for free", func(t *testing.T) {
+		host := newInternalMockVMHostWithGas(true, 1000)
+
+		require.NoError(t, extract(host, vmhost.MaxFunctionNameLength))
+		assert.Equal(t, uint64(1000), host.Metering().GasLeft())
 	})
 }

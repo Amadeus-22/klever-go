@@ -722,3 +722,75 @@ func TestKleverTransferOversizedValueForkGating(t *testing.T) {
 		require.False(t, accountTransferCalled)
 	})
 }
+
+// TestKleverTransferZeroValueLogForkGating pins KLC-2830 in the builtin: a zero-value transfer is
+// settled without an account transfer on both sides of FixAuditChangesV6, and only before the fork
+// does it leave a transfer log naming its asset id and NFT nonce.
+func TestKleverTransferZeroValueLogForkGating(t *testing.T) {
+	t.Parallel()
+
+	funcGasCost := uint64(100)
+
+	run := func(t *testing.T, forkEnabled bool) ([]*vmcommon.LogEntry, []*vmcommon.KDATransfer, []string) {
+		var transferredAssets []string
+		instance := builtInFunctions.NewKDATransferFunc(
+			funcGasCost,
+			&stub.KAppControllerStub{
+				GetAccountsKAppCalled: func() kapp.AccountsKapp {
+					return &stub.KAppAccountsStub{
+						TransferCalled: func(
+							_ transaction.TXContract_ContractType,
+							_ []byte,
+							tc *transaction.TransferContract,
+						) (transaction.Transaction_TXResultCode, error) {
+							transferredAssets = append(transferredAssets, string(tc.AssetID))
+							return transaction.Transaction_Ok, nil
+						},
+					}
+				},
+			},
+			mock.NewForkControllerStub().SetFork("FixAuditChangesV6", forkEnabled),
+		)
+		require.NoError(t, instance.SetPayableChecker(&PayableHandlerStub{}))
+
+		transfers := []*vmcommon.KDATransfer{
+			{KDATokenName: []byte("FTFunded"), KDAValue: big.NewInt(1000)},
+			{KDATokenName: []byte("NFT-1234"), KDAValue: big.NewInt(0), KDATokenNonce: 5},
+		}
+		vmInput := vmInputTransferCreation(transfers, funcGasCost*uint64(len(transfers)))
+
+		vmOutput, err := instance.ProcessBuiltinFunction(vmInput)
+		require.NoError(t, err)
+		require.Equal(t, vmcommon.Ok, vmOutput.ReturnCode)
+		require.Zero(t, vmOutput.GasRemaining, "the zero-value transfer is still charged")
+
+		return vmOutput.Logs, transfers, transferredAssets
+	}
+
+	logTokens := func(logs []*vmcommon.LogEntry) []string {
+		tokens := make([]string, 0, len(logs))
+		for _, entry := range logs {
+			tokens = append(tokens, string(entry.Topics[0]))
+		}
+		return tokens
+	}
+
+	for _, tc := range []struct {
+		name        string
+		forkEnabled bool
+		logTokens   []string
+	}{
+		{name: "fork disabled logs the zero-value transfer", forkEnabled: false, logTokens: []string{"FTFunded", "NFT-1234/5"}},
+		{name: "fork enabled logs only the funded transfer", forkEnabled: true, logTokens: []string{"FTFunded"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs, transfers, transferredAssets := run(t, tc.forkEnabled)
+
+			require.Equal(t, tc.logTokens, logTokens(logs))
+			require.Equal(t, []string{"FTFunded"}, transferredAssets, "only the funded transfer reaches the accounts KApp")
+			for _, transfer := range transfers {
+				require.True(t, transfer.IsExecuted(), "%s must be marked executed", transfer.KDATokenName)
+			}
+		})
+	}
+}

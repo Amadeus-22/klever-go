@@ -254,6 +254,7 @@ type RequestHandler interface {
 	SetNumPeersToQuery(key string, intra int, cross int) error
 	GetNumPeersToQuery(key string) (int, int, error)
 	ResetRequests()
+	RemoveHeaderRequests(nonce uint64, hash []byte)
 	IsInterfaceNil() bool
 }
 
@@ -383,7 +384,6 @@ type EpochBootstrapper interface {
 
 // TransactionProcessor is the main interface for transaction execution engine
 type TransactionProcessor interface {
-	SetProposalController(controller kapps.ActiveProposalController) error
 	PreProcessTransaction(tx *transaction.Transaction) (state.UserAccountHandler, []byte, error)
 	ProcessTransaction(block *block.Block, txHash []byte, tx *transaction.Transaction) error
 	ProcessBandwidthFee(txHash []byte, tx *transaction.Transaction, ownerAcc state.UserAccountHandler) (int64, error)
@@ -456,6 +456,7 @@ type TransactionCoordinator interface {
 	ProcessBlockTransactions(blk *block.Block, haveTime func() time.Duration, isImportDB bool) (data.ProcessResults, error)
 	GetAllCurrentUsedTxs() map[string]data.TransactionHandler
 	GetAllCurrentLogs() []*data.LogData
+	SaveLogsToStorage() error
 
 	RestoreBlockDataFromStorage(body *block.Block) (int, error)
 	RemoveBlockDataFromPool(body *block.Block) error
@@ -494,6 +495,7 @@ type EconomicsDataHandler interface {
 	LeaderPercentage() float64
 	MaxGasLimitPerBlock() uint64
 	MaxGasLimitPerTX() uint64
+	IsProposalControllerSet() bool
 	IsInterfaceNil() bool
 }
 
@@ -657,8 +659,6 @@ type BlockChainHookHandler interface {
 	IsPayable(sndAddress []byte, recvAddress []byte) (bool, error)
 	DeleteCompiledCode(codeHash []byte)
 	ClearCompiledCodes()
-	GetSnapshot() int
-	RevertToSnapshot(snapshot int) error
 	ExecuteSmartContractCallOnOtherVM(input *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error)
 	TransferValueOnly(destination []byte, sender []byte, value *big.Int) error
 	KDATransfer(sender []byte, tc *transaction.TransferContract) error
@@ -719,6 +719,7 @@ type TransactionLogProcessor interface {
 	GetAllCurrentLogs() []*data.LogData
 	GetLog(txHash []byte) (data.LogHandler, error)
 	SaveLog(txHash []byte, acntSender []byte, tc data.SmartContractHandler, contractID int, vmLogs []*vmcommon.LogEntry) error
+	SaveLogsToStorage() error
 	Clean()
 	IsInterfaceNil() bool
 }

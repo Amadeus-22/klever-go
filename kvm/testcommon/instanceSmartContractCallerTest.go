@@ -3,6 +3,7 @@ package testcommon
 import (
 	"testing"
 
+	blockchainConfig "github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/kvm/config"
 	"github.com/klever-io/klever-go/kvm/executor"
 	executorwrapper "github.com/klever-io/klever-go/kvm/executor/wrapper"
@@ -102,6 +103,12 @@ func (template *InstanceCallTestTemplate) WithSetup(setup func(vmhost.VMHost, *c
 // WithGasSchedule provides gas schedule for the test
 func (template *InstanceCallTestTemplate) WithGasSchedule(gasSchedule config.GasScheduleMap) *InstanceCallTestTemplate {
 	template.hostBuilder.WithGasSchedule(gasSchedule)
+	return template
+}
+
+// WithEnableEpochs runs the test under the given fork activation schedule instead of all forks active
+func (template *InstanceCallTestTemplate) WithEnableEpochs(epochs blockchainConfig.EnableEpochs) *InstanceCallTestTemplate {
+	template.hostBuilder.WithEnableEpochs(epochs)
 	return template
 }
 

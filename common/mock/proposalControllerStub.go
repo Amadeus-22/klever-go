@@ -13,6 +13,7 @@ type ProposalControllerStub struct {
 	GetParameterUintCalled      func(kapps.EnumParameter) uint64
 	ParseParamAndValidateCalled func(parameter kapps.EnumParameter, value []byte, forks core.ForkController) (reflect.Value, error)
 	UpdateParametersCalled      func(map[int32]*kapps.Parameter)
+	RestoreParametersCalled     func(map[int32]*kapps.Parameter)
 	IsInterfaceNilCalled        func() bool
 }
 
@@ -51,6 +52,12 @@ func (stub *ProposalControllerStub) ParseParamAndValidate(param kapps.EnumParame
 func (stub *ProposalControllerStub) UpdateParameters(params map[int32]*kapps.Parameter) {
 	if stub.UpdateParametersCalled != nil {
 		stub.UpdateParametersCalled(params)
+	}
+}
+
+func (stub *ProposalControllerStub) RestoreParameters(params map[int32]*kapps.Parameter) {
+	if stub.RestoreParametersCalled != nil {
+		stub.RestoreParametersCalled(params)
 	}
 }
 

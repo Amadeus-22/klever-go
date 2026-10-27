@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sync"
 
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/core"
@@ -55,6 +56,18 @@ type instanceTracker struct {
 	numTrackedInstances int
 
 	forkController core.ForkController
+
+	// mutActive serializes RequestInterruption, which runs on the timeout
+	// goroutine, against every write of the active instance and its breakpoint
+	// on the execution goroutine. The execution goroutine reads the active
+	// instance without it: those reads cannot race its own writes, and the
+	// timeout goroutine only reads under the lock.
+	mutActive sync.Mutex
+	// interruption is the breakpoint requested by an execution timeout, or
+	// BreakpointNone. While set, it is applied to every instance that becomes
+	// active and survives breakpoint resets, so a nested call started after the
+	// request cannot run past it.
+	interruption vmhost.BreakpointValue
 }
 
 // NewInstanceTracker creates a new instanceTracker instance
@@ -88,7 +101,7 @@ func NewInstanceTracker(forkController core.ForkController) (*instanceTracker, e
 
 // InitState initializes the internal instanceTracker state
 func (tracker *instanceTracker) InitState() {
-	tracker.instance = nil
+	tracker.setActiveInstance(nil)
 	tracker.codeHash = make([]byte, 0)
 	tracker.instances = make(map[string]executor.Instance)
 	tracker.numTrackedInstances = 0
@@ -118,11 +131,13 @@ func (tracker *instanceTracker) PopSetActiveState() {
 	activeInstanceIsTopOfStack := stackedPrevInstance == activeInstance
 	cold := !WarmInstancesEnabled
 
+	// Replace before destroying, so RequestInterruption never targets the popped
+	// instance while it is being cleaned.
+	tracker.ReplaceInstance(stackedPrevInstance)
+
 	if !activeInstanceIsTopOfStack && (onStack || cold) {
 		tracker.cleanPoppedInstance(activeInstance, activeCodeHash)
 	}
-
-	tracker.ReplaceInstance(stackedPrevInstance)
 
 	tracker.instanceStack = tracker.instanceStack[:instanceStackLen-1]
 	tracker.codeHash = tracker.codeHashStack[instanceStackLen-1]
@@ -243,24 +258,29 @@ func (tracker *instanceTracker) ForceCleanInstance(bypassWarmAndStackChecks bool
 		return
 	}
 
+	// Unset before destroying, so RequestInterruption never targets an instance
+	// that is being cleaned.
+	instance := tracker.instance
+	codeHash := tracker.codeHash
+	tracker.UnsetInstance()
+
 	defer func() {
-		tracker.UnsetInstance()
 		numWarmInstances, numColdInstances := tracker.NumRunningInstances()
 		logTracker.Trace("instance cleaned; num instances", "warm", numWarmInstances, "cold", numColdInstances)
 	}()
 
 	if bypassWarmAndStackChecks {
-		tracker.cleanInstance(tracker.instance)
+		tracker.cleanInstance(instance)
 
 		return
 	}
 
-	onStack := tracker.IsCodeHashOnTheStack(tracker.codeHash)
+	onStack := tracker.IsCodeHashOnTheStack(codeHash)
 	coldOnlyEnabled := !WarmInstancesEnabled
 	if onStack || coldOnlyEnabled {
-		tracker.cleanInstance(tracker.instance)
+		tracker.cleanInstance(instance)
 	} else {
-		tracker.warmInstanceCache.Remove(tracker.codeHash)
+		tracker.warmInstanceCache.Remove(codeHash)
 	}
 }
 
@@ -377,7 +397,7 @@ func (tracker *instanceTracker) ReplaceInstance(instance executor.Instance) {
 	logTracker.Trace("replaced instance",
 		"prev id", previousInstanceID,
 		"new id", instance.ID())
-	tracker.instance = instance
+	tracker.setActiveInstance(instance)
 }
 
 // UnsetInstance replaces the currently active instance with nil
@@ -390,8 +410,53 @@ func (tracker *instanceTracker) UnsetInstance() {
 	logTracker.Trace("UnsetInstance",
 		"id", tracker.instance.ID(),
 		"codeHash", tracker.codeHash)
-	tracker.instance = nil
+	tracker.setActiveInstance(nil)
 	tracker.codeHash = nil
+}
+
+// setActiveInstance makes the given instance active, applying any pending
+// interruption to it.
+func (tracker *instanceTracker) setActiveInstance(instance executor.Instance) {
+	tracker.mutActive.Lock()
+	defer tracker.mutActive.Unlock()
+
+	tracker.instance = instance
+	if tracker.interruption != vmhost.BreakpointNone && !check.IfNil(instance) {
+		instance.SetBreakpointValue(uint64(tracker.interruption))
+	}
+}
+
+// SetActiveBreakpointValue sets the breakpoint of the active instance. A reset
+// to BreakpointNone keeps a pending interruption in place instead of clearing it.
+func (tracker *instanceTracker) SetActiveBreakpointValue(value vmhost.BreakpointValue) {
+	tracker.mutActive.Lock()
+	defer tracker.mutActive.Unlock()
+
+	if value == vmhost.BreakpointNone {
+		value = tracker.interruption
+	}
+	tracker.instance.SetBreakpointValue(uint64(value))
+}
+
+// RequestInterruption stops the active instance, and every instance made active
+// after it, at the given breakpoint. It is safe to call from a goroutine other
+// than the one executing the contract.
+func (tracker *instanceTracker) RequestInterruption(value vmhost.BreakpointValue) {
+	tracker.mutActive.Lock()
+	defer tracker.mutActive.Unlock()
+
+	tracker.interruption = value
+	if !check.IfNil(tracker.instance) {
+		tracker.instance.SetBreakpointValue(uint64(value))
+	}
+}
+
+// ClearInterruption drops a pending interruption request.
+func (tracker *instanceTracker) ClearInterruption() {
+	tracker.mutActive.Lock()
+	defer tracker.mutActive.Unlock()
+
+	tracker.interruption = vmhost.BreakpointNone
 }
 
 // LogCounts prints the instance counter to the log

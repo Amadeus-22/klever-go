@@ -143,6 +143,7 @@ type AssetTriggerTXRequest struct {
 // CreateValidatorTXRequest -
 type CreateValidatorTXRequest struct {
 	BLSPublicKey        string            `form:"blsPublicKey" json:"blsPublicKey"`
+	BLSSignature        string            `form:"blsSignature" json:"blsSignature"`
 	OwnerAddress        string            `form:"ownerAddress" json:"ownerAddress"`
 	RewardAddress       string            `form:"rewardAddress" json:"rewardAddress"`
 	CanDelegate         bool              `form:"canDelegate" json:"canDelegate"`
@@ -156,6 +157,7 @@ type CreateValidatorTXRequest struct {
 // ValidatorConfigTXRequest -
 type ValidatorConfigTXRequest struct {
 	BLSPublicKey        string            `form:"blsPublicKey" json:"blsPublicKey"`
+	BLSSignature        string            `form:"blsSignature" json:"blsSignature"`
 	RewardAddress       string            `form:"rewardAddress" json:"rewardAddress"`
 	CanDelegate         bool              `form:"canDelegate" json:"canDelegate"`
 	Commission          uint32            `form:"commission" json:"commission"`

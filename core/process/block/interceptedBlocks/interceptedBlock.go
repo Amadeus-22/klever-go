@@ -198,7 +198,11 @@ func (inMb *InterceptedBlock) CheckValidity() error {
 			err)
 	}
 
-	return inMb.sigVerifier.VerifySignature(hdr)
+	if err := inMb.sigVerifier.VerifySignature(hdr); err != nil {
+		return err
+	}
+
+	return process.CheckBlockBodyMatchesHeader(hdr, inMb.hasher, inMb.forkController)
 }
 
 // integrity checks the integrity of the tx block header
@@ -238,10 +242,8 @@ func (inMb *InterceptedBlock) integrity() error {
 
 	blk := inMb.block
 
-	for _, txHash := range blk.TxHashes {
-		if txHash == nil {
-			return process.ErrNilTxHash
-		}
+	if len(blk.TxResults) != 0 && len(blk.TxResults) != len(blk.TxHashes) {
+		return process.WrapBlockBodyNotMatchingHeader(process.ErrInvalidTXResultsCount)
 	}
 
 	return nil

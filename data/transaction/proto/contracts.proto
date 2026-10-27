@@ -162,6 +162,7 @@ message ValidatorConfig {
     string               Logo                = 6 [json_name = "logo"];
     map<string, string>  URIs                = 7 [json_name = "uris"];
     string               Name                = 8 [json_name = "name"];
+    bytes                BLSSignature        = 9 [json_name = "blsSignature,omitempty"];
 }
 
 // CreateValidatorContract holds the data for create a validator

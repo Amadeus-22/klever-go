@@ -591,6 +591,7 @@ func TestEventsProcessor_SaveBlock_DispatchesAllEventsAndPreparesIndexer(t *test
 	require.NotNil(t, prepared)
 	require.NotEmpty(t, prepared.Txs)
 	require.NotNil(t, prepared.Altered)
+	require.NotEmpty(t, prepared.Accounts, "the dispatched account documents ride along so the indexer does not build them again")
 }
 
 // Regression: SaveBlock must not drain TransactionsPool.Txs — the work item
@@ -637,10 +638,10 @@ func TestEventsProcessor_SaveBlock_DoesNotMutatePool(t *testing.T) {
 	require.Len(t, pool.Txs, 2, "SaveBlock must not drain TransactionsPool.Txs — work item still reads it for ComputeSizeOfTxs")
 }
 
-// When ws is disabled and only the indexer is enabled, SaveBlock must NOT
-// prep on the commit goroutine — the worker re-preps via the fallback in
-// elasticProcessor.SaveTransactions, keeping commit-thread cost flat.
-func TestEventsProcessor_SaveBlock_IndexerOnlySkipsCommitThreadPrep(t *testing.T) {
+// When ws is disabled and only the indexer is enabled, eventsProcessor must not
+// prep itself: dataIndexer.SaveBlock preps through PrepareBlockData, still on the
+// commit goroutine, and only when the accounts index needs it.
+func TestEventsProcessor_SaveBlock_IndexerOnlyLeavesPrepToIndexer(t *testing.T) {
 	testQueue := saveAndRestoreEventQueue(t, false)
 
 	acc := createTestAccountStub()
@@ -680,7 +681,7 @@ func TestEventsProcessor_SaveBlock_IndexerOnlySkipsCommitThreadPrep(t *testing.T
 	default:
 	}
 
-	require.Nil(t, receivedPrepared, "Prepared must be nil when ws is disabled — worker re-preps on its own goroutine")
+	require.Nil(t, receivedPrepared, "Prepared must be nil when ws is disabled — the indexer preps through PrepareBlockData")
 }
 
 func TestEventsProcessor_SaveBlock_NoOpWhenNothingEnabled(t *testing.T) {

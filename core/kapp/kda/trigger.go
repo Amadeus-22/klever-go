@@ -136,7 +136,7 @@ func (k *kdaKapp) burnAsset(sender []byte, tc *transaction.AssetTriggerContract)
 func (k *kdaKapp) handlePauseOrResume(sender []byte, tc *transaction.AssetTriggerContract, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -160,7 +160,7 @@ func (k *kdaKapp) changeOwner(sender []byte, tc *transaction.AssetTriggerContrac
 	}
 
 	// admin cannot change owner
-	if !bytes.Equal(asset.OwnerAddress, sender) {
+	if !asset.IsOwner(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -200,7 +200,7 @@ func (k *kdaKapp) handleAddRole(
 ) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -249,7 +249,7 @@ func (k *kdaKapp) handleAddRole(
 func (k *kdaKapp) handleRemoveRole(sender []byte, tc *transaction.AssetTriggerContract, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -268,7 +268,7 @@ func (k *kdaKapp) handleRemoveRole(sender []byte, tc *transaction.AssetTriggerCo
 }
 
 func (k *kdaKapp) updateMetadata(sender []byte, tc *transaction.AssetTriggerContract, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData, txData [][]byte) (transaction.Transaction_TXResultCode, error) {
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
 
@@ -280,7 +280,7 @@ func (k *kdaKapp) updateMetadata(sender []byte, tc *transaction.AssetTriggerCont
 	case kapps.KDAData_NonFungible:
 		return k.updateMetadataV1(tc, kdaKApp, assetID, asset, txData)
 	case kapps.KDAData_SemiFungible:
-		return k.updateMetadataV2(assetID, txData)
+		return k.updateMetadataV2(assetID, asset, txData)
 	default:
 		return transaction.Transaction_AssetTypeInvalid, common.ErrAssetTypeInvalid
 	}
@@ -353,7 +353,7 @@ func (k *kdaKapp) updateMetadataV1(tc *transaction.AssetTriggerContract, kdaKApp
 	return k.updateKApp(kdaKApp, assetID[0], asset)
 }
 
-func (k *kdaKapp) updateMetadataV2(assetID [][]byte, txData [][]byte) (transaction.Transaction_TXResultCode, error) {
+func (k *kdaKapp) updateMetadataV2(assetID [][]byte, asset *kapps.KDAData, txData [][]byte) (transaction.Transaction_TXResultCode, error) {
 	// check if asset has nonce Metadata only supported with NFT/SFTs
 	if len(assetID) != 2 {
 		return transaction.Transaction_AssetTypeInvalid, common.ErrAssetIDInvalid
@@ -375,6 +375,19 @@ func (k *kdaKapp) updateMetadataV2(assetID [][]byte, txData [][]byte) (transacti
 		args = append(args, decoded)
 	}
 
+	// Stopped SFTs refuse metadata rewrites once the nonce has a Name or Attributes;
+	// the first write to an empty nonce is still allowed, mirroring the NFT branch.
+	if k.forkController.FixAuditChangesV6() && asset.GetAttributes().GetIsNFTMetadataChangeStopped() {
+		meta, err := k.KAppController.GetSystemAccountKApp().SFTGetMeta(assetID[0], assetID[1])
+		if err != nil {
+			return transaction.Transaction_AssetError, err
+		}
+
+		if len(meta.GetMetadata().GetName()) > 0 || len(meta.GetMetadata().GetAttributes()) > 0 {
+			return transaction.Transaction_NFTMetadataChangeStopped, process.ErrNFTMetadataChangeStopped
+		}
+	}
+
 	if err := k.KAppController.GetSystemAccountKApp().SFTSetMetadata(assetID[0], assetID[1], args); err != nil {
 		return transaction.Transaction_AssetError, err
 	}
@@ -392,7 +405,7 @@ func (k *kdaKapp) updateMetadataV2(assetID [][]byte, txData [][]byte) (transacti
 func (k *kdaKapp) handleStopNFTMint(sender []byte, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -415,7 +428,7 @@ func (k *kdaKapp) handleStopNFTMint(sender []byte, kdaKApp state.KAppAccountHand
 func (k *kdaKapp) handleStopRoyaltiesChange(sender []byte, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -431,7 +444,7 @@ func (k *kdaKapp) handleStopRoyaltiesChange(sender []byte, kdaKApp state.KAppAcc
 }
 
 func (k *kdaKapp) handleUpdateLogo(sender []byte, tc *transaction.AssetTriggerContract, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
 
@@ -445,7 +458,7 @@ func (k *kdaKapp) handleUpdateLogo(sender []byte, tc *transaction.AssetTriggerCo
 }
 
 func (k *kdaKapp) handleUpdateURIs(sender []byte, tc *transaction.AssetTriggerContract, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
 
@@ -468,8 +481,15 @@ func (k *kdaKapp) handleUpdateURIs(sender []byte, tc *transaction.AssetTriggerCo
 }
 
 func (k *kdaKapp) updateRoyaltiesReceiver(sender []byte, tc *transaction.AssetTriggerContract, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
+	}
+
+	// The royalties stop freezes the payout address too, as UpdateRoyalties already enforces
+	if k.forkController.FixAuditChangesV6() && asset.Attributes.GetIsRoyaltiesChangeStopped() {
+		ctx := k.KAppController.GetCurrentKAppContext()
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldRoyaltiesChangeStopped, common.ErrAssetTriggerInvalid.Error())
+		return transaction.Transaction_RoyaltiesChangeStopped, common.ErrAssetTriggerInvalid
 	}
 
 	if len(tc.GetToAddress()) != k.pubkeyConv.Len() {
@@ -486,7 +506,7 @@ func (k *kdaKapp) updateRoyaltiesReceiver(sender []byte, tc *transaction.AssetTr
 }
 
 func (k *kdaKapp) updateStaking(sender []byte, tc *transaction.AssetTriggerContract, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
 
@@ -509,6 +529,11 @@ func (k *kdaKapp) updateStaking(sender []byte, tc *transaction.AssetTriggerContr
 
 	if staking.InterestType != kapps.StakingData_EnumInterestType(tc.GetStaking().GetType()) {
 		return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
+	}
+
+	err = k.validateStakingAPR(tc.GetStaking())
+	if err != nil {
+		return transaction.Transaction_ParameterInvalid, err
 	}
 
 	staking.MinEpochsToClaim = tc.GetStaking().GetMinEpochsToClaim()
@@ -555,7 +580,7 @@ func (k *kdaKapp) updateStaking(sender []byte, tc *transaction.AssetTriggerContr
 func (k *kdaKapp) updateRoyalties(sender []byte, tc *transaction.AssetTriggerContract, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -801,7 +826,7 @@ func processRoyaltiesTransferPercentage(tp []*transaction.RoyaltyInfo) ([]*kapps
 
 func (k *kdaKapp) updateKDAFeePool(sender []byte, tc *transaction.AssetTriggerContract, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	// after fork, validation happens inside the KDAFeesPoolKapp
-	if !k.forkController.FPRComputeAndKdaFeeFlow() && !k.isOwnerOrAdmin(sender, asset) {
+	if !k.forkController.FPRComputeAndKdaFeeFlow() && !asset.IsOwnerOrAdmin(sender) {
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
 
@@ -819,7 +844,7 @@ func (k *kdaKapp) updateKDAFeePool(sender []byte, tc *transaction.AssetTriggerCo
 func (k *kdaKapp) handleStopNFTMetadataChange(sender []byte, tc *transaction.AssetTriggerContract, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -842,7 +867,7 @@ func (k *kdaKapp) handleStopNFTMetadataChange(sender []byte, tc *transaction.Ass
 func (k *kdaKapp) handleChangeAdmin(sender []byte, tc *transaction.AssetTriggerContract, kdaKApp state.KAppAccountHandler, assetID [][]byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	ctx := k.KAppController.GetCurrentKAppContext()
 
-	if !k.isOwnerOrAdmin(sender, asset) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -855,10 +880,6 @@ func (k *kdaKapp) handleChangeAdmin(sender []byte, tc *transaction.AssetTriggerC
 	asset.AdminAddress = tc.GetToAddress()
 
 	return k.updateKApp(kdaKApp, assetID[0], asset)
-}
-
-func (k *kdaKapp) isOwnerOrAdmin(sender []byte, asset *kapps.KDAData) bool {
-	return bytes.Equal(asset.OwnerAddress, sender) || bytes.Equal(asset.AdminAddress, sender)
 }
 
 func (k *kdaKapp) updateKApp(kdaKApp state.KAppAccountHandler, assetID []byte, asset *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {

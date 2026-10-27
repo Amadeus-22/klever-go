@@ -27,6 +27,7 @@ type EconomicsHandlerStub struct {
 	RewardsTopUpGradientPointCalled        func() int64
 	RewardsTopUpFactorCalled               func() float64
 	GenesisTotalSupplyCalled               func() *big.Int
+	IsProposalControllerSetCalled          func() bool
 	TxSimulatorProcessor                   txsimulator.TransactionSimulatorProcessor
 }
 
@@ -151,6 +152,15 @@ func (e *EconomicsHandlerStub) MaxGasLimitPerBlock() uint64 {
 
 func (e *EconomicsHandlerStub) MaxGasLimitPerTX() uint64 {
 	return e.MaxGasLimitPerTxValue
+}
+
+// IsProposalControllerSet - wired unless the hook says otherwise
+func (e *EconomicsHandlerStub) IsProposalControllerSet() bool {
+	if e.IsProposalControllerSetCalled != nil {
+		return e.IsProposalControllerSetCalled()
+	}
+
+	return true
 }
 
 func (e *EconomicsHandlerStub) SetTXSimulatorProcessor(txSimulatorProcessor txsimulator.TransactionSimulatorProcessor) error {

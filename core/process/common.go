@@ -9,6 +9,7 @@ import (
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/core"
+	"github.com/klever-io/klever-go/crypto/hashing"
 	"github.com/klever-io/klever-go/data"
 	"github.com/klever-io/klever-go/data/block"
 	"github.com/klever-io/klever-go/data/retriever"
@@ -272,6 +273,82 @@ func getHeaderHashFromStorageWithNonce(
 // IsInProperSlot checks if the given slot index satisfies the slot modulus trigger
 func IsInProperSlot(index int64) bool {
 	return index%SlotModulusTrigger == 0
+}
+
+// CheckTxHashesLength returns ErrInvalidTxHashLength if any tx hash is not hashSize bytes long
+func CheckTxHashesLength(txHashes [][]byte, hashSize int) error {
+	for _, txHash := range txHashes {
+		if len(txHash) != hashSize {
+			return ErrInvalidTxHashLength
+		}
+	}
+
+	return nil
+}
+
+// WrapBlockBodyNotMatchingHeader marks err as a mismatch between a block's transaction list and its signed header
+func WrapBlockBodyNotMatchingHeader(err error) error {
+	return fmt.Errorf("%w: %w", ErrBlockBodyNotMatchingHeader, err)
+}
+
+// WrapBlockExecutionNotMatchingHeader marks err as a mismatch between a block's execution and its signed header
+func WrapBlockExecutionNotMatchingHeader(err error) error {
+	return fmt.Errorf("%w: %w", ErrBlockExecutionNotMatchingHeader, err)
+}
+
+// CheckBlockBodyMatchesHeader returns an error wrapping ErrBlockBodyNotMatchingHeader if the block's transaction list does not match its signed header
+func CheckBlockBodyMatchesHeader(header data.HeaderHandler, hasher hashing.Hasher, forkController core.ForkController) error {
+	if check.IfNil(header) {
+		return ErrNilBlockHeader
+	}
+
+	txHashes := header.GetTxHashes()
+	if int(header.GetTxCount()) != len(txHashes) {
+		return WrapBlockBodyNotMatchingHeader(ErrInvalidTXCount)
+	}
+
+	// TxResults carries one consensus result code per transaction and is what the validator
+	// compares its own execution against (KLR-63). A proposer always fills it in lockstep with
+	// TxHashes, so any other length is malformed - and an omitted list would silently skip the
+	// comparison altogether. The field is not covered by the tx root hash yet, so this only bounds
+	// the shape of the list, not its contents.
+	//
+	// The gate is derived from the header's own epoch, not from the notifier's current one:
+	// ProcessBlock reaches here (block.go:127) before it advances the notifier (block.go:167),
+	// so the flag would still hold the previous epoch's value and skip this check on the very
+	// first block of the activation epoch - the one block commitBlock would then reject, after
+	// the whole block had already been executed with the per-tx comparison bypassed.
+	if forkController.FixAuditChangesV5InEpoch(header.GetEpoch()) && len(header.GetTxResults()) != len(txHashes) {
+		return WrapBlockBodyNotMatchingHeader(ErrInvalidTXResultsCount)
+	}
+
+	if len(txHashes) == 0 {
+		return checkEmptyBlockTxRootHash(header.GetTxRootHash(), hasher)
+	}
+
+	err := CheckTxHashesLength(txHashes, hasher.Size())
+	if err != nil {
+		return WrapBlockBodyNotMatchingHeader(err)
+	}
+
+	txRootHash, err := header.ComputeRootHash(hasher)
+	if err != nil {
+		return err
+	}
+
+	if !bytes.Equal(header.GetTxRootHash(), txRootHash) {
+		return WrapBlockBodyNotMatchingHeader(ErrTxRootHashDoesNotMatch)
+	}
+
+	return nil
+}
+
+func checkEmptyBlockTxRootHash(txRootHash []byte, hasher hashing.Hasher) error {
+	if txRootHash == nil || bytes.Equal(txRootHash, hasher.EmptyHash()) {
+		return nil
+	}
+
+	return ErrTxRootHashInvalidForEmptyBlock
 }
 
 // AddHeaderToBlackList adds a hash to black list handler. Logs if the operation did not succeed

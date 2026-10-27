@@ -12,8 +12,6 @@ type P2PConfig struct {
 // NodeConfig will hold basic p2p settings
 type NodeConfig struct {
 	Port                       string `yaml:"port"`
-	Seed                       string `yaml:"seed"`
-	LegacySeed                 bool   `yaml:"legacySeed"`
 	MaximumExpectedPeerCount   uint64 `yaml:"maximumExpectedPeerCount"`
 	ThresholdMinConnectedPeers uint32 `yaml:"thresholdMinConnectedPeers"`
 	BroadcastIP                string `yaml:"broadcastIP"`

@@ -655,6 +655,11 @@ func (t *Transaction) addCreateValidator(txArgs TXArgs) error {
 		return errors.New("could not create bls key from provided param")
 	}
 
+	blsSignature, err := decodeBLSSignature(contractRequest.BLSSignature)
+	if err != nil {
+		return err
+	}
+
 	ownerAddress := txArgs.Sender
 	if len(contractRequest.OwnerAddress) > 0 {
 		ownerAddress, err = txArgs.NodeHelper.GetAddressPCK().Decode(contractRequest.OwnerAddress)
@@ -675,6 +680,7 @@ func (t *Transaction) addCreateValidator(txArgs TXArgs) error {
 		OwnerAddress: ownerAddress,
 		Config: &ValidatorConfig{
 			BLSPublicKey:        blsKey,
+			BLSSignature:        blsSignature,
 			RewardAddress:       rewardAddress,
 			CanDelegate:         contractRequest.CanDelegate,
 			Commission:          contractRequest.Commission,
@@ -686,6 +692,26 @@ func (t *Transaction) addCreateValidator(txArgs TXArgs) error {
 	}
 
 	return t.PushContract(TXContract_CreateValidatorContractType, contract)
+}
+
+// decodeBLSSignature decodes the optional hex BLS key proof of possession; an empty
+// string means no proof and yields nil, so requests from clients that predate the
+// proof keep building the same contract
+func decodeBLSSignature(encoded string) ([]byte, error) {
+	if len(encoded) == 0 {
+		return nil, nil
+	}
+
+	signature, err := hex.DecodeString(encoded)
+	if err != nil {
+		return nil, errors.New("could not decode bls signature from provided param")
+	}
+
+	if len(signature) != BLSKeyProofSize {
+		return nil, fmt.Errorf("invalid bls signature length: expected %d bytes, got %d", BLSKeyProofSize, len(signature))
+	}
+
+	return signature, nil
 }
 
 // addValidatorConfig -
@@ -712,6 +738,11 @@ func (t *Transaction) addValidatorConfig(txArgs TXArgs) error {
 		}
 	}
 
+	blsSignature, err := decodeBLSSignature(contractRequest.BLSSignature)
+	if err != nil {
+		return err
+	}
+
 	rewardAddress := []byte(nil)
 	if len(contractRequest.RewardAddress) > 0 {
 		rewardAddress, err = txArgs.NodeHelper.GetAddressPCK().Decode(contractRequest.RewardAddress)
@@ -723,6 +754,7 @@ func (t *Transaction) addValidatorConfig(txArgs TXArgs) error {
 	contract := &ValidatorConfigContract{
 		Config: &ValidatorConfig{
 			BLSPublicKey:        blsKey,
+			BLSSignature:        blsSignature,
 			RewardAddress:       rewardAddress,
 			CanDelegate:         contractRequest.CanDelegate,
 			Commission:          contractRequest.Commission,

@@ -80,14 +80,11 @@ func (a *kappAccount) SetStorage(key []byte, value []byte) error {
 func (a *kappAccount) StartProposalsKApp(forks core.ForkController) (kapps.ActiveProposalController, error) {
 	marshalizer := marshal.NewProtoMarshalizer()
 
-	initialProposal, err := kapps.NewProposalController(forks)
-	if err != nil {
-		return nil, err
-	}
+	initialProposal := kapps.NewInitialProposalController(forks)
 
 	controllerBytes, err := a.dataTrieTracker.RetrieveValue(kdautils.ProposalControllerKey)
 	if err != nil || len(controllerBytes) == 0 {
-		proposalData, errMarshal := marshalizer.Marshal(initialProposal.ProposalController)
+		proposalData, errMarshal := marshalizer.Marshal(initialProposal)
 		if errMarshal != nil {
 			return nil, errMarshal
 		}
@@ -97,7 +94,7 @@ func (a *kappAccount) StartProposalsKApp(forks core.ForkController) (kapps.Activ
 			return nil, errSave
 		}
 
-		return initialProposal, nil
+		return kapps.NewActiveProposalController(initialProposal), nil
 	}
 
 	current := &kapps.ProposalController{}
@@ -111,8 +108,7 @@ func (a *kappAccount) StartProposalsKApp(forks core.ForkController) (kapps.Activ
 		}
 	}
 
-	initialProposal.ProposalController = current
-	return initialProposal, nil
+	return kapps.NewActiveProposalController(current), nil
 }
 
 func (a *kappAccount) mergeAndSaveParameters(marshalizer marshal.Marshalizer, initialParams map[int32]*kapps.Parameter, current *kapps.ProposalController) error {

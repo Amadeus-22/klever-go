@@ -569,17 +569,6 @@ func (b *MockWorld) SetCurrentBlockHash(blockHash []byte) {
 	b.Blockhashes = [][]byte{blockHash}
 }
 
-// GetSnapshot -
-func (b *MockWorld) GetSnapshot() int {
-	b.CreateStateBackup()
-	return b.AccountsAdapter.JournalLen()
-}
-
-// RevertToSnapshot -
-func (b *MockWorld) RevertToSnapshot(snapshot int) error {
-	return b.AccountsAdapter.RevertToSnapshot(snapshot)
-}
-
 // ExecuteSmartContractCallOnOtherVM -
 func (b *MockWorld) ExecuteSmartContractCallOnOtherVM(input *vmcommon.ContractCallInput) (*vmcommon.VMOutput, error) {
 	vmType, err := vmcommon.ParseVMTypeFromContractAddress(input.RecipientAddr)

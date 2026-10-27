@@ -180,6 +180,12 @@ const docTemplatenode = `{
                         "schema": {
                             "$ref": "#/definitions/shared.GenericAPIResponse"
                         }
+                    },
+                    "503": {
+                        "description": "request timed out",
+                        "schema": {
+                            "$ref": "#/definitions/shared.GenericAPIResponse"
+                        }
                     }
                 }
             }
@@ -2519,6 +2525,9 @@ const docTemplatenode = `{
                     "type": "integer"
                 },
                 "fixAuditChangesV5": {
+                    "type": "integer"
+                },
+                "fixAuditChangesV6": {
                     "type": "integer"
                 },
                 "fixDelegationSameEpoch": {

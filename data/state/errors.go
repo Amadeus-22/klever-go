@@ -44,3 +44,9 @@ var ErrNilTrackableDataTrie = errors.New("nil trackable data trie")
 
 // ErrInvalidNonce signals that invalid nonce for kda
 var ErrInvalidNonce = errors.New("invalid nonce for kda")
+
+// ErrAPRGainDropped signals that an APR gain was dropped under FixAuditChangesV6 because it could not be credited
+var ErrAPRGainDropped = errors.New("apr gain dropped")
+
+// ErrNegativeCirculatingSupply signals that an asset's circulating supply is negative
+var ErrNegativeCirculatingSupply = errors.New("negative circulating supply")

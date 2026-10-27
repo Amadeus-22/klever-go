@@ -14,6 +14,7 @@ import (
 	"github.com/klever-io/klever-go/crypto/signing"
 	"github.com/klever-io/klever-go/crypto/signing/ed25519"
 	"github.com/klever-io/klever-go/crypto/signing/mcl"
+	"github.com/klever-io/klever-go/crypto/signing/mcl/singlesig"
 	"github.com/klever-io/klever-go/data/state"
 	dt "github.com/klever-io/klever-go/data/transaction"
 	"github.com/stretchr/testify/assert"
@@ -24,6 +25,12 @@ import (
 // FixAuditChangesV3 fork is active, so tests that register validators must use
 // real keys instead of placeholder bytes.
 func validBLSKey(seed string) []byte {
+	_, pk := blsKeyPairFromSeed(seed)
+	return pk
+}
+
+// blsKeyPairFromSeed deterministically derives a BLS12-381 key pair from a seed.
+func blsKeyPairFromSeed(seed string) (crypto.PrivateKey, []byte) {
 	kg := signing.NewKeyGenerator(mcl.NewSuiteBLS12())
 	s := make([]byte, 32)
 	copy(s, seed)
@@ -35,7 +42,19 @@ func validBLSKey(seed string) []byte {
 	if err != nil {
 		panic(err)
 	}
-	return pk
+	return sk, pk
+}
+
+// validBLSKeyProof returns the BLS proof of possession of the key derived from seed,
+// bound to owner. From FixAuditChangesV6 on, registering or rotating to a BLS key
+// needs this proof, signed by the key over BLSKeyProofMessage(owner, key).
+func validBLSKeyProof(seed string, owner []byte) []byte {
+	sk, pk := blsKeyPairFromSeed(seed)
+	sig, err := singlesig.NewBlsSigner().Sign(sk, dt.BLSKeyProofMessage(owner, pk))
+	if err != nil {
+		panic(err)
+	}
+	return sig
 }
 
 func mockProcessor(economicHandlerStub *mock.EconomicsHandlerStub) *transaction.TxProcessorExportTest {

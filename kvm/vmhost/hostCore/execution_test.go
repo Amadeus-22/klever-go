@@ -926,7 +926,8 @@ var staleFlagSourceAddress = testcommon.MakeTestSCAddress("staleFlagSource")
 // validator, so re-verifying a long-deployed contract is observable as a failed call.
 const staleFlagLegacyExport = "invalid-library-function"
 
-func zeroCodeCostsForStaleFlagTest(host vmhost.VMHost) {
+// zeroCodeCosts zeroes the code loading and copying costs, and the ExecuteOnDestContext API cost.
+func zeroCodeCosts(host vmhost.VMHost) {
 	schedule := host.Metering().GasSchedule()
 	schedule.BaseOperationCost.CompilePerByte = 0
 	schedule.BaseOperationCost.AoTPreparePerByte = 0
@@ -997,7 +998,7 @@ func TestCreateNewContract_FailedDeployDoesNotArmTheNextInstantiation(t *testing
 			WithFunction("deployThenCallLibrary").
 			Build()).
 		WithSetup(func(host vmhost.VMHost, _ *worldmock.MockWorld) {
-			zeroCodeCostsForStaleFlagTest(host)
+			zeroCodeCosts(host)
 		}).
 		AndAssertResults(func(_ *worldmock.MockWorld, verify *testcommon.VMOutputVerifier) {
 			verify.Ok()

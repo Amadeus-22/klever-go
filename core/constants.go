@@ -277,6 +277,10 @@ const MetricAreVMQueriesReady = "klv_are_vm_queries_ready"
 // Maximum amount of APR updates that will be saved by the blockchain and the indexer
 const MaxAPRPercentageUpdates = 100
 
+// MaxStakingAPR is the highest APR, inclusive and in HundredPercent precision (1000%), accepted at asset
+// creation and on UpdateStaking once FixAuditChangesV6 is active
+const MaxStakingAPR = 10 * HundredPercent
+
 // MaxCallValueSize defines the maximum number of currencies that can be used in a smart contract call value
 const MaxCallValueSize = 50
 

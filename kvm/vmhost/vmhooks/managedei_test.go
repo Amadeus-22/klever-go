@@ -1,13 +1,17 @@
 package vmhooks_test
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"math/big"
 	"math/rand"
 	"strings"
 	"testing"
 
+	"github.com/klever-io/klever-go/common"
 	commonMock "github.com/klever-io/klever-go/common/mock"
+	blockchainConfig "github.com/klever-io/klever-go/config"
 	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
@@ -15,6 +19,7 @@ import (
 	"github.com/klever-io/klever-go/kvm/config"
 	contextmock "github.com/klever-io/klever-go/kvm/mock/context"
 	worldmock "github.com/klever-io/klever-go/kvm/mock/world"
+	test "github.com/klever-io/klever-go/kvm/testcommon"
 	"github.com/klever-io/klever-go/kvm/vmhost"
 	"github.com/klever-io/klever-go/kvm/vmhost/hostCore"
 	hostmock "github.com/klever-io/klever-go/kvm/vmhost/mock"
@@ -280,7 +285,7 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				hooksRuntime.SetVMInput(&vmcommon.ContractCallInput{
 					VMInput: vmcommon.VMInput{
 						KDATransfers: tt.kdaTransfers,
-						GasProvided:  1,
+						GasProvided:  10_000,
 					},
 				})
 				hooksMetering.InitStateFromContractCallInput(&hooksRuntime.GetVMInput().VMInput)
@@ -295,7 +300,10 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				// Calculate gas used
 				loopGas := hooksMetering.GasSchedule().WASMOpcodeCost.Loop
 				callValueGas := hooksMetering.GasSchedule().BaseOpsAPICost.GetCallValue
-				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas
+				dataCopyPerByte := hooksMetering.GasSchedule().BaseOperationCost.DataCopyPerByte
+				// from FixAuditChangesV6 the token id is paid for before it is copied out of the buffer
+				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas +
+					dataCopyPerByte*uint64(len(testKDAId))
 
 				assert.Equal(t, hooksRuntime.GetPointsUsed(), totalGas)
 			})
@@ -340,7 +348,7 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				hooksRuntime.SetVMInput(&vmcommon.ContractCallInput{
 					VMInput: vmcommon.VMInput{
 						KDATransfers: tt.kdaTransfers,
-						GasProvided:  1,
+						GasProvided:  10_000,
 					},
 				})
 				hooksMetering.InitStateFromContractCallInput(&hooksRuntime.GetVMInput().VMInput)
@@ -355,7 +363,10 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				// Calculate gas used
 				loopGas := hooksMetering.GasSchedule().WASMOpcodeCost.Loop
 				callValueGas := hooksMetering.GasSchedule().BaseOpsAPICost.GetCallValue
-				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas
+				dataCopyPerByte := hooksMetering.GasSchedule().BaseOperationCost.DataCopyPerByte
+				// from FixAuditChangesV6 the token name is paid for before it is copied out of the buffer
+				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas +
+					dataCopyPerByte*uint64(len(targetTransfer.KDATokenName))
 
 				assert.Equal(t, hooksRuntime.GetPointsUsed(), totalGas)
 			})
@@ -393,7 +404,7 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				hooksRuntime.SetVMInput(&vmcommon.ContractCallInput{
 					VMInput: vmcommon.VMInput{
 						KDATransfers: tt.kdaTransfers,
-						GasProvided:  1,
+						GasProvided:  10_000,
 					},
 				})
 				hooksMetering.InitStateFromContractCallInput(&hooksRuntime.GetVMInput().VMInput)
@@ -407,11 +418,9 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				assert.Equal(t, result, big.NewInt(0))
 
 				// Calculate gas used
-				loopGas := hooksMetering.GasSchedule().WASMOpcodeCost.Loop
-				callValueGas := hooksMetering.GasSchedule().BaseOpsAPICost.GetCallValue
-				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas
-
-				assert.Equal(t, hooksRuntime.GetPointsUsed(), totalGas)
+				// the handle is missing, so nothing is copied: the hook charges its fixed cost and
+				// then fails, and failing consumes everything that was left
+				assert.Equal(t, hooksRuntime.GetVMInput().GasProvided, hooksRuntime.GetPointsUsed())
 
 				vmOutput := vmHost.Output().GetVMOutput()
 				assert.Equal(
@@ -459,7 +468,7 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				hooksRuntime.SetVMInput(&vmcommon.ContractCallInput{
 					VMInput: vmcommon.VMInput{
 						KDATransfers: tt.kdaTransfers,
-						GasProvided:  1,
+						GasProvided:  10_000,
 					},
 				})
 				hooksMetering.InitStateFromContractCallInput(&hooksRuntime.GetVMInput().VMInput)
@@ -473,11 +482,9 @@ func TestManagedGetKDACallValue(t *testing.T) {
 				assert.Equal(t, result, big.NewInt(0))
 
 				// Calculate gas used
-				loopGas := hooksMetering.GasSchedule().WASMOpcodeCost.Loop
-				callValueGas := hooksMetering.GasSchedule().BaseOpsAPICost.GetCallValue
-				totalGas := (uint64(loopGas) * uint64(len(tt.kdaTransfers))) + callValueGas
-
-				assert.Equal(t, hooksRuntime.GetPointsUsed(), totalGas)
+				// the handle is missing, so nothing is copied: the hook charges its fixed cost and
+				// then fails, and failing consumes everything that was left
+				assert.Equal(t, hooksRuntime.GetVMInput().GasProvided, hooksRuntime.GetPointsUsed())
 
 				vmOutput := vmHost.Output().GetVMOutput()
 				assert.Equal(
@@ -505,9 +512,10 @@ func TestManagedGetKDACallValue(t *testing.T) {
 		hooksMgdType := hooks.GetManagedTypesContext()
 
 		kdaHandle, kdaCallValueHandle := int32(1), int32(1)
+		testKDAId := []byte("TEST-H7K7")
 
 		// Sets KDA ID into bytes on memory using kdaHandle
-		hooksMgdType.SetBytes(kdaHandle, []byte("TEST-H7K7"))
+		hooksMgdType.SetBytes(kdaHandle, testKDAId)
 
 		// As it does not exist, it will be created
 		initialKDAValue := hooksMgdType.GetBigIntOrCreate(kdaCallValueHandle)
@@ -516,7 +524,7 @@ func TestManagedGetKDACallValue(t *testing.T) {
 		hooksRuntime.SetVMInput(&vmcommon.ContractCallInput{
 			VMInput: vmcommon.VMInput{
 				KDATransfers: []*vmcommon.KDATransfer{},
-				GasProvided:  1,
+				GasProvided:  10_000,
 			},
 		})
 		hooksMetering.InitStateFromContractCallInput(&hooksRuntime.GetVMInput().VMInput)
@@ -530,10 +538,12 @@ func TestManagedGetKDACallValue(t *testing.T) {
 
 		// Calculate gas used
 		loopGas := hooksMetering.GasSchedule().WASMOpcodeCost.Loop
+		// from FixAuditChangesV6 the token id is paid for before it is copied out of the buffer
+		dataCopyPerByte := hooksMetering.GasSchedule().BaseOperationCost.DataCopyPerByte
 		callValueGas := hooksMetering.GasSchedule().BaseOpsAPICost.GetCallValue
 		totalGas := (uint64(loopGas))*uint64(
 			len(hooksRuntime.GetVMInput().KDATransfers),
-		) + callValueGas
+		) + callValueGas + dataCopyPerByte*uint64(len(testKDAId))
 
 		assert.Equal(t, hooksRuntime.GetPointsUsed(), totalGas)
 
@@ -738,6 +748,8 @@ func TestManagedGetKDARolesWithHost_GasCost(t *testing.T) {
 
 	host := &contextmock.VMHostMock{
 		ManagedTypesContext: managedTypes,
+		// pinned pre-FixAuditChangesV6, as in TestManagedGetKDATokenDataWithHost_GasCost
+		ForkControllerContext: &commonMock.ForkControllerStub{},
 		MeteringContext: &contextmock.MeteringContextMock{
 			GasCost: &config.GasCost{
 				BaseOpsAPICost: config.BaseOpsAPICost{
@@ -866,6 +878,8 @@ func TestManagedGetSftMetadataWithHost_GasCost(t *testing.T) {
 
 	host := &contextmock.VMHostMock{
 		ManagedTypesContext: managedTypes,
+		// pinned pre-FixAuditChangesV6, as in TestManagedGetKDATokenDataWithHost_GasCost
+		ForkControllerContext: &commonMock.ForkControllerStub{},
 		MeteringContext: &contextmock.MeteringContextMock{
 			GasCost: &config.GasCost{
 				BaseOpsAPICost: config.BaseOpsAPICost{
@@ -930,6 +944,16 @@ func TestManagedGetSftMetadataWithHost_GasCost(t *testing.T) {
 			expectedGas:   160,
 		},
 		{
+			purpose: "Should return error because GetSFTMeta returns error and consume only the base gas",
+			mock: func() {
+				blockchain.GetSFTMetaCalled = func(asset []byte, nonce uint64) (*kapps.MetaV2, error) {
+					return nil, mockErr
+				}
+			},
+			expectedError: vmhost.ErrArgOutOfRange,
+			expectedGas:   10,
+		},
+		{
 			purpose: "Should return error because GetBytes returns error and consume only the base gas",
 			mock: func() {
 				managedTypes.GetBytesCalled = func(handle int32) ([]byte, error) {
@@ -979,6 +1003,8 @@ func TestManagedGetUserKDAWithHost_GasCost(t *testing.T) {
 
 	host := &contextmock.VMHostMock{
 		ManagedTypesContext: managedTypes,
+		// pinned pre-FixAuditChangesV6, as in TestManagedGetKDATokenDataWithHost_GasCost
+		ForkControllerContext: &commonMock.ForkControllerStub{},
 		MeteringContext: &contextmock.MeteringContextMock{
 			GasCost: &config.GasCost{
 				BaseOpsAPICost: config.BaseOpsAPICost{
@@ -1181,6 +1207,10 @@ func TestManagedGetKDATokenDataWithHost_GasCost(t *testing.T) {
 
 	host := &contextmock.VMHostMock{
 		ManagedTypesContext: managedTypes,
+		// pinned pre-FixAuditChangesV6: this case counts gas through UseAndTraceGasCalled, which the
+		// post-fork bounded charge does not go through. The fork's copy charge is covered two-sided
+		// by TestVMHooksImpl_CopyGas_SameBeforeAndFromV6 instead
+		ForkControllerContext: &commonMock.ForkControllerStub{},
 		MeteringContext: &contextmock.MeteringContextMock{
 			GasCost: &config.GasCost{
 				BaseOpsAPICost: config.BaseOpsAPICost{
@@ -1692,6 +1722,413 @@ func TestManagedGetMultiKDAWithoutKLVCallValueDoesNotMutateVMInput(t *testing.T)
 			assert.Equal(t, tt.expectedTokens, actualTokens)
 			assert.Equal(t, tt.expectedOtherKDA, vmInput.GetKDACallValue([]byte("OTHER_KDA")).Int64())
 			assert.Equal(t, tt.expectedKLV, vmInput.GetKDACallValue([]byte("KLV")).Int64())
+		})
+	}
+}
+
+var (
+	flatCloneOwner  = bytes.Repeat([]byte{0x01}, vmhost.AddressLen)
+	flatCloneSigner = bytes.Repeat([]byte{0x02}, vmhost.AddressLen)
+	flatCloneMeta   = []byte{vmcommon.MetadataUpgradeable, 0}
+)
+
+// stubFlatCloneAccounts serves flatCloneOwner, with code metadata flatCloneMeta and flatCloneSigner
+// as its owner permission signer, and like the accounts DB finds no account under any other
+// address. It returns the addresses looked up
+func stubFlatCloneAccounts(host *contextmock.VMHostMock) *[][]byte {
+	lookups := make([][]byte, 0)
+	host.BlockchainContext.(*hostmock.BlockchainContextStub).GetUserAccountCalled = func(address []byte) (state.UserAccountHandler, error) {
+		lookups = append(lookups, address)
+		if !bytes.Equal(address, flatCloneOwner) {
+			return nil, common.ErrAccNotFound
+		}
+		acc := state.NewEmptyUserAccount()
+		acc.SetCodeMetadata(flatCloneMeta)
+		acc.UserAccountData.Permissions = []*state.Permission{{
+			Type:      state.Permission_Owner,
+			Threshold: 1,
+			Signers:   []*state.Key{{Address: flatCloneSigner, Weight: 1}},
+		}}
+		return acc, nil
+	}
+	return &lookups
+}
+
+// ManagedGetCodeMetadata cloned the address, whatever its size, for a flat cost. From
+// FixAuditChangesV6 the flat cost is bounded and the address is charged DataCopyPerByte for each of
+// its bytes before it is cloned; it is then looked up whatever its length, as it always was, since
+// an account can live under an address that is not vmhost.AddressLen long. Not parallel: it counts
+// allocations
+func TestManagedGetCodeMetadata_ChargedBeforeCloneFromV6(t *testing.T) {
+	gasMap := flatCloneGasMap()
+	fixedCost := gasMap["BaseOpsAPICost"]["GetCodeMetadata"] + gasMap["ManagedBufferAPICost"]["MBufferSetBytes"]
+	dataCopyPerByte := gasMap["BaseOperationCost"]["DataCopyPerByte"]
+	untouched := []byte("untouched")
+	oversized := append(append([]byte{}, flatCloneOwner...), make([]byte, flatCloneOversizedLen-vmhost.AddressLen)...)
+
+	type scenario struct {
+		name     string
+		address  []byte
+		missing  bool
+		budget   uint64
+		failErr  error
+		response []byte
+		lookedUp bool
+		cloned   bool
+		noClone  bool
+	}
+
+	for _, fixV6 := range []bool{false, true} {
+		perByte := func(address []byte) uint64 {
+			if !fixV6 {
+				return 0
+			}
+			return dataCopyPerByte * uint64(len(address))
+		}
+		scenarios := []scenario{
+			{name: "owner", address: flatCloneOwner, response: flatCloneMeta, lookedUp: true},
+			{name: "unknown", address: flatCloneSigner, failErr: common.ErrAccNotFound, lookedUp: true},
+			{name: "short", address: flatCloneOwner[:vmhost.AddressLen-1], failErr: common.ErrAccNotFound, lookedUp: true},
+			// one byte past vmhost.AddressLen is charged and looked up like any other length
+			{name: "oneTooLong", address: append(append([]byte{}, flatCloneOwner...), 0),
+				failErr: common.ErrAccNotFound, lookedUp: true},
+			{name: "oversized", address: oversized, failErr: common.ErrAccNotFound, lookedUp: true, cloned: true},
+			{name: "missing", missing: true, failErr: vmhost.ErrNoManagedBufferUnderThisHandle},
+		}
+		if fixV6 {
+			scenarios = append(scenarios,
+				scenario{name: "fixedShortfall", address: oversized, budget: fixedCost - 1,
+					failErr: vmhost.ErrNotEnoughGas, noClone: true},
+				scenario{name: "perByteShortfall", address: oversized, budget: fixedCost + perByte(oversized) - 1,
+					failErr: vmhost.ErrNotEnoughGas, noClone: true},
+				scenario{name: "ownerPerByteShortfall", address: flatCloneOwner, budget: fixedCost + perByte(flatCloneOwner) - 1,
+					failErr: vmhost.ErrNotEnoughGas},
+			)
+		} else {
+			// pre-fork the flat cost overdraws and the hook carries on
+			scenarios = append(scenarios,
+				scenario{name: "fixedShortfall", address: flatCloneOwner, budget: fixedCost - 1,
+					response: flatCloneMeta, lookedUp: true},
+			)
+		}
+
+		for _, sc := range scenarios {
+			t.Run(fmt.Sprintf("FixAuditChangesV6=%v/%s", fixV6, sc.name), func(t *testing.T) {
+				// a fault burns the gas left, so a row is run on exactly the gas it should use: a
+				// charge past it would fail with ErrNotEnoughGas instead, and from the fork one gas
+				// less must, or the charge fell short
+				expectedGas := fixedCost + perByte(sc.address)
+				run := func(budget uint64) (*contextmock.RuntimeContextMock, uint64, uint64, int, []byte) {
+					host, runtime := newFlatCloneHost(t, fixV6)
+					lookups := stubFlatCloneAccounts(host)
+					managedTypes := host.ManagedTypes()
+					addressHandle := int32(1234)
+					if !sc.missing {
+						addressHandle = managedTypes.NewManagedBufferFromBytes(sc.address)
+					}
+					responseHandle := managedTypes.NewManagedBufferFromBytes(untouched)
+
+					gasUsed, allocated := runFlatCloneHook(host, budget, func() {
+						vmhooks.ManagedGetCodeMetadataWithHost(host, addressHandle, responseHandle)
+					})
+
+					response, err := managedTypes.GetBytes(responseHandle)
+					require.NoError(t, err)
+					return runtime, gasUsed, allocated, len(*lookups), response
+				}
+
+				budget := sc.budget
+				if budget == 0 {
+					budget = expectedGas
+				}
+				runtime, gasUsed, allocated, lookups, response := run(budget)
+
+				if sc.failErr != nil {
+					require.ErrorIs(t, runtime.FailExecutionErr, sc.failErr)
+				} else {
+					require.Nil(t, runtime.FailExecutionErr)
+					assert.Equal(t, expectedGas, gasUsed)
+				}
+				if sc.response != nil {
+					assert.Equal(t, sc.response, response)
+				} else {
+					assert.Equal(t, untouched, response)
+				}
+				assert.Equal(t, sc.lookedUp, lookups == 1, "lookups: %d", lookups)
+				if sc.cloned {
+					assert.GreaterOrEqual(t, allocated, uint64(flatCloneOversizedLen))
+				}
+				if sc.noClone {
+					assert.Less(t, allocated, uint64(flatCloneNoCloneBelow), "the address must not be cloned")
+				}
+
+				if fixV6 && sc.budget == 0 {
+					runtime, _, _, lookups, response = run(expectedGas - 1)
+					require.ErrorIs(t, runtime.FailExecutionErr, vmhost.ErrNotEnoughGas)
+					assert.Equal(t, untouched, response)
+					assert.Zero(t, lookups)
+				}
+			})
+		}
+	}
+}
+
+// ManagedAccHasPerm cloned both addresses, whatever their size, for a flat cost. From
+// FixAuditChangesV6 the flat cost is bounded and each address is charged DataCopyPerByte for each
+// of its bytes right before it is cloned, the source first, so a missing source handle is never
+// charged the target (an unknown source account is, as it is looked up after both clones); both
+// are then answered as they always were, whatever their length. Not
+// parallel: it counts allocations
+func TestManagedAccHasPerm_ChargedBeforeCloneFromV6(t *testing.T) {
+	gasMap := flatCloneGasMap()
+	fixedCost := gasMap["BaseOpsAPICost"]["Int64Finish"] + gasMap["BaseOpsAPICost"]["GetOwnerAddress"]
+	dataCopyPerByte := gasMap["BaseOperationCost"]["DataCopyPerByte"]
+	oversized := func(prefix []byte) []byte {
+		return append(append([]byte{}, prefix...), make([]byte, flatCloneOversizedLen-len(prefix))...)
+	}
+
+	type scenario struct {
+		name        string
+		ops         int64
+		source      []byte
+		target      []byte
+		missingSrc  bool
+		missingTgt  bool
+		budget      uint64
+		failErr     error
+		result      int32
+		lookups     int
+		chargedSrc  bool
+		chargedTgt  bool
+		clonedBytes bool
+		noCloneLen  bool
+	}
+
+	for _, fixV6 := range []bool{false, true} {
+		perByte := func(address []byte) uint64 {
+			if !fixV6 {
+				return 0
+			}
+			return dataCopyPerByte * uint64(len(address))
+		}
+		scenarios := []scenario{
+			{name: "granted", source: flatCloneOwner, target: flatCloneSigner, result: 1, lookups: 1,
+				chargedSrc: true, chargedTgt: true},
+			{name: "notGranted", source: flatCloneOwner, target: flatCloneOwner, result: 0, lookups: 1,
+				chargedSrc: true, chargedTgt: true},
+			{name: "shortTarget", source: flatCloneOwner, target: flatCloneSigner[:vmhost.AddressLen-1], result: 0, lookups: 1,
+				chargedSrc: true, chargedTgt: true},
+			{name: "oversizedTarget", source: flatCloneOwner, target: oversized(flatCloneSigner), result: 0, lookups: 1,
+				chargedSrc: true, chargedTgt: true, clonedBytes: true},
+			{name: "oversizedTargetUnknownSource", source: flatCloneSigner, target: oversized(flatCloneSigner),
+				failErr: vmhost.ErrArgOutOfRange, lookups: 1, chargedSrc: true, chargedTgt: true, clonedBytes: true},
+			// a missing source faults before the target is charged or cloned
+			{name: "oversizedTargetMissingSource", missingSrc: true, target: oversized(flatCloneSigner),
+				failErr: vmhost.ErrArgOutOfRange, noCloneLen: true},
+			{name: "oversizedSource", source: oversized(flatCloneOwner), target: flatCloneSigner,
+				failErr: vmhost.ErrArgOutOfRange, lookups: 1, chargedSrc: true, chargedTgt: true, clonedBytes: true},
+			{name: "oversizedSourceMissingTarget", source: oversized(flatCloneOwner), missingTgt: true,
+				failErr: vmhost.ErrArgOutOfRange, chargedSrc: true, clonedBytes: true},
+			{name: "missingTarget", source: flatCloneOwner, missingTgt: true, failErr: vmhost.ErrArgOutOfRange,
+				chargedSrc: true},
+			{name: "missingSource", missingSrc: true, target: flatCloneSigner, failErr: vmhost.ErrArgOutOfRange},
+			// negative ops faults before either address is charged or cloned
+			{name: "negativeOps", ops: -1, source: oversized(flatCloneOwner), target: oversized(flatCloneSigner),
+				failErr: vmhost.ErrArgOutOfRange, noCloneLen: true},
+			// one byte past vmhost.AddressLen is charged and looked up like any other length
+			{name: "oneTooLongSource", source: append(append([]byte{}, flatCloneOwner...), 0), target: flatCloneSigner,
+				failErr: vmhost.ErrArgOutOfRange, lookups: 1, chargedSrc: true, chargedTgt: true},
+			{name: "oneTooLongTarget", source: flatCloneOwner, target: append(append([]byte{}, flatCloneSigner...), 0),
+				result: 0, lookups: 1, chargedSrc: true, chargedTgt: true},
+		}
+		if fixV6 {
+			scenarios = append(scenarios,
+				scenario{name: "fixedShortfall", source: oversized(flatCloneOwner), target: oversized(flatCloneSigner),
+					budget: fixedCost - 1, failErr: vmhost.ErrNotEnoughGas, noCloneLen: true},
+				scenario{name: "sourceShortfall", source: oversized(flatCloneOwner), target: flatCloneSigner,
+					budget: fixedCost + perByte(oversized(flatCloneOwner)) - 1, failErr: vmhost.ErrNotEnoughGas, noCloneLen: true},
+				scenario{name: "targetShortfall", source: flatCloneOwner, target: oversized(flatCloneSigner),
+					budget:  fixedCost + perByte(flatCloneOwner) + perByte(oversized(flatCloneSigner)) - 1,
+					failErr: vmhost.ErrNotEnoughGas, noCloneLen: true},
+				scenario{name: "honestShortfall", source: flatCloneOwner, target: flatCloneSigner,
+					budget: fixedCost + perByte(flatCloneOwner) + perByte(flatCloneSigner) - 1, failErr: vmhost.ErrNotEnoughGas},
+			)
+		} else {
+			// pre-fork the flat cost overdraws and the hook carries on
+			scenarios = append(scenarios,
+				scenario{name: "fixedShortfall", source: flatCloneOwner, target: flatCloneSigner,
+					budget: fixedCost - 1, result: 1, lookups: 1},
+			)
+		}
+
+		for _, sc := range scenarios {
+			t.Run(fmt.Sprintf("FixAuditChangesV6=%v/%s", fixV6, sc.name), func(t *testing.T) {
+				// a fault burns the gas left, so a row is run on exactly the gas it should use: a
+				// charge past it would fail with ErrNotEnoughGas instead, and from the fork one gas
+				// less must, or the charge fell short
+				expectedGas := fixedCost
+				if sc.chargedSrc {
+					expectedGas += perByte(sc.source)
+				}
+				if sc.chargedTgt {
+					expectedGas += perByte(sc.target)
+				}
+				ops := sc.ops
+				if ops == 0 {
+					ops = 1
+				}
+				run := func(budget uint64) (*contextmock.RuntimeContextMock, int32, uint64, uint64, int) {
+					host, runtime := newFlatCloneHost(t, fixV6)
+					lookups := stubFlatCloneAccounts(host)
+					managedTypes := host.ManagedTypes()
+					sourceHandle, targetHandle := int32(1234), int32(4321)
+					if !sc.missingSrc {
+						sourceHandle = managedTypes.NewManagedBufferFromBytes(sc.source)
+					}
+					if !sc.missingTgt {
+						targetHandle = managedTypes.NewManagedBufferFromBytes(sc.target)
+					}
+
+					var result int32
+					gasUsed, allocated := runFlatCloneHook(host, budget, func() {
+						result = vmhooks.ManagedAccHasPermWithHost(host, ops, sourceHandle, targetHandle)
+					})
+					return runtime, result, gasUsed, allocated, len(*lookups)
+				}
+
+				budget := sc.budget
+				if budget == 0 {
+					budget = expectedGas
+				}
+				runtime, result, gasUsed, allocated, lookups := run(budget)
+
+				assert.Equal(t, sc.result, result)
+				if sc.failErr != nil {
+					require.ErrorIs(t, runtime.FailExecutionErr, sc.failErr)
+				} else {
+					require.Nil(t, runtime.FailExecutionErr)
+					assert.Equal(t, expectedGas, gasUsed)
+				}
+				assert.Equal(t, sc.lookups, lookups)
+				if sc.clonedBytes {
+					assert.GreaterOrEqual(t, allocated, uint64(flatCloneOversizedLen))
+				} else if sc.noCloneLen {
+					assert.Less(t, allocated, uint64(flatCloneNoCloneBelow), "no oversized address may be cloned")
+				}
+
+				if fixV6 && sc.budget == 0 {
+					runtime, result, _, _, lookups = run(expectedGas - 1)
+					require.ErrorIs(t, runtime.FailExecutionErr, vmhost.ErrNotEnoughGas)
+					assert.Zero(t, result)
+					assert.Zero(t, lookups)
+				}
+			})
+		}
+	}
+}
+
+// addressHooksSeedAccount stores an account under address, with code metadata
+// addressHooksSeededMeta and an owner permission signed by signer, as a zero-amount transfer to a
+// junk address could leave one in state before FixAuditChangesV6
+func addressHooksSeedAccount(t *testing.T, world *worldmock.MockWorld, address []byte, signer []byte) {
+	t.Helper()
+	acc, err := world.AccountsCacher.LoadUser(address)
+	require.NoError(t, err)
+	acc.SetCodeMetadata(addressHooksSeededMeta)
+	acc.SetPermissions([]*state.Permission{{
+		Type:      state.Permission_Owner,
+		Threshold: 1,
+		Signers:   []*state.Key{{Address: signer, Weight: 1}},
+	}})
+	require.NoError(t, world.AccountsCacher.UpdateUser(acc))
+}
+
+var addressHooksSeededMeta = []byte{vmcommon.MetadataPayable, 0}
+
+// What the address hooks answer for an address that is not vmhost.AddressLen long, on the real
+// accounts DB, must not change at FixAuditChangesV6, down to the return message, whether or not an
+// account lives under it: from the fork they only pay for the copy first
+func TestAddressHooks_OversizedAddressSameResultAcrossV6(t *testing.T) {
+	oversized := append(append([]byte{}, test.ParentAddress...), make([]byte, flatCloneOversizedLen)...)
+	// accounts a zero-amount transfer to a junk address could have created before the fork
+	longAddress := bytes.Repeat([]byte{0x06}, vmhost.AddressLen+8)
+	shortAddress := bytes.Repeat([]byte{0x05}, vmhost.AddressLen-1)
+	longSignerOwner := bytes.Repeat([]byte{0x07}, vmhost.AddressLen)
+	seed := func(t *testing.T) func(host vmhost.VMHost, world *worldmock.MockWorld) {
+		return func(host vmhost.VMHost, world *worldmock.MockWorld) {
+			addressHooksSeedAccount(t, world, longAddress, test.ParentAddress)
+			addressHooksSeedAccount(t, world, shortAddress, test.ParentAddress)
+			addressHooksSeedAccount(t, world, longSignerOwner, longAddress)
+		}
+	}
+
+	type outcome struct {
+		result        int32
+		returnCode    vmcommon.ReturnCode
+		returnMessage string
+		response      []byte
+	}
+	codeMetadata := func(address []byte) func(host vmhost.VMHost) int32 {
+		return func(host vmhost.VMHost) int32 {
+			managedTypes := host.ManagedTypes()
+			response := managedTypes.NewManagedBufferFromBytes([]byte("untouched"))
+			vmhooks.ManagedGetCodeMetadataWithHost(host, managedTypes.NewManagedBufferFromBytes(address), response)
+			return response
+		}
+	}
+	accHasPerm := func(source, target []byte) func(host vmhost.VMHost) int32 {
+		return func(host vmhost.VMHost) int32 {
+			managedTypes := host.ManagedTypes()
+			return vmhooks.ManagedAccHasPermWithHost(host, 1,
+				managedTypes.NewManagedBufferFromBytes(source), managedTypes.NewManagedBufferFromBytes(target))
+		}
+	}
+	type hookCase struct {
+		hook         func(host vmhost.VMHost) int32
+		codeMetadata bool
+		// when set, what the hook answers pre-fork for an account that exists, so the comparison
+		// cannot pass on two lookups that both missed
+		wantResult   int32
+		wantResponse []byte
+	}
+	hooks := map[string]hookCase{
+		"ManagedGetCodeMetadata":                    {hook: codeMetadata(oversized), codeMetadata: true},
+		"ManagedGetCodeMetadata/existingLongAddr":   {hook: codeMetadata(longAddress), codeMetadata: true, wantResponse: addressHooksSeededMeta},
+		"ManagedGetCodeMetadata/existingShortAddr":  {hook: codeMetadata(shortAddress), codeMetadata: true, wantResponse: addressHooksSeededMeta},
+		"ManagedAccHasPerm/oversizedSource":         {hook: accHasPerm(oversized, test.ParentAddress)},
+		"ManagedAccHasPerm/oversizedTarget":         {hook: accHasPerm(test.ParentAddress, oversized)},
+		"ManagedAccHasPerm/existingLongSource":      {hook: accHasPerm(longAddress, test.ParentAddress), wantResult: 1},
+		"ManagedAccHasPerm/existingShortSource":     {hook: accHasPerm(shortAddress, test.ParentAddress), wantResult: 1},
+		"ManagedAccHasPerm/longSignerTarget":        {hook: accHasPerm(longSignerOwner, longAddress), wantResult: 1},
+		"ManagedAccHasPerm/existingLongSourceShort": {hook: accHasPerm(longAddress, shortAddress)},
+	}
+
+	for name, hc := range hooks {
+		t.Run(name, func(t *testing.T) {
+			outcomes := make([]outcome, 0, 2)
+			for _, epochs := range []blockchainConfig.EnableEpochs{preForkV6EnableEpochs(), postForkV6EnableEpochs()} {
+				var out outcome
+				// enough gas for the post-fork copy charge of the oversized address
+				run := runManagedHookInWorld(t, epochs, 100_000_000, seed(t), func(host vmhost.VMHost) func() {
+					return func() {
+						out.result = hc.hook(host)
+						if hc.codeMetadata {
+							out.response, _ = host.ManagedTypes().GetBytes(out.result)
+						}
+					}
+				})
+				out.returnCode, out.returnMessage = run.returnCode, run.returnMessage
+				outcomes = append(outcomes, out)
+			}
+			if hc.wantResponse != nil {
+				require.Equal(t, vmcommon.Ok, outcomes[0].returnCode, outcomes[0].returnMessage)
+				require.Equal(t, hc.wantResponse, outcomes[0].response)
+			}
+			if hc.wantResult != 0 {
+				require.Equal(t, vmcommon.Ok, outcomes[0].returnCode, outcomes[0].returnMessage)
+				require.Equal(t, hc.wantResult, outcomes[0].result)
+			}
+			assert.Equal(t, outcomes[0], outcomes[1])
 		})
 	}
 }

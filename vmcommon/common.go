@@ -15,6 +15,10 @@ const additionalRandomCharsLength = kdautils.TickerRandomSequenceLength
 const identifierMinLength = tickerMinLength + additionalRandomCharsLength + 1
 const identifierMaxLength = tickerMaxLength + additionalRandomCharsLength + 1
 
+// TokenIdentifierMaxLength is the length of the longest token identifier ValidateToken accepts. The
+// official tokens are shorter, so no longer buffer is ever a valid token identifier
+const TokenIdentifierMaxLength = identifierMaxLength
+
 // ValidateToken - validates the token ID
 func ValidateToken(tokenID []byte) bool {
 	// official tokens

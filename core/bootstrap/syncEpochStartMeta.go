@@ -186,3 +186,15 @@ func (e *epochStartMetaSyncer) initTopicForEpochStartMetaBlockInterceptor() erro
 func (e *epochStartMetaSyncer) IsInterfaceNil() bool {
 	return e == nil
 }
+
+// syncPrevEpochStartMeta returns the epoch start metablock of the epoch before epochStartMeta's.
+// Epoch 0 has no previous one, so its own metablock stands in for it without a request: asking
+// for epoch 0 - 1 would wrap to the unknown-epoch identifier, which peers answer with their
+// current epoch start metablock and the previous epoch fetch would ignore.
+func syncPrevEpochStartMeta(syncer StartOfEpochMetaSyncer, epochStartMeta *block.Block, waitTime time.Duration) (*block.Block, error) {
+	if epochStartMeta.GetEpoch() == 0 {
+		return epochStartMeta, nil
+	}
+
+	return syncer.SyncPrevEpochStartMeta(waitTime, epochStartMeta.GetEpoch()-1)
+}

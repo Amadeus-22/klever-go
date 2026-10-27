@@ -2,6 +2,7 @@ package ito_test
 
 import (
 	"encoding/hex"
+	"fmt"
 	"testing"
 
 	"github.com/klever-io/klever-go/common"
@@ -496,4 +497,98 @@ func TestITO_BuyOverflow_AfterSCFork(t *testing.T) {
 	status, err := kc.GetITOKApp().Buy(defaultSender, bc)
 	require.Error(t, common.ErrInvalidValue, err)
 	assert.Equal(t, transaction.Transaction_ParameterInvalid, status)
+}
+
+// TestITO_ZeroPackPrice_AllPaths checks that ConfigITO, the SetITOPrices trigger and
+// SetPrices agree on a zero pack price: only ConfigITO and the trigger accept it, and
+// only while KdaFpr is active and FixAuditChangesV6 is not (GHSA-jwr2-h2vc-8vvg).
+func TestITO_ZeroPackPrice_AllPaths(t *testing.T) {
+	const inactive = uint32(100_000)
+	itoAsset := []byte("ITO-1PUA")
+	zeroPricePacks := map[string]*transaction.PackInfo{
+		string(defaultAssetID): {Packs: []*transaction.PackItem{{Amount: 1, Price: 0}, {Amount: 100, Price: 10}}},
+	}
+
+	paths := map[string]struct {
+		zeroPriceAllowedOnKdaFpr bool
+		store                    func(kc kapp.KAppController) (transaction.Transaction_TXResultCode, error)
+	}{
+		"ConfigITO": {
+			zeroPriceAllowedOnKdaFpr: true,
+			store: func(kc kapp.KAppController) (transaction.Transaction_TXResultCode, error) {
+				return kc.GetITOKApp().Config(defaultSender, &transaction.ConfigITOContract{
+					AssetID:         itoAsset,
+					ReceiverAddress: defaultSender,
+					Status:          transaction.ConfigITOContract_ActiveITO,
+					PackInfo:        zeroPricePacks,
+					WhitelistStatus: transaction.ConfigITOContract_PausedITO,
+				})
+			},
+		},
+		"SetITOPrices trigger": {
+			zeroPriceAllowedOnKdaFpr: true,
+			store: func(kc kapp.KAppController) (transaction.Transaction_TXResultCode, error) {
+				return kc.GetITOKApp().Trigger(defaultSender, &transaction.ITOTriggerContract{
+					TriggerType: transaction.ITOTriggerContract_SetITOPrices,
+					AssetID:     itoAsset,
+					PackInfo:    zeroPricePacks,
+				})
+			},
+		},
+		"SetPrices": {
+			zeroPriceAllowedOnKdaFpr: false,
+			store: func(kc kapp.KAppController) (transaction.Transaction_TXResultCode, error) {
+				return kc.GetITOKApp().SetPrices(defaultSender, &transaction.SetITOPricesContract{
+					AssetID:  itoAsset,
+					PackInfo: zeroPricePacks,
+				})
+			},
+		},
+	}
+
+	for name, path := range paths {
+		for _, kdaFpr := range []bool{false, true} {
+			for _, fixV6 := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/KdaFpr=%t/FixAuditChangesV6=%t", name, kdaFpr, fixV6), func(t *testing.T) {
+					epochs := config.EnableEpochs{KdaFpr: inactive, FixAuditChangesV6: inactive}
+					if kdaFpr {
+						epochs.KdaFpr = 0
+					}
+					if fixV6 {
+						epochs.FixAuditChangesV6 = 0
+					}
+
+					kc, err := createMockControllers(epochs)
+					require.NoError(t, err)
+
+					createAsset(t, kc, []byte("ITO"), transaction.CreateAssetContract_Fungible, 0, 100_000, 100_000)
+					createAsset(t, kc, defaultTicker, transaction.CreateAssetContract_Fungible, 0, 10_000_000, 10_000_000)
+					if name != "ConfigITO" {
+						createDefaultITO(t, kc, string(defaultAssetID), itoAsset)
+						grantSetITOPricesRole(t, kc, itoAsset, defaultSender)
+					}
+
+					status, err := path.store(kc)
+
+					if kdaFpr && !fixV6 && path.zeroPriceAllowedOnKdaFpr {
+						require.NoError(t, err)
+						assert.Equal(t, transaction.Transaction_Ok, status)
+						assert.Equal(t, int64(0), GetIto(t, kc, itoAsset).PackData[string(defaultAssetID)].Packs[0].Price)
+						return
+					}
+
+					assert.Equal(t, common.ErrInvalidValue, err)
+					assert.Equal(t, transaction.Transaction_ParameterInvalid, status)
+				})
+			}
+		}
+	}
+}
+
+func grantSetITOPricesRole(t *testing.T, kc kapp.KAppController, assetID []byte, address []byte) {
+	kdaKapp, asset, err := kc.GetKDAKApp().GetKDA(assetID)
+	require.NoError(t, err)
+
+	asset.Roles = append(asset.Roles, &kapps.RolesData{Address: address, HasRoleSetITOPrices: true})
+	require.NoError(t, kc.GetKDAKApp().SetKDA(kdaKapp, assetID, asset))
 }

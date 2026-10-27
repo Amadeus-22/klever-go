@@ -760,8 +760,23 @@ func (context *runtimeContext) SignalUserError(message string) {
 // SetRuntimeBreakpointValue sets the specified runtime breakpoint in Wasmer,
 // immediately stopping the contract execution.
 func (context *runtimeContext) SetRuntimeBreakpointValue(value vmhost.BreakpointValue) {
-	context.iTracker.Instance().SetBreakpointValue(uint64(value))
+	context.iTracker.SetActiveBreakpointValue(value)
 	logRuntime.Trace("runtime breakpoint set", "breakpoint", value)
+}
+
+// RequestTimeoutInterruption stops the running contract, including nested
+// executions started afterwards, at BreakpointExecutionFailed. Unlike
+// FailExecution it touches neither the output nor the runtime errors, so it is
+// safe to call from the timeout goroutine while the execution goroutine runs;
+// the timeout result is published by the host after the execution is joined.
+func (context *runtimeContext) RequestTimeoutInterruption() {
+	context.iTracker.RequestInterruption(vmhost.BreakpointExecutionFailed)
+	logRuntime.Trace("timeout interruption requested")
+}
+
+// ClearTimeoutInterruption drops a pending timeout interruption request.
+func (context *runtimeContext) ClearTimeoutInterruption() {
+	context.iTracker.ClearInterruption()
 }
 
 // GetRuntimeBreakpointValue retrieves the value of the breakpoint that has

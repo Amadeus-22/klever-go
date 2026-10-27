@@ -135,10 +135,7 @@ func (sr *subslotEndSlot) isBlockHeaderFinalInfoValid(cnsDta *consensus.Message)
 		return false
 	}
 
-	header := currentHeader.Clone()
-	header.SetPubKeysBitmap(cnsDta.PubKeysBitmap)
-	header.SetSignature(cnsDta.AggregateSignature)
-	header.SetProducerSignature(cnsDta.LeaderSignature)
+	header := cloneWithSignatures(currentHeader, cnsDta.PubKeysBitmap, cnsDta.AggregateSignature, cnsDta.LeaderSignature)
 
 	err := sr.HeaderSigVerifier().VerifyLeaderSignature(header)
 	if err != nil {
@@ -444,6 +441,8 @@ func (sr *subslotEndSlot) doEndSlotJobByParticipant(cnsDta *consensus.Message) b
 	}
 	if err != nil {
 		log.Debug("doEndSlotJobByParticipant.CommitBlock", "error", err.Error())
+		// CommitBlock reverted the tries: a later final-info must not commit this slot again; sync catches up
+		sr.SetSlotCanceled(true)
 		return false
 	}
 
@@ -483,12 +482,19 @@ func (sr *subslotEndSlot) haveConsensusHeaderWithFullInfo(cnsDta *consensus.Mess
 		return false, nil
 	}
 
-	header := currentHeader.Clone()
-	header.SetPubKeysBitmap(cnsDta.PubKeysBitmap)
-	header.SetSignature(cnsDta.AggregateSignature)
-	header.SetProducerSignature(cnsDta.LeaderSignature)
+	return true, cloneWithSignatures(currentHeader, cnsDta.PubKeysBitmap, cnsDta.AggregateSignature, cnsDta.LeaderSignature)
+}
 
-	return true, header
+// cloneWithSignatures returns a copy of header, the block this node processed, carrying the given
+// bitmap and signatures. The body must come from the processed header, never from a received copy:
+// the signatures bind only the inner BlockHeader, not the TxResults values (KLC-2605).
+func cloneWithSignatures(header data.HeaderHandler, pubKeysBitmap []byte, signature []byte, producerSignature []byte) data.HeaderHandler {
+	clone := header.Clone()
+	clone.SetPubKeysBitmap(pubKeysBitmap)
+	clone.SetSignature(signature)
+	clone.SetProducerSignature(producerSignature)
+
+	return clone
 }
 
 func (sr *subslotEndSlot) isConsensusHeaderReceived() (bool, data.HeaderHandler) {
@@ -519,7 +525,8 @@ func (sr *subslotEndSlot) isConsensusHeaderReceived() (bool, data.HeaderHandler)
 		}
 
 		if bytes.Equal(receivedHeaderHash, consensusHeaderHash) {
-			return true, receivedHeaders[index]
+			received := receivedHeaders[index]
+			return true, cloneWithSignatures(currentHeader, received.GetPubKeysBitmap(), received.GetSignature(), received.GetProducerSignature())
 		}
 	}
 

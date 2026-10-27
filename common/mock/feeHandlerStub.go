@@ -10,12 +10,14 @@ import (
 
 // FeeHandlerStub -
 type FeeHandlerStub struct {
-	MaxGasLimitPerBlockValue     uint64
-	MaxGasLimitPerTxValue        uint64
-	CheckValidityTxValuesCalled  func(tx process.TransactionWithFeeHandler) (*transaction.CostResponse, error)
-	ComputeTransactionCostCalled func(tx process.TransactionWithFeeHandler) (*transaction.CostResponse, error)
-	ComputeGasCalled             func(tx *transaction.Transaction, computedCost *transaction.CostResponse) (uint64, uint64, error)
-	EpochConfirmedCalled         func(epoch uint32)
+	MaxGasLimitPerBlockValue      uint64
+	MaxGasLimitPerTxValue         uint64
+	CheckValidityTxValuesCalled   func(tx process.TransactionWithFeeHandler) (*transaction.CostResponse, error)
+	ComputeTransactionCostCalled  func(tx process.TransactionWithFeeHandler) (*transaction.CostResponse, error)
+	ComputeGasCalled              func(tx *transaction.Transaction, computedCost *transaction.CostResponse) (uint64, uint64, error)
+	EpochConfirmedCalled          func(epoch uint32)
+	SetProposalControllerCalled   func(controller kapps.ActiveProposalController) error
+	IsProposalControllerSetCalled func() bool
 }
 
 func (fhs *FeeHandlerStub) ComputeGas(tx *transaction.Transaction, computedCost *transaction.CostResponse) (uint64, uint64, error) {
@@ -34,6 +36,9 @@ func (fhs *FeeHandlerStub) ComputeTransactionCost(tx process.TransactionWithFeeH
 }
 
 func (fhs *FeeHandlerStub) SetProposalController(controller kapps.ActiveProposalController) error {
+	if fhs.SetProposalControllerCalled != nil {
+		return fhs.SetProposalControllerCalled(controller)
+	}
 	return nil
 }
 
@@ -71,6 +76,15 @@ func (fhs *FeeHandlerStub) MaxGasLimitPerBlock() uint64 {
 
 func (fhs *FeeHandlerStub) MaxGasLimitPerTX() uint64 {
 	return fhs.MaxGasLimitPerTxValue
+}
+
+// IsProposalControllerSet - wired unless the hook says otherwise
+func (fhs *FeeHandlerStub) IsProposalControllerSet() bool {
+	if fhs.IsProposalControllerSetCalled != nil {
+		return fhs.IsProposalControllerSetCalled()
+	}
+
+	return true
 }
 
 // IsInterfaceNil returns true if there is no value under the interface

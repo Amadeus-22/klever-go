@@ -10,6 +10,19 @@ import (
 
 const displayLastPidChars = 12
 
+// MaxFramedMessageSize is the largest framed message, in bytes, a peer reads: it matches the pubsub wire
+// limit (go-libp2p-pubsub DefaultMaxMessageSize, not overridden by this node) and caps the direct-send reader
+const MaxFramedMessageSize = 1 << 20
+
+// messageHeader reserves room for the pubsub envelope (sender, seqno, topic, signature, key) inside a
+// MaxFramedMessageSize frame, so the payload must leave space for it
+const messageHeader = 64 * 1024 //64kB
+
+// MaxSendBuffSize is the largest buffer, in bytes, a sender accepts; the bound is inclusive. The messenger
+// checks it against the payload and the direct sender checks it again against the framed TopicMessage, so a
+// SendToConnectedPeer payload must also leave room for that frame (about 12 bytes)
+const MaxSendBuffSize = MaxFramedMessageSize - messageHeader
+
 const (
 	// ListsSharder is the variant that uses lists
 	ListsSharder = "ListsSharder"

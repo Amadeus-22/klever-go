@@ -15,6 +15,7 @@ import (
 
 	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/config"
+	consensusMock "github.com/klever-io/klever-go/core/consensus/mock"
 	"github.com/klever-io/klever-go/core/fork"
 	"github.com/klever-io/klever-go/core/kapp"
 	kappcontroller "github.com/klever-io/klever-go/core/kapp/kappController"
@@ -26,6 +27,7 @@ import (
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/data/transaction"
 	"github.com/klever-io/klever-go/kapps"
+	"github.com/klever-io/klever-go/kvm/mock/stub"
 	"github.com/klever-io/klever-go/node"
 	"github.com/klever-io/klever-go/storage"
 	"github.com/klever-io/klever-go/tools/marshal"
@@ -654,6 +656,32 @@ func TestEstimateTransactionsFees(t *testing.T) {
 		assert.NotNil(t, err)
 	})
 
+	t.Run("should fail with nil contract", func(t *testing.T) {
+		t.Parallel()
+
+		feeHandlerCalled := false
+		feeHandler := &mock.FeeHandlerStub{
+			ComputeTransactionCostCalled: func(tx process.TransactionWithFeeHandler) (*transaction.CostResponse, error) {
+				feeHandlerCalled = true
+				return &transaction.CostResponse{}, nil
+			},
+		}
+		nodeWithFeeHandler, err := createNodeWithFeeHandler(t, feeHandler)
+		require.Nil(t, err)
+
+		tx := &transaction.Transaction{
+			RawData: &transaction.Transaction_Raw{
+				Sender:   validAddress,
+				Contract: []*transaction.TXContract{nil},
+			},
+		}
+
+		cost, err := nodeWithFeeHandler.EstimateTransactionFees(tx)
+		assert.Nil(t, cost)
+		assert.Equal(t, common.ErrInvalidContract, err)
+		assert.False(t, feeHandlerCalled)
+	})
+
 	t.Run("should work transaction with transfer contract", func(t *testing.T) {
 		t.Parallel()
 
@@ -904,5 +932,124 @@ func TestDecodeTransaction(t *testing.T) {
 		require.NotNil(t, decoded)
 		assert.Len(t, decoded.Contracts, 1)
 		assert.NotEmpty(t, decoded.Hash)
+	})
+}
+
+// the concurrent case lives in TestNode_PublishProposalController, which races
+// readers against the wiring path StartConsensus actually uses
+func TestNode_GetProposalParameters(t *testing.T) {
+	t.Parallel()
+
+	n, err := node.NewNode()
+	require.Nil(t, err)
+
+	// API requests are served from the moment the REST server starts, which is
+	// before StartConsensus wires the proposal controller in
+	params, err := n.GetProposalParameters()
+	require.Nil(t, params)
+	require.Equal(t, process.ErrProposalNotInitialized, err)
+
+	epochNotifier := &mock.EpochNotifierStub{}
+	forkController, _ := fork.NewForkController(config.EnableEpochs{}, epochNotifier)
+	proposalController, _ := kapps.NewProposalController(forkController)
+
+	require.Nil(t, node.WithProposalController(proposalController)(n))
+
+	params, err = n.GetProposalParameters()
+	require.Nil(t, err)
+	require.Equal(t, proposalController.GetActiveParameters(), params)
+}
+
+func TestNode_PublishProposalController(t *testing.T) {
+	t.Parallel()
+
+	newController := func() kapps.ActiveProposalController {
+		forkController, _ := fork.NewForkController(config.EnableEpochs{}, &mock.EpochNotifierStub{})
+		controller, err := kapps.NewProposalController(forkController)
+		require.Nil(t, err)
+
+		return controller
+	}
+
+	// createNodeWithConsumers wires a node with the four consumers
+	// publishProposalController fans out to, each recording what it received
+	createNodeWithConsumers := func(t *testing.T, kappErr error) (*node.Node, map[string]kapps.ActiveProposalController) {
+		got := make(map[string]kapps.ActiveProposalController)
+		record := func(name string) func(kapps.ActiveProposalController) error {
+			return func(controller kapps.ActiveProposalController) error {
+				got[name] = controller
+				return nil
+			}
+		}
+
+		n, err := node.NewNode(
+			node.WithTxFeeHandler(&mock.FeeHandlerStub{SetProposalControllerCalled: record("feeHandler")}),
+			node.WithBlockProcessor(&consensusMock.BlockProcessorMock{SetProposalControllerCalled: record("blockProcessor")}),
+			node.WithKAppController(&stub.KAppControllerStub{SetProposalControllerCalled: func(controller kapps.ActiveProposalController) error {
+				if kappErr != nil {
+					return kappErr
+				}
+
+				return record("kappController")(controller)
+			}}),
+			node.WithSimulatorKAppController(&stub.KAppControllerStub{SetProposalControllerCalled: record("kappControllerSimulator")}),
+		)
+		require.Nil(t, err)
+
+		return n, got
+	}
+
+	t.Run("every consumer receives the same controller", func(t *testing.T) {
+		t.Parallel()
+
+		n, got := createNodeWithConsumers(t, nil)
+		controller := newController()
+
+		require.Nil(t, n.PublishProposalController(controller))
+
+		require.Len(t, got, 4)
+		for name, received := range got {
+			assert.Same(t, controller, received, "consumer %s got a different controller", name)
+		}
+
+		params, err := n.GetProposalParameters()
+		require.Nil(t, err)
+		require.Equal(t, controller.GetActiveParameters(), params)
+	})
+
+	t.Run("a failing consumer aborts the wiring", func(t *testing.T) {
+		t.Parallel()
+
+		expectedErr := errors.New("kapp controller refused")
+		n, got := createNodeWithConsumers(t, expectedErr)
+
+		require.Equal(t, expectedErr, n.PublishProposalController(newController()))
+
+		// the setters after the failing one never ran
+		require.NotContains(t, got, "kappControllerSimulator")
+	})
+
+	t.Run("readers race against the wiring", func(t *testing.T) {
+		t.Parallel()
+
+		n, _ := createNodeWithConsumers(t, nil)
+		controller := newController()
+
+		// the REST API is already serving when StartConsensus publishes
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for i := 0; i < 1000; i++ {
+				params, err := n.GetProposalParameters()
+				if err == nil {
+					require.NotEmpty(t, params)
+					continue
+				}
+				require.Equal(t, process.ErrProposalNotInitialized, err)
+			}
+		}()
+
+		require.Nil(t, n.PublishProposalController(controller))
+		<-done
 	})
 }

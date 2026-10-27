@@ -3,6 +3,7 @@ package indexer
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	dataBlock "github.com/klever-io/klever-go/data/block"
 	"github.com/klever-io/klever-go/data/indexer"
 	"github.com/klever-io/klever-go/data/transaction"
+	idata "github.com/klever-io/klever-go/indexer/data"
 	imock "github.com/klever-io/klever-go/indexer/mock"
 	"github.com/klever-io/klever-go/indexer/workItems"
 	"github.com/klever-io/klever-go/tools"
@@ -106,6 +108,84 @@ func TestDataIndexer_SaveBlock(t *testing.T) {
 	}
 	ei.SaveBlock(args)
 	require.True(t, called)
+}
+
+// The account snapshot taken on the commit goroutine must reach the queued work item:
+// without it the worker indexes the block with no account documents (KLR-68).
+func TestDataIndexer_SaveBlockQueuesPreparedBlockData(t *testing.T) {
+	errResolve := errors.New("resolve failed")
+
+	tests := []struct {
+		name       string
+		prepared   any
+		payload    *idata.PreparedBlockData
+		resolveErr error
+	}{
+		{name: "no payload from eventsProcessor", payload: &idata.PreparedBlockData{}},
+		// eventsProcessor.prepare returns a typed nil for an empty pool
+		{name: "typed-nil payload from eventsProcessor", prepared: (*idata.PreparedBlockData)(nil), payload: &idata.PreparedBlockData{}},
+		{name: "resolve error still queues the block", payload: &idata.PreparedBlockData{}, resolveErr: errResolve},
+		{name: "nothing resolved keeps the original payload", prepared: (*idata.PreparedBlockData)(nil)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var received, saved any
+			var queued workItems.WorkItemHandler
+
+			arguments := NewDataIndexerArguments()
+			arguments.ElasticProcessor = &imock.ElasticProcessorStub{
+				PrepareBlockDataCalled: func(_ data.HeaderHandler, _ *indexer.Pool, prepared any) (*idata.PreparedBlockData, error) {
+					received = prepared
+					return tt.payload, tt.resolveErr
+				},
+				SaveTransactionsCalled: func(_ data.HeaderHandler, _ *indexer.Pool, prepared any) error {
+					saved = prepared
+					return nil
+				},
+			}
+			arguments.DataDispatcher = &imock.DispatcherMock{
+				AddCalled: func(item workItems.WorkItemHandler) { queued = item },
+			}
+			di, err := NewDataIndexer(arguments)
+			require.NoError(t, err)
+
+			di.SaveBlock(&indexer.ArgsSaveBlockData{Header: &dataBlock.Block{}, Prepared: tt.prepared})
+
+			require.Equal(t, tt.prepared, received)
+			require.NotNil(t, queued)
+			require.NoError(t, queued.Save())
+			if tt.payload != nil {
+				require.Same(t, tt.payload, saved)
+			} else {
+				require.Equal(t, tt.prepared, saved)
+			}
+		})
+	}
+}
+
+// SaveBlock preps on the commit goroutine, ahead of the work item's nil guards, so with a
+// real processor it must still tolerate a nil header or pool rather than crash the node.
+func TestDataIndexer_SaveBlockToleratesNilHeaderAndPool(t *testing.T) {
+	for name, args := range map[string]*indexer.ArgsSaveBlockData{
+		"nil header": {TransactionsPool: &indexer.Pool{}},
+		"nil pool":   {Header: &dataBlock.Block{Header: &dataBlock.BlockHeader{Nonce: 1}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var queued workItems.WorkItemHandler
+
+			arguments := NewDataIndexerArguments()
+			arguments.ElasticProcessor = newTestElasticSearchDatabase(&imock.DatabaseWriterStub{}, createMockElasticProcessorArgs())
+			arguments.DataDispatcher = &imock.DispatcherMock{
+				AddCalled: func(item workItems.WorkItemHandler) { queued = item },
+			}
+			di, err := NewDataIndexer(arguments)
+			require.NoError(t, err)
+
+			require.NotPanics(t, func() { di.SaveBlock(args) })
+			require.NotNil(t, queued)
+		})
+	}
 }
 
 func TestDataIndexer(t *testing.T) {

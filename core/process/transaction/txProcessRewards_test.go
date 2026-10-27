@@ -39,6 +39,7 @@ func CreateValidators(c *Controller, blk *block.Block) {
 		OwnerAddress: validatorA,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddressA,
+			BLSSignature:        validBLSKeyProof("peerAddressA", validatorA),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -70,6 +71,7 @@ func CreateValidators(c *Controller, blk *block.Block) {
 		OwnerAddress: validatorB,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddressB,
+			BLSSignature:        validBLSKeyProof("peerAddressB", validatorB),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -374,6 +376,7 @@ func Test_ValidatorRewards_Comission_20(t *testing.T) {
 		OwnerAddress: validatorA,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddressA,
+			BLSSignature:        validBLSKeyProof("peerAddressA", validatorA),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -451,6 +454,7 @@ func Test_ValidatorRewards_Comission_2000(t *testing.T) {
 		OwnerAddress: validatorA,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddressA,
+			BLSSignature:        validBLSKeyProof("peerAddressA", validatorA),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -574,6 +578,7 @@ func Test_ValidatorRewards_V2_Commission_20(t *testing.T) {
 		OwnerAddress: validatorA,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddressA,
+			BLSSignature:        validBLSKeyProof("peerAddressA", validatorA),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -656,6 +661,7 @@ func Test_ValidatorRewards_V2_Commission_2000(t *testing.T) {
 		OwnerAddress: validatorA,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddressA,
+			BLSSignature:        validBLSKeyProof("peerAddressA", validatorA),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,

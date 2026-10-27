@@ -1,7 +1,6 @@
 p2p:
   node:
     port: 37373-38383
-    seed:
     maximumExpectedPeerCount: 0
     thresholdMinConnectedPeers: 0
     broadcastIP:
@@ -9,8 +8,7 @@ p2p:
     enabled: true
     refreshIntervalInSec: 10
     protocolID: /klv/kad/0.0.1
-    initialPeerList:
-      - /ip4/127.0.0.1/tcp/37373/p2p/16Uiu2HAkw5SNNtSvH1zJiQ6Gc3WoGNSxiyNueRKe6fuAuh57G3Bk
+    initialPeerList: []
     bucketSize: 100
     routingTableRefreshIntervalInSec: 300
   sharding:

@@ -18,12 +18,14 @@ import (
 	"github.com/klever-io/klever-go/network/p2p"
 	"github.com/klever-io/klever-go/network/p2p/data"
 	"github.com/klever-io/klever-go/network/p2p/libp2p"
+	"github.com/klever-io/klever-go/network/p2p/libp2p/p2pkey"
 	"github.com/klever-io/klever-go/network/p2p/message"
 	"github.com/klever-io/klever-go/network/p2p/mock"
 	"github.com/klever-io/klever-go/tools/check"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsub_pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/connmgr"
+	libp2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
@@ -88,8 +90,18 @@ func createMockNetworkArgs() libp2p.ArgsNetworkMessenger {
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
+}
+
+func createP2pPrivateKey() libp2pCrypto.PrivKey {
+	sk, err := p2pkey.Generate()
+	if err != nil {
+		panic(err)
+	}
+
+	return sk
 }
 
 func createMockNetworkOf2() (mocknet.Mocknet, p2p.Messenger, p2p.Messenger) {
@@ -159,6 +171,38 @@ func TestNewNetworkMessenger_NilSyncTimerShouldErr(t *testing.T) {
 
 	assert.True(t, check.IfNil(mes))
 	assert.True(t, errors.Is(err, p2p.ErrNilSyncTimer))
+}
+
+func TestNewNetworkMessenger_NilP2pPrivateKeyShouldErr(t *testing.T) {
+	arg := createMockNetworkArgs()
+	arg.P2pPrivateKey = nil
+	mes, err := libp2p.NewNetworkMessenger(arg)
+
+	assert.True(t, check.IfNil(mes))
+	assert.True(t, errors.Is(err, p2p.ErrNilP2pPrivateKey))
+}
+
+func TestNewNetworkMessenger_TypedNilP2pPrivateKeyShouldErr(t *testing.T) {
+	arg := createMockNetworkArgs()
+	var typedNil *libp2pCrypto.Secp256k1PrivateKey
+	arg.P2pPrivateKey = typedNil
+	mes, err := libp2p.NewNetworkMessenger(arg)
+
+	assert.True(t, check.IfNil(mes))
+	assert.True(t, errors.Is(err, p2p.ErrNilP2pPrivateKey))
+}
+
+func TestNewNetworkMessenger_UsesProvidedP2pPrivateKey(t *testing.T) {
+	arg := createMockNetworkArgs()
+	mes, err := libp2p.NewNetworkMessenger(arg)
+	require.Nil(t, err)
+	defer func() {
+		_ = mes.Close()
+	}()
+
+	expectedID, err := peer.IDFromPrivateKey(arg.P2pPrivateKey)
+	require.Nil(t, err)
+	assert.Equal(t, core.PeerID(expectedID), mes.ID())
 }
 
 func TestNewNetworkMessenger_WithDeactivatedKadDiscovererShouldWork(t *testing.T) {
@@ -596,7 +640,7 @@ func TestLibp2pMessenger_UnregisterAllTopicValidatorShouldWork(t *testing.T) {
 }
 
 func TestLibp2pMessenger_BroadcastDataLargeMessageShouldNotCallSend(t *testing.T) {
-	msg := make([]byte, libp2p.MaxSendBuffSize+1)
+	msg := make([]byte, p2p.MaxSendBuffSize+1)
 	mes, _ := libp2p.NewNetworkMessenger(createMockNetworkArgs())
 	mes.SetLoadBalancer(&mock.ChannelLoadBalancerStub{
 		GetChannelOrDefaultCalled: func(pipe string) chan *p2p.SendableData {
@@ -650,6 +694,55 @@ func TestLibp2pMessenger_BroadcastDataBetween2PeersShouldWork(t *testing.T) {
 	_ = mes2.Close()
 }
 
+// The fast bootstrap quorum counts one vote per gossip author, so a production messenger must
+// only deliver gossip signed by the key of the peer it names as its author.
+func TestNetworkMessenger_GossipShouldBeSignedByItsAuthor(t *testing.T) {
+	sender, err := libp2p.NewNetworkMessenger(createMockNetworkArgs())
+	require.NoError(t, err)
+	receiver, err := libp2p.NewNetworkMessenger(createMockNetworkArgs())
+	require.NoError(t, err)
+	defer func() {
+		_ = sender.Close()
+		_ = receiver.Close()
+	}()
+
+	require.NoError(t, sender.ConnectToPeer(getConnectableAddress(receiver)))
+	require.NoError(t, sender.CreateTopic("test", false))
+	require.NoError(t, receiver.CreateTopic("test", false))
+
+	type delivery struct {
+		message           p2p.MessageP2P
+		fromConnectedPeer core.PeerID
+	}
+	chanDelivered := make(chan delivery, 1)
+	err = receiver.RegisterMessageProcessor("test", &mock.MessageProcessorStub{
+		ProcessMessageCalled: func(message p2p.MessageP2P, fromConnectedPeer core.PeerID) error {
+			select {
+			case chanDelivered <- delivery{message: message, fromConnectedPeer: fromConnectedPeer}:
+			default:
+			}
+			return nil
+		},
+	})
+	require.NoError(t, err)
+
+	// resend until the topic subscriptions have propagated, instead of sleeping a fixed time
+	timeout := time.After(timeoutWaitResponses)
+	for {
+		sender.Broadcast("test", []byte("signed gossip"))
+		select {
+		case delivered := <-chanDelivered:
+			assert.NotEmpty(t, delivered.message.Signature(), "production gossip must be signed")
+			assert.Equal(t, sender.ID(), delivered.message.Peer())
+			assert.Equal(t, sender.ID(), delivered.fromConnectedPeer)
+			return
+		case <-timeout:
+			require.Fail(t, "the gossip never reached the receiver")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 func TestLibp2pMessenger_BroadcastOnChannelBlockingShouldLimitNumberOfGoRoutines(t *testing.T) {
 	if testing.Short() {
 		t.Skip("this test does not perform well in TC with race detector on")
@@ -696,8 +789,33 @@ func TestLibp2pMessenger_BroadcastOnChannelBlockingShouldLimitNumberOfGoRoutines
 	_ = mes.Close()
 }
 
+func TestLibp2pMessenger_BroadcastOnChannelBlockingReleasesSlotOnPanic(t *testing.T) {
+	closed := make(chan *p2p.SendableData)
+	close(closed)
+
+	mes, _ := libp2p.NewNetworkMessenger(createMockNetworkArgs())
+	mes.SetLoadBalancer(&mock.ChannelLoadBalancerStub{
+		CollectOneElementFromChannelsCalled: func() *p2p.SendableData {
+			return nil
+		},
+		GetChannelOrDefaultCalled: func(pipe string) chan *p2p.SendableData {
+			return closed
+		},
+	})
+
+	// Each send panics on the closed channel. A caller that recovers must not have spent a
+	// throttler slot, or after BroadcastGoRoutines panics every broadcast is refused.
+	for i := 0; i < libp2p.BroadcastGoRoutines+1; i++ {
+		assert.Panics(t, func() {
+			_ = mes.BroadcastOnChannelBlocking("test", "test", []byte("test message"))
+		})
+	}
+
+	_ = mes.Close()
+}
+
 func TestLibp2pMessenger_BroadcastDataBetween2PeersWithLargeMsgShouldWork(t *testing.T) {
-	msg := make([]byte, libp2p.MaxSendBuffSize)
+	msg := make([]byte, p2p.MaxSendBuffSize)
 
 	_, mes1, mes2 := createMockNetworkOf2()
 
@@ -1178,6 +1296,45 @@ func TestLibp2pMessenger_SendDirectWithMockNetToConnectedPeerShouldWork(t *testi
 	_ = mes2.Close()
 }
 
+func TestLibp2pMessenger_SendDirectWithMockNetLargestPayloadShouldWork(t *testing.T) {
+	framed, err := (&commonMock.ProtoMarshalizerMock{}).Marshal(&data.TopicMessage{
+		Version:   libp2p.CurrentTopicMessageVersion,
+		Payload:   make([]byte, p2p.MaxSendBuffSize),
+		Timestamp: time.Now().Unix(),
+	})
+	require.Nil(t, err)
+	frameSize := len(framed) - p2p.MaxSendBuffSize
+
+	largestPayload := bytes.Repeat([]byte{65}, p2p.MaxSendBuffSize-frameSize)
+
+	_, mes1, mes2 := createMockNetworkOf2()
+	_ = mes1.ConnectToPeer(mes2.Addresses()[0])
+
+	wg := &sync.WaitGroup{}
+	chanDone := make(chan bool)
+	wg.Add(1)
+
+	go func() {
+		wg.Wait()
+		chanDone <- true
+	}()
+
+	prepareMessengerForMatchDataReceive(mes2, largestPayload, wg)
+
+	time.Sleep(time.Second)
+
+	err = mes1.SendToConnectedPeer("test", largestPayload, mes2.ID())
+	assert.Nil(t, err)
+
+	waitDoneWithTimeout(t, chanDone, timeoutWaitResponses)
+
+	err = mes1.SendToConnectedPeer("test", append(largestPayload, 65), mes2.ID())
+	assert.True(t, errors.Is(err, p2p.ErrMessageTooLarge))
+
+	_ = mes1.Close()
+	_ = mes2.Close()
+}
+
 func TestLibp2pMessenger_SendDirectWithRealNetToConnectedPeerShouldWork(t *testing.T) {
 	msg := []byte("test message")
 
@@ -1376,7 +1533,8 @@ func TestNetworkMessenger_PreventReprocessingShouldWork(t *testing.T) {
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
@@ -1439,7 +1597,8 @@ func TestNetworkMessenger_PubsubCallbackNotMessageNotValidShouldNotCallHandler(t
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
@@ -1509,7 +1668,8 @@ func TestNetworkMessenger_PubsubCallbackReturnsFalseIfHandlerErrors(t *testing.T
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
@@ -1572,7 +1732,8 @@ func TestNetworkMessenger_PubsubCallbackRecoversFromHandlerPanic(t *testing.T) {
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
@@ -1663,7 +1824,8 @@ func TestNetworkMessenger_DirectMessageHandlerRecoversFromPanic(t *testing.T) {
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)
@@ -1740,7 +1902,8 @@ func TestNetworkMessenger_UnjoinAllTopicsShouldWork(t *testing.T) {
 				Type: p2p.NilListSharder,
 			},
 		},
-		SyncTimer: &libp2p.LocalSyncTimer{},
+		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: createP2pPrivateKey(),
 	}
 
 	mes, _ := libp2p.NewNetworkMessenger(args)

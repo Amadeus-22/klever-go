@@ -23,7 +23,7 @@ func (v *ValidatorsKAppStub) SetKAppController(controller kapp.KAppController) e
 }
 
 // Register registers a new validator.
-func (v *ValidatorsKAppStub) Register(tc *transaction.CreateValidatorContract) (transaction.Transaction_TXResultCode, error) {
+func (v *ValidatorsKAppStub) Register(sender []byte, tc *transaction.CreateValidatorContract) (transaction.Transaction_TXResultCode, error) {
 	// Stub implementation
 	return transaction.Transaction_TXResultCode(0), nil
 }

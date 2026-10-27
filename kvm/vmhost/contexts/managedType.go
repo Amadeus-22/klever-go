@@ -145,8 +145,16 @@ func (context *managedTypesContext) InitState() {
 	}
 }
 
-// PushState appends the values map to the state stack
+// PushState saves the active values on the state stack. Before FixAuditChangesV6 it stacks a deep
+// copy and leaves the active values in place; once it is active it moves the active values onto
+// the stack and leaves a fresh, empty active state, so it must be paired with PopSetActiveState,
+// never PopDiscard, or the caller's values are lost.
 func (context *managedTypesContext) PushState() {
+	if context.host.ForkController().FixAuditChangesV6() {
+		context.pushStateByMove()
+		return
+	}
+
 	newBigIntState, newBigFloatState, newEcState, newmBufferState, newmMapState := context.clone()
 	newTransfers := context.cloneBackTransfers()
 	context.managedTypesStack = append(context.managedTypesStack, managedTypesState{
@@ -157,6 +165,19 @@ func (context *managedTypesContext) PushState() {
 		mMapValues:     newmMapState,
 		backTransfers:  newTransfers,
 	})
+}
+
+// pushStateByMove is PushState once FixAuditChangesV6 is active. Every nested call starts on a
+// fresh state (InitState right after PushState), so the caller's values can go onto the stack as
+// they are instead of being deep-copied. The copy cost time and memory in proportion to the number
+// of handles and charged no gas, so a contract could make a nested call clone a large handle set
+// for free. The active state is replaced straight away, so nothing reachable from it shares a map
+// with the stacked state, and PopSetActiveState hands the caller back its own maps.
+func (context *managedTypesContext) pushStateByMove() {
+	stackedState := context.managedTypesValues
+	stackedState.backTransfers = context.cloneBackTransfers()
+	context.managedTypesStack = append(context.managedTypesStack, stackedState)
+	context.InitState()
 }
 
 // PopSetActiveState removes the latest entry from the state stack and sets it as the current values map
@@ -242,6 +263,18 @@ func (context *managedTypesContext) ConsumeGasForThisIntNumberOfBytes(byteLen in
 		gasToUse = math.MulUint64(uint64(byteLen), metering.GasSchedule().BigIntAPICost.CopyPerByteForTooBig)
 		metering.UseAndTraceGas(gasToUse)
 	}
+}
+
+// ConsumeGasForThisIntNumberOfBytesBounded charges byteLen * CopyPerByteForTooBig when byteLen exceeds
+// maxBigIntByteLenForNormalCost. Unlike ConsumeGasForThisIntNumberOfBytes, it charges nothing and returns
+// ErrNotEnoughGas when the gas left cannot cover it.
+func (context *managedTypesContext) ConsumeGasForThisIntNumberOfBytesBounded(byteLen int64) error {
+	if byteLen <= maxBigIntByteLenForNormalCost {
+		return nil
+	}
+	metering := context.host.Metering()
+	gasToUse := math.MulUint64(uint64(byteLen), metering.GasSchedule().BigIntAPICost.CopyPerByteForTooBig)
+	return metering.UseGasBounded(gasToUse)
 }
 
 // ConsumeGasForBytes uses gas for the given bytes
@@ -359,6 +392,11 @@ func (context *managedTypesContext) BigFloatPrecIsNotValid(precision uint) bool 
 // BigFloatExpIsNotValid checks if the exponent of a big float is not valid (smaller than -65025 or bigger than 65025)
 func (context *managedTypesContext) BigFloatExpIsNotValid(exponent int) bool {
 	return exponent < bigFloatMinExponent || exponent > bigFloatMaxExponent
+}
+
+// EncodedBigFloatLenIsNotValid checks if an encoded big float is longer than a canonical encoding can be
+func (context *managedTypesContext) EncodedBigFloatLenIsNotValid(length int32) bool {
+	return length > encodedBigFloatMaxByteLen
 }
 
 // BigFloatIsNotCanonical checks if a big float's mantissa carries more significant bits than its declared precision
@@ -773,6 +811,10 @@ func (context *managedTypesContext) InsertSlice(mBufferHandle int32, startPositi
 func (context *managedTypesContext) ReadManagedVecOfManagedBuffers(
 	managedVecHandle int32,
 ) ([][]byte, uint64, error) {
+	if context.host.ForkController().FixAuditChangesV6() {
+		return context.readManagedVecOfManagedBuffersBounded(managedVecHandle)
+	}
+
 	managedVecBytes, err := context.GetBytes(managedVecHandle)
 	if err != nil {
 		return nil, 0, err
@@ -802,11 +844,81 @@ func (context *managedTypesContext) ReadManagedVecOfManagedBuffers(
 	return result, sumOfItemByteLengths, nil
 }
 
+// readManagedVecOfManagedBuffersBounded is ReadManagedVecOfManagedBuffers once FixAuditChangesV6
+// is active. The vector and the items are charged, bounded, before anything is cloned, and the
+// items' total length is capped, so a vector that repeats one large handle can no longer clone it
+// once per occurrence whatever the gas left. It charges the same gas as the legacy path, so an
+// honest call costs the same. Every item handle is checked before the first item clone, so a
+// missing one fails without doing any work.
+func (context *managedTypesContext) readManagedVecOfManagedBuffersBounded(
+	managedVecHandle int32,
+) ([][]byte, uint64, error) {
+	vecLen := context.GetLength(managedVecHandle)
+	if vecLen < 0 {
+		return nil, 0, vmhost.ErrNoManagedBufferUnderThisHandle
+	}
+	// the gas already bounds the vector well below the cap; the cap keeps that true whatever the schedule
+	if vecLen > vmhost.MaxTotalArgumentsBytes {
+		return nil, 0, vmhost.ErrManagedBufferLengthExceedsMaximum
+	}
+	// #nosec G115
+	err := context.ConsumeGasForByteLenBounded(uint64(vecLen))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	managedVecBytes, err := context.GetBytes(managedVecHandle)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(managedVecBytes)%handleLen != 0 {
+		return nil, 0, errors.New("invalid managed vector of managed buffer handles")
+	}
+
+	numBuffers := len(managedVecBytes) / handleLen
+	sumOfItemByteLengths := uint64(0)
+	for i := 0; i < len(managedVecBytes); i += handleLen {
+		itemHandle := int32(binary.BigEndian.Uint32(managedVecBytes[i : i+handleLen])) // #nosec G115
+		itemLen := context.GetLength(itemHandle)
+		if itemLen < 0 {
+			return nil, 0, vmhost.ErrNoManagedBufferUnderThisHandle
+		}
+
+		// #nosec G115
+		sumOfItemByteLengths += uint64(itemLen)
+		// the same cap the arguments read from wasm memory are held to
+		if sumOfItemByteLengths > vmhost.MaxTotalArgumentsBytes {
+			return nil, 0, vmhost.ErrManagedBufferLengthExceedsMaximum
+		}
+	}
+
+	err = context.ConsumeGasForByteLenBounded(sumOfItemByteLengths)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	result := make([][]byte, 0, numBuffers)
+	for i := 0; i < len(managedVecBytes); i += handleLen {
+		itemHandle := int32(binary.BigEndian.Uint32(managedVecBytes[i : i+handleLen])) // #nosec G115
+		itemBytes, err := context.GetBytes(itemHandle)
+		if err != nil {
+			return nil, 0, err
+		}
+		result = append(result, itemBytes)
+	}
+
+	return result, sumOfItemByteLengths, nil
+}
+
 // WriteManagedVecOfManagedBuffers converts a slice of byte slices to a managed buffer of managed buffers.
 func (context *managedTypesContext) WriteManagedVecOfManagedBuffers(
 	data [][]byte,
 	destinationHandle int32,
-) {
+) error {
+	if context.host.ForkController().FixAuditChangesV6() {
+		return context.writeManagedVecOfManagedBuffersBounded(data, destinationHandle)
+	}
+
 	sumOfItemByteLengths := uint64(0)
 	destinationBytes := make([]byte, handleLen*len(data))
 	dataIndex := 0
@@ -820,6 +932,40 @@ func (context *managedTypesContext) WriteManagedVecOfManagedBuffers(
 	context.SetBytes(destinationHandle, destinationBytes)
 	metering := context.host.Metering()
 	metering.UseAndTraceGas(sumOfItemByteLengths * metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
+	return nil
+}
+
+// writeManagedVecOfManagedBuffersBounded is WriteManagedVecOfManagedBuffers once FixAuditChangesV6
+// is active. The legacy path charged only the items' bytes, after the handles were made, so an
+// empty item became a handle for free. Here every item is charged the price of MBufferNewFromBytes
+// on top of its bytes, bounded and before the first handle is made, so an underfunded conversion
+// makes no handle at all.
+func (context *managedTypesContext) writeManagedVecOfManagedBuffersBounded(
+	data [][]byte,
+	destinationHandle int32,
+) error {
+	sumOfItemByteLengths := uint64(0)
+	for _, itemBytes := range data {
+		sumOfItemByteLengths += uint64(len(itemBytes))
+	}
+
+	metering := context.host.Metering()
+	gasSchedule := metering.GasSchedule()
+	gasForItems := math.MulUint64(uint64(len(data)), gasSchedule.ManagedBufferAPICost.MBufferNewFromBytes)
+	gasForBytes := math.MulUint64(sumOfItemByteLengths, gasSchedule.BaseOperationCost.DataCopyPerByte)
+	err := metering.UseGasBounded(math.AddUint64(gasForItems, gasForBytes))
+	if err != nil {
+		return err
+	}
+
+	destinationBytes := make([]byte, handleLen*len(data))
+	for i, itemBytes := range data {
+		itemHandle := context.NewManagedBufferFromBytes(itemBytes)
+		binary.BigEndian.PutUint32(destinationBytes[i*handleLen:], uint32(itemHandle)) // #nosec G115
+	}
+	context.SetBytes(destinationHandle, destinationBytes)
+
+	return nil
 }
 
 // NewManagedMap creates a new empty managed map in the managed buffers map and returns the handle
@@ -836,11 +982,28 @@ func (context *managedTypesContext) NewManagedMap() int32 {
 	return newHandle
 }
 
-// ManagedMapPut puts the key and value bytes stored at those respective handles in the map
+// ManagedMapPut puts the key and value bytes stored at those respective handles in the map. From
+// FixAuditChangesV6 it charges, bounded and before either is cloned, DataCopyPerByte for each byte
+// of the key and of the value, the amount it used to charge after cloning them
 func (context *managedTypesContext) ManagedMapPut(mMapHandle int32, keyHandle int32, valueHandle int32) error {
 	mMap, ok := context.managedTypesValues.mMapValues[mMapHandle]
 	if !ok {
 		return vmhost.ErrNoManagedMapUnderThisHandle
+	}
+
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
+	if fixAuditV6 {
+		// a missing key or value is not charged and is reported before either is cloned: it is the
+		// error GetBytes reports for either of them
+		keyLen := context.GetLength(keyHandle)
+		valueLen := context.GetLength(valueHandle)
+		if keyLen < 0 || valueLen < 0 {
+			return vmhost.ErrNoManagedBufferUnderThisHandle
+		}
+		err := context.ConsumeGasForByteLenBounded(uint64(keyLen) + uint64(valueLen))
+		if err != nil {
+			return err
+		}
 	}
 
 	key, err := context.GetBytes(keyHandle)
@@ -855,19 +1018,40 @@ func (context *managedTypesContext) ManagedMapPut(mMapHandle int32, keyHandle in
 	valueCopy := make([]byte, len(value))
 	copy(valueCopy, value)
 
-	context.ConsumeGasForBytes(key)
-	context.ConsumeGasForBytes(value)
+	if !fixAuditV6 {
+		context.ConsumeGasForBytes(key)
+		context.ConsumeGasForBytes(value)
+	}
 
 	mMap[string(key)] = valueCopy
 
 	return nil
 }
 
-// ManagedMapGet gets the bytes stored as the key handle in an output value handle
+// ManagedMapGet gets the bytes stored as the key handle in an output value handle. From
+// FixAuditChangesV6 it charges, bounded, DataCopyPerByte for each byte of the key before cloning it,
+// which it did not charge before, and for each byte of the value before writing it
 func (context *managedTypesContext) ManagedMapGet(mMapHandle int32, keyHandle int32, outValueHandle int32) error {
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
+	if fixAuditV6 {
+		err := context.consumeGasForManagedMapKeyBounded(mMapHandle, keyHandle)
+		if err != nil {
+			return err
+		}
+	}
+
 	_, _, value, _, err := context.getKeyValueFromManagedMap(mMapHandle, keyHandle)
 	if err != nil {
 		return err
+	}
+
+	if fixAuditV6 {
+		err = context.ConsumeGasForByteLenBounded(uint64(len(value)))
+		if err != nil {
+			return err
+		}
+		context.SetBytes(outValueHandle, value)
+		return nil
 	}
 
 	context.SetBytes(outValueHandle, value)
@@ -876,11 +1060,32 @@ func (context *managedTypesContext) ManagedMapGet(mMapHandle int32, keyHandle in
 	return nil
 }
 
-// ManagedMapRemove removes the bytes stored as the key handle and returns it in an output value handle
+// ManagedMapRemove removes the bytes stored as the key handle and returns it in an output value
+// handle. From FixAuditChangesV6 it charges, bounded, DataCopyPerByte for each byte of the key
+// before cloning it and for each byte of the value before writing it, the amounts it used to charge
+// after both
 func (context *managedTypesContext) ManagedMapRemove(mMapHandle int32, keyHandle int32, outValueHandle int32) error {
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
+	if fixAuditV6 {
+		err := context.consumeGasForManagedMapKeyBounded(mMapHandle, keyHandle)
+		if err != nil {
+			return err
+		}
+	}
+
 	mMap, key, value, _, err := context.getKeyValueFromManagedMap(mMapHandle, keyHandle)
 	if err != nil {
 		return err
+	}
+
+	if fixAuditV6 {
+		err = context.ConsumeGasForByteLenBounded(uint64(len(value)))
+		if err != nil {
+			return err
+		}
+		context.SetBytes(outValueHandle, value)
+		delete(mMap, string(key))
+		return nil
 	}
 
 	context.SetBytes(outValueHandle, value)
@@ -891,14 +1096,36 @@ func (context *managedTypesContext) ManagedMapRemove(mMapHandle int32, keyHandle
 	return nil
 }
 
-// ManagedMapContains checks if the managed map contains the given key
+// ManagedMapContains checks if the managed map contains the given key. From FixAuditChangesV6 it
+// charges, bounded and before the key is cloned, DataCopyPerByte for each byte of the key
 func (context *managedTypesContext) ManagedMapContains(mMapHandle int32, keyHandle int32) (bool, error) {
+	if context.host.ForkController().FixAuditChangesV6() {
+		err := context.consumeGasForManagedMapKeyBounded(mMapHandle, keyHandle)
+		if err != nil {
+			return false, err
+		}
+	}
+
 	_, _, value, foundValue, err := context.getKeyValueFromManagedMap(mMapHandle, keyHandle)
 	if err != nil {
 		return false, err
 	}
 
 	return foundValue && len(value) > 0, nil
+}
+
+// consumeGasForManagedMapKeyBounded charges, bounded, DataCopyPerByte for each byte of the key a map
+// lookup is about to clone. An unknown map or a missing key is not charged, so that
+// getKeyValueFromManagedMap reports them as before, the map first
+func (context *managedTypesContext) consumeGasForManagedMapKeyBounded(mMapHandle int32, keyHandle int32) error {
+	if _, ok := context.managedTypesValues.mMapValues[mMapHandle]; !ok {
+		return nil
+	}
+	keyLen := context.GetLength(keyHandle)
+	if keyLen < 0 {
+		return nil
+	}
+	return context.ConsumeGasForByteLenBounded(uint64(keyLen))
 }
 
 func (context *managedTypesContext) getKeyValueFromManagedMap(mMapHandle int32, keyHandle int32) (map[string][]byte, []byte, []byte, bool, error) {

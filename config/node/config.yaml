@@ -1,11 +1,6 @@
 p2p:
   node:
     port: 37373-38383
-    seed:
-    # legacySeed enables the frozen Go 1.18 PRNG for deterministic peer ID generation.
-    # Set to true only for nodes with p2p.node.seed configured that need to preserve
-    # their original peer ID from builds compiled with Go 1.18.
-    legacySeed: false
     maximumExpectedPeerCount: 0
     thresholdMinConnectedPeers: 0
     broadcastIP:
@@ -13,8 +8,10 @@ p2p:
     enabled: true
     refreshIntervalInSec: 10
     protocolID: /klv/kad/0.0.1
-    initialPeerList:
-      - /ip4/127.0.0.1/tcp/37373/p2p/16Uiu2HAmLnwsbHvKiBrxKF1d4Zr1KCqfQ115C4FmarTuvsVWubAz
+    # Seednode addresses in the form /ip4/<ip>/tcp/<port>/p2p/<peerID>. For a local seednode
+    # (`make seednode`), copy the peer ID it logs on startup (also the label of its
+    # ./config/p2pKey.pem), e.g. /ip4/127.0.0.1/tcp/37373/p2p/<peerID>.
+    initialPeerList: []
     bucketSize: 100
     routingTableRefreshIntervalInSec: 300
   sharding:
@@ -91,6 +88,9 @@ preferences:
   identity:
   # RedundancyLevel represents the level of redundancy used by the node (-1 = disabled, 0 = main instance (default),
   # 1 = first backup, 2 = second backup, etc.)
+  # Main and backup machines must never share a p2p key file (--p2p-key-pem-file): a backup with the main machine's
+  # peer ID cannot see the main as active and starts signing with the same validator key. Do not copy p2pKey.pem
+  # along with validatorKey.pem. A backup ignores the default key path and loads one only when --p2p-key-pem-file is set.
   redundancyLevel: 0
   # statics pooling interval
   statusPollingIntervalSec: 2

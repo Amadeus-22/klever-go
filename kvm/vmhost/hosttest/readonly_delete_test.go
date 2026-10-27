@@ -70,7 +70,7 @@ func Test_ReadOnly_DoesNotCommitDelete(t *testing.T) {
 
 						destHandle := managed.NewManagedBufferFromBytes(targetAddress)
 						argsHandle := managed.NewManagedBuffer()
-						managed.WriteManagedVecOfManagedBuffers(nil, argsHandle)
+						require.NoError(t, managed.WriteManagedVecOfManagedBuffers(nil, argsHandle))
 
 						vmhooks.ManagedDeleteContractWithHost(host, destHandle, 100000, argsHandle)
 						return childInstance
@@ -195,7 +195,7 @@ func Test_ReadOnly_DeleteCommitted_PreFork(t *testing.T) {
 
 						destHandle := managed.NewManagedBufferFromBytes(targetAddress)
 						argsHandle := managed.NewManagedBuffer()
-						managed.WriteManagedVecOfManagedBuffers(nil, argsHandle)
+						require.NoError(t, managed.WriteManagedVecOfManagedBuffers(nil, argsHandle))
 
 						vmhooks.ManagedDeleteContractWithHost(host, destHandle, 100000, argsHandle)
 						return childInstance

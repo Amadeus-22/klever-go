@@ -38,7 +38,10 @@ func TestVmHost_WaitExecutionWithDeterministicCompletion_TimeoutWhileExecutionIn
 
 	timeoutStarted := make(chan struct{})
 	runtimeCtx := &contextmock.RuntimeContextMock{
-		FailExecutionCalled: func(error) { close(timeoutStarted) },
+		RequestTimeoutInterruptionCalled: func() { close(timeoutStarted) },
+		// FailExecution writes the VM output and runtime errors the execution
+		// goroutine still owns, so the timeout path must not call it.
+		FailExecutionCalled: func(error) { t.Errorf("timeout path must not call FailExecution") },
 	}
 	host := &vmHost{runtimeContext: runtimeCtx}
 
@@ -54,7 +57,6 @@ func TestVmHost_WaitExecutionWithDeterministicCompletion_TimeoutWhileExecutionIn
 
 	err := host.waitExecutionWithDeterministicCompletion(ctx, cancelHook, done)
 	require.Equal(t, vmhost.ErrExecutionFailedWithTimeout, err)
-	require.Equal(t, vmhost.ErrExecutionFailedWithTimeout, runtimeCtx.FailExecutionErr)
 
 	select {
 	case <-done:

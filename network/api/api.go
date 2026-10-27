@@ -258,6 +258,9 @@ func registerLoggerWsRoute(
 	// origin at will on cached credentials, and on an unsecured /log a bare GET does the same.
 	// One budget for the route, as /subscribe has: one line per window with the count.
 	upgradeFailWarn := clientSocket.NewDropWarner(clientSocket.PeerDrivenLogWindow)
+	// A panic in the stream is just as peer-driven on an unsecured /log: its own budget, so a
+	// reproducible one buys a line per window rather than a stack trace per reconnect.
+	streamPanicWarn := clientSocket.NewDropWarner(clientSocket.PeerDrivenLogWindow)
 
 	// Only an authenticated (secured) /log may apply a client-supplied logger profile to the
 	// process-global logger; on an unauthenticated /log profiles are ignored (GHSA-9v8p-frvj-2pcm).
@@ -289,7 +292,7 @@ func registerLoggerWsRoute(
 
 		// Streaming no longer runs on the request goroutine, so gin.Recovery() no longer
 		// contains it; SafeGo does, and release() runs on the unwind.
-		shared.SafeGo(log, "/log stream", conn, func() {
+		shared.SafeGo(log, "/log stream", conn, streamPanicWarn, func() {
 			defer release()
 			ls.StartSendingBlocking()
 		})

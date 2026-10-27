@@ -58,7 +58,7 @@ func createArgs() transaction.ArgsNewSimulateTxProcessor {
 		KAppsController: &mock.KappsControllerMock{},
 		PubkeyConv:      &mock.PubkeyConverterMock{},
 		ScProcessor:     scProcessor,
-		EconomicsFee:    &mock.EconomicsHandlerStub{},
+		EconomicsFee:    &mock.EconomicsHandlerStub{MaxGasLimitPerTxValue: 1500000000},
 		ForkController:  &mock.ForkControllerStub{},
 		VMOutputCacher:  vmOutputCacher,
 	}
@@ -189,6 +189,17 @@ func TestProcessTransaction(t *testing.T) {
 		}
 		err := txProc.ProcessTransaction(tx)
 		assert.Equal(t, process.ErrSmartContractFailMaxContracts, err)
+	})
+
+	t.Run("Proposal controller not wired in yet", func(t *testing.T) {
+		args := createArgs()
+		args.EconomicsFee = &mock.EconomicsHandlerStub{
+			IsProposalControllerSetCalled: func() bool { return false },
+		}
+		txProc, _ := transaction.NewSimulateTxProcessorExportTest(args)
+
+		err := txProc.ProcessTransaction(createBaseTx())
+		assert.Equal(t, process.ErrProposalNotInitialized, err)
 	})
 
 	t.Run("Invalid Hasher", func(t *testing.T) {

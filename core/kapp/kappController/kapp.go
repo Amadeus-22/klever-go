@@ -2,6 +2,7 @@ package kappcontroller
 
 import (
 	logger "github.com/klever-io/klever-go-logger"
+	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
 	"github.com/klever-io/klever-go/core/kapp/factory"
@@ -9,6 +10,7 @@ import (
 	"github.com/klever-io/klever-go/crypto/hashing"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/kapps"
+	"github.com/klever-io/klever-go/tools/check"
 	"github.com/klever-io/klever-go/tools/marshal"
 )
 
@@ -41,7 +43,7 @@ type kApp struct {
 	proposalKapp       kapp.ProposalKapp
 	forkController     core.ForkController
 	currentKAppContext kapp.KappContext
-	proposalController kapps.ActiveProposalController
+	proposalController kapps.ProposalControllerHolder
 	readOnly           bool
 
 	container map[string]KleverKApp
@@ -189,7 +191,7 @@ func (k *kApp) InitKApps(accCacher state.AccountsCacher) error {
 	// (e.g. the VM query controller in cmd/node/sc.go) would otherwise be left
 	// with a nil ActiveProposalController. Shared-instance callers overwrite
 	// this later via SetProposalController.
-	k.proposalController = proposalController
+	k.proposalController.Set(proposalController)
 
 	// persist the proposal kapp to update the active proposals
 	// must use UpdateKapp as accCacher fork may not be available at the time
@@ -261,11 +263,17 @@ func (k *kApp) GetCurrentKAppContext() kapp.KappContext {
 }
 
 func (k *kApp) GetProposalController() kapps.ActiveProposalController {
-	return k.proposalController
+	return k.proposalController.Get()
 }
 
 func (k *kApp) SetProposalController(proposalController kapps.ActiveProposalController) error {
-	k.proposalController = proposalController
+	// the kapp handlers read the controller without a nil check, so storing nil
+	// here would panic on the next freeze, mint or proposal transaction
+	if check.IfNil(proposalController) {
+		return common.ErrNilProposalController
+	}
+
+	k.proposalController.Set(proposalController)
 
 	return nil
 }

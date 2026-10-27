@@ -114,6 +114,15 @@ var ErrNilBlockPool = errors.New("nil block pool")
 // ErrNilTxHash signals that an operation has been attempted with a nil hash
 var ErrNilTxHash = errors.New("nil transaction hash")
 
+// ErrInvalidTxHashLength signals that a transaction hash does not have the hasher size
+var ErrInvalidTxHashLength = errors.New("invalid transaction hash length")
+
+// ErrBlockBodyNotMatchingHeader signals that a block's transaction list does not match its signed header
+var ErrBlockBodyNotMatchingHeader = errors.New("block body does not match header")
+
+// ErrBlockExecutionNotMatchingHeader signals that executing a block did not reproduce the fees or state roots in its signed header
+var ErrBlockExecutionNotMatchingHeader = errors.New("block execution does not match header")
+
 // ErrInvalidRcvAddr signals that an invalid receiver address was provided
 var ErrInvalidRcvAddr = errors.New("invalid receiver address")
 
@@ -253,6 +262,12 @@ var ErrNilTransactionVersionChecker = errors.New("nil transaction version checke
 var ErrNilForkController = errors.New("nil fork controller")
 
 var ErrStoreProtectedKey = errors.New("cannot persist storage update to protected key")
+
+// ErrStorageKeyTooLong signals a storage update whose key exceeds common.MaxStorageKeyLength
+var ErrStorageKeyTooLong = errors.New("cannot persist storage update with a key longer than the maximum storage key length")
+
+// ErrInvalidOutputAccountAddressLength signals a VM output account whose address length is not the public key length
+var ErrInvalidOutputAccountAddressLength = errors.New("cannot persist output account with an invalid address length")
 
 // ErrNilAddressContainer signals that an operation has been attempted to or with a nil AddressContainer implementation
 var ErrNilAddressContainer = errors.New("nil AddressContainer")
@@ -648,6 +663,9 @@ var ErrSystemBusy = errors.New("system busy")
 // ErrInvalidMaxGasLimitPerTx signals that an invalid max gas limit per tx has been read from config file
 var ErrInvalidMaxGasLimitPerTx = errors.New("invalid max gas limit per tx")
 
+// ErrMaxGasLimitPerBlockExceeded signals that a transaction does not fit the block gas limit
+var ErrMaxGasLimitPerBlockExceeded = errors.New("max gas limit per block exceeded")
+
 // ErrInvalidNonceRequest signals that invalid nonce was requested
 var ErrInvalidNonceRequest = errors.New("invalid nonce request")
 
@@ -714,8 +732,14 @@ var ErrInvalidVMType = errors.New("invalid VM type")
 // ErrSmartContractDeploymentIsDisabled signals that smart contract deployment was disabled
 var ErrSmartContractDeploymentIsDisabled = errors.New("smart Contract deployment is disabled")
 
-// ErrUpgradeNotAllowed signals that upgrade is not allowed
-var ErrUpgradeNotAllowed = errors.New("upgrade is allowed only for owner")
+// ErrUpgradeContractNotFound signals that an upgrade targeted an account that is not a contract
+var ErrUpgradeContractNotFound = errors.New("contract not found for upgrade")
+
+// ErrUpgradeContractNotUpgradeable signals that the contract was deployed without the upgradeable flag
+var ErrUpgradeContractNotUpgradeable = errors.New("contract is not upgradeable")
+
+// ErrUpgradeCallerNotOwner signals that the upgrade caller is not the contract owner
+var ErrUpgradeCallerNotOwner = errors.New("upgrade caller is not the contract owner")
 
 // ErrEmptyConsensusGroup is raised when an operation is attempted with an empty consensus group
 var ErrEmptyConsensusGroup = errors.New("consensusGroup is empty")

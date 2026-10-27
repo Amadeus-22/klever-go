@@ -42,3 +42,8 @@ func (txls *TxLogsProcessorStub) IsInterfaceNil() bool {
 func (txls *TxLogsProcessorStub) GetAllCurrentLogs() []*data.LogData {
 	return nil
 }
+
+// SaveLogsToStorage -
+func (txls *TxLogsProcessorStub) SaveLogsToStorage() error {
+	return nil
+}

@@ -19,9 +19,18 @@ type ElasticProcessorStub struct {
 	RemoveAccountsHistoryCalled        func(blockTimestamp int64) error
 	RevertAccountBalancesCalled        func(blockTimestamp int64) error
 	SaveTransactionsCalled             func(header nodeData.HeaderHandler, pool *indexer.Pool, prepared any) error
+	PrepareBlockDataCalled             func(header nodeData.HeaderHandler, pool *indexer.Pool, prepared any) (*data.PreparedBlockData, error)
 	SaveAccountsCalled                 func(timestamp int64, acc []*data.Account) error
 	SavePeerAccountCalled              func(account *data.ValidatorAccountInfo) error
 	UpdateProposalsAndParametersCalled func([]string) error
+}
+
+// PrepareBlockData -
+func (eim *ElasticProcessorStub) PrepareBlockData(header nodeData.HeaderHandler, pool *indexer.Pool, prepared any) (*data.PreparedBlockData, error) {
+	if eim.PrepareBlockDataCalled != nil {
+		return eim.PrepareBlockDataCalled(header, pool, prepared)
+	}
+	return nil, nil
 }
 
 // SaveHeader -

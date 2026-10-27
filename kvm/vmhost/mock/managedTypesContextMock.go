@@ -21,6 +21,7 @@ type ManagedTypesContextMock struct {
 	GetRandReaderCalled                            func() io.Reader
 	ConsumeGasForThisBigIntNumberOfBytesCalled     func(byteLen *big.Int) error
 	ConsumeGasForThisIntNumberOfBytesCalled        func(byteLen int)
+	ConsumeGasForThisIntNumberOfBytesBoundedCalled func(byteLen int64) error
 	ConsumeGasForBytesCalled                       func(bytes []byte)
 	ConsumeGasForByteLenBoundedCalled              func(byteLen uint64) error
 	ConsumeGasForAppendCalled                      func(mBufferHandle int32, dataLength int32) error
@@ -36,6 +37,7 @@ type ManagedTypesContextMock struct {
 	BigFloatExpIsNotValidCalled                    func(exponent int) bool
 	BigFloatIsNotCanonicalCalled                   func(bigFloat *big.Float) bool
 	EncodedBigFloatIsNotValidCalled                func(encodedBigFloat []byte) bool
+	EncodedBigFloatLenIsNotValidCalled             func(length int32) bool
 	GetBigFloatOrCreateCalled                      func(handle int32) (*big.Float, error)
 	GetBigFloatCalled                              func(handle int32) (*big.Float, error)
 	GetTwoBigFloatsCalled                          func(handle1 int32, handle2 int32) (*big.Float, *big.Float, error)
@@ -57,7 +59,7 @@ type ManagedTypesContextMock struct {
 	DeleteSliceCalled                              func(mBufferHandle int32, startPosition int32, lengthOfSlice int32) ([]byte, error)
 	InsertSliceCalled                              func(mBufferHandle int32, startPosition int32, slice []byte) ([]byte, error)
 	ReadManagedVecOfManagedBuffersCalled           func(managedVecHandle int32) ([][]byte, uint64, error)
-	WriteManagedVecOfManagedBuffersCalled          func(data [][]byte, destinationHandle int32)
+	WriteManagedVecOfManagedBuffersCalled          func(data [][]byte, destinationHandle int32) error
 	NewManagedMapCalled                            func() int32
 	ManagedMapPutCalled                            func(mMapHandle int32, keyHandle int32, valueHandle int32) error
 	ManagedMapGetCalled                            func(mMapHandle int32, keyHandle int32, outValueHandle int32) error
@@ -119,6 +121,13 @@ func (m *ManagedTypesContextMock) ConsumeGasForThisIntNumberOfBytes(byteLen int)
 	if m.ConsumeGasForThisIntNumberOfBytesCalled != nil {
 		m.ConsumeGasForThisIntNumberOfBytesCalled(byteLen)
 	}
+}
+
+func (m *ManagedTypesContextMock) ConsumeGasForThisIntNumberOfBytesBounded(byteLen int64) error {
+	if m.ConsumeGasForThisIntNumberOfBytesBoundedCalled != nil {
+		return m.ConsumeGasForThisIntNumberOfBytesBoundedCalled(byteLen)
+	}
+	return nil
 }
 
 func (m *ManagedTypesContextMock) ConsumeGasForBytes(bytes []byte) {
@@ -219,6 +228,13 @@ func (m *ManagedTypesContextMock) BigFloatIsNotCanonical(bigFloat *big.Float) bo
 func (m *ManagedTypesContextMock) EncodedBigFloatIsNotValid(encodedBigFloat []byte) bool {
 	if m.EncodedBigFloatIsNotValidCalled != nil {
 		return m.EncodedBigFloatIsNotValidCalled(encodedBigFloat)
+	}
+	return false
+}
+
+func (m *ManagedTypesContextMock) EncodedBigFloatLenIsNotValid(length int32) bool {
+	if m.EncodedBigFloatLenIsNotValidCalled != nil {
+		return m.EncodedBigFloatLenIsNotValidCalled(length)
 	}
 	return false
 }
@@ -369,10 +385,11 @@ func (m *ManagedTypesContextMock) ReadManagedVecOfManagedBuffers(managedVecHandl
 	return nil, 0, nil
 }
 
-func (m *ManagedTypesContextMock) WriteManagedVecOfManagedBuffers(data [][]byte, destinationHandle int32) {
+func (m *ManagedTypesContextMock) WriteManagedVecOfManagedBuffers(data [][]byte, destinationHandle int32) error {
 	if m.WriteManagedVecOfManagedBuffersCalled != nil {
-		m.WriteManagedVecOfManagedBuffersCalled(data, destinationHandle)
+		return m.WriteManagedVecOfManagedBuffersCalled(data, destinationHandle)
 	}
+	return nil
 }
 
 func (m *ManagedTypesContextMock) NewManagedMap() int32 {

@@ -746,7 +746,7 @@ func WithProposalController(controller kapps.ActiveProposalController) Option {
 			return common.ErrNilProposalController
 		}
 
-		n.proposalController = controller
+		n.proposalController.Set(controller)
 
 		return nil
 	}

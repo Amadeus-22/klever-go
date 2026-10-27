@@ -22,12 +22,7 @@ var expectedPattern = []byte{
 }
 
 func (kda *KDAData) IsTransferAllowed(sender []byte, destination []byte) bool {
-	if !kda.Properties.LimitTransfer {
-		return true
-	}
-
-	senderRoles, err := kda.GetRoleByAddress(sender)
-	if err == nil && senderRoles.HasRoleTransfer {
+	if kda.CanSenderTransfer(sender) {
 		return true
 	}
 
@@ -39,9 +34,33 @@ func (kda *KDAData) IsTransferAllowed(sender []byte, destination []byte) bool {
 	return false
 }
 
+// CanSenderTransfer reports whether sender may move the asset to any destination: always when the
+// asset does not limit transfers, otherwise only with the transfer role (the owner and admin hold it).
+func (kda *KDAData) CanSenderTransfer(sender []byte) bool {
+	if !kda.GetProperties().GetLimitTransfer() {
+		return true
+	}
+
+	senderRoles, err := kda.GetRoleByAddress(sender)
+
+	return err == nil && senderRoles.HasRoleTransfer
+}
+
+func MatchesAddress(expected []byte, address []byte) bool {
+	return len(address) > 0 && bytes.Equal(expected, address)
+}
+
+func (kda *KDAData) IsOwner(address []byte) bool {
+	return MatchesAddress(kda.OwnerAddress, address)
+}
+
+func (kda *KDAData) IsOwnerOrAdmin(address []byte) bool {
+	return kda.IsOwner(address) || MatchesAddress(kda.AdminAddress, address)
+}
+
 // GetRoleByAddress return the role of the given address into the kda or error if doesnt exist
 func (kda *KDAData) GetRoleByAddress(address []byte) (*RolesData, error) {
-	if bytes.Equal(kda.OwnerAddress, address) || bytes.Equal(kda.AdminAddress, address) {
+	if kda.IsOwnerOrAdmin(address) {
 		return &RolesData{
 			Address:             address,
 			HasRoleMint:         true,

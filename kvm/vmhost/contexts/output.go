@@ -165,12 +165,20 @@ func (context *outputContext) popCodeUpdatesState() map[string]struct{} {
 // nothing was executed before. Required for ExecuteOnDestContext().
 // StorageUpdates are not deleted from context.outputState.OutputAccounts,
 // preserving the storage cache.
+// From FixAuditChangesV6, DeletedAccounts is cleared too, so the nested call
+// carries only its own deletions. The parent's list survives on the state
+// stack: PopMergeActiveState merges it back and PopSetActiveState restores it.
+// Before the fork the child inherits the list, so pre-activation blocks replay
+// unchanged.
 func (context *outputContext) CensorVMOutput() {
 	context.outputState.ReturnData = make([][]byte, 0)
 	context.outputState.ReturnCode = vmcommon.Ok
 	context.outputState.ReturnMessage = ""
 	context.outputState.GasRemaining = 0
 	context.outputState.Logs = make([]*vmcommon.LogEntry, 0)
+	if context.host.ForkController().FixAuditChangesV6() {
+		context.outputState.DeletedAccounts = make([][]byte, 0)
+	}
 
 	for _, account := range context.outputState.OutputAccounts {
 		account.OutputTransfers = append(
@@ -364,12 +372,19 @@ func (context *outputContext) TransferValueOnly(destination []byte, sender []byt
 	_, _ = context.GetOutputAccount(sender)
 	// add output transfer to destination account
 	destinationAccount, _ := context.GetOutputAccount(destination)
+	recordedValue := value
+	if context.host.ForkController().FixAuditChangesV6() {
+		// value can be the caller's own managed big int, which FixAuditChangesV6 hands back to the
+		// caller after a nested call instead of a clone (KLC-2678); record the amount transferred,
+		// not a pointer the caller could later rewrite into a forged back-transfer
+		recordedValue = big.NewInt(0).Set(value)
+	}
 	outputTransfer := vmcommon.OutputTransfer{
 		Index:         context.NextOutputTransferIndex(),
 		SenderAddress: sender,
 		RcvAddr:       destination,
 		KDATransfers: vmcommon.KDATransfer{
-			KDAValue:     value,
+			KDAValue:     recordedValue,
 			KDATokenName: kdautils.KLVIdentifier,
 		},
 	}

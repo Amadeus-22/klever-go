@@ -62,8 +62,22 @@ func checkIndexerArgs(arguments ArgDataIndexer) error {
 	return nil
 }
 
-// SaveBlock saves the block info in the queue to be sent to elastic
+// SaveBlock saves the block info in the queue to be sent to elastic.
+//
+// The account documents are resolved here rather than on the worker: this runs on the
+// commit goroutine, where the live state adapter still holds this block's committed
+// state. The worker drains the queue later, so resolving there records whatever block
+// has committed since under this block's timestamp (KLR-68).
 func (di *dataIndexer) SaveBlock(args *indexer.ArgsSaveBlockData) {
+	prepared, err := di.elasticProcessor.PrepareBlockData(args.Header, args.TransactionsPool, args.Prepared)
+	if err != nil {
+		log.Error("dataIndexer.SaveBlock: cannot resolve account documents, indexing block without the failed ones",
+			"nonce", args.Header.GetNonce(), "error", err)
+	}
+	if prepared != nil {
+		args.Prepared = prepared
+	}
+
 	wi := workItems.NewItemBlock(
 		di.elasticProcessor,
 		di.marshalizer,

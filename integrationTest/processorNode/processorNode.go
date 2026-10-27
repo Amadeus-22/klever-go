@@ -81,6 +81,7 @@ import (
 	"github.com/klever-io/klever-go/kapps"
 	"github.com/klever-io/klever-go/network/p2p"
 	"github.com/klever-io/klever-go/network/p2p/libp2p"
+	"github.com/klever-io/klever-go/network/p2p/libp2p/p2pkey"
 	"github.com/klever-io/klever-go/node"
 	"github.com/klever-io/klever-go/node/nodeDebugFactory"
 	"github.com/klever-io/klever-go/ntp"
@@ -1132,11 +1133,6 @@ func (n *ProcessorNode) initBlockProcessor() error {
 		return err
 	}
 
-	err = n.TxProcessor.SetProposalController(n.ProposalController)
-	if err != nil {
-		return err
-	}
-
 	err = n.FeeHandler.SetProposalController(n.ProposalController)
 	if err != nil {
 		return err
@@ -1195,11 +1191,17 @@ func createKeyGenMock() crypto.KeyGenerator {
 }
 
 func CreateMessengerFromP2P(p2pConfig config.P2PConfig) (p2p.Messenger, error) {
+	p2pPrivateKey, err := p2pkey.Generate()
+	if err != nil {
+		return nil, err
+	}
+
 	arg := libp2p.ArgsNetworkMessenger{
 		Marshalizer:   getMarshalizer(),
 		ListenAddress: libp2p.ListenLocalhostAddrWithIp4AndTcp,
 		P2pConfig:     p2pConfig,
 		SyncTimer:     &libp2p.LocalSyncTimer{},
+		P2pPrivateKey: p2pPrivateKey,
 	}
 
 	return libp2p.NewNetworkMessenger(arg)
@@ -1771,7 +1773,6 @@ func CreateP2PConfigWithNoDiscovery() config.P2PConfig {
 	return config.P2PConfig{
 		Node: config.NodeConfig{
 			Port: "0",
-			Seed: "",
 		},
 		KadDhtPeerDiscovery: config.KadDhtPeerDiscoveryConfig{
 			Enabled: false,

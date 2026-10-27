@@ -141,22 +141,24 @@ func (mp *metaProcessor) ProcessBlock(
 	// fails after this point, the deferred handler restores them so a rejected
 	// (e.g. future-epoch) block cannot leave the node in a mutated, future-epoch
 	// state.
-	prevEpoch := mp.epochNotifier.CurrentEpoch()
 	prevCurrentHeader := mp.blockChain.GetCurrentBlockHeader()
+	prevEpoch := epochToRestore(mp.epochNotifier.CurrentEpoch(), prevCurrentHeader)
 	restoreEpochTrigger := snapshotEpochTrigger(mp.epochStartTrigger)
 
 	// Only the epoch start branch settles proposals, so only it can move the
 	// in-memory proposal parameters.
 	var restoreProposalParameters func()
 	if header.GetIsEpochStart() {
-		restoreProposalParameters = snapshotProposalParameters(mp.proposalController)
+		restoreProposalParameters = snapshotProposalParameters(mp.proposalController.Get())
 	}
 
 	defer func() {
 		if err != nil {
 			log.Error("ProcessBlock revert: ", "error", err.Error())
-			mp.RevertStateToSnapshot(header)
+			// fork flags first: the revert reloads the proposal parameters and backfills
+			// the defaults of every fork active at the restored epoch, not the rejected one
 			mp.restoreEpochState(prevEpoch, prevCurrentHeader, restoreEpochTrigger)
+			mp.RevertStateToSnapshot(header)
 
 			if restoreProposalParameters != nil {
 				restoreProposalParameters()
@@ -316,7 +318,7 @@ func (mp *metaProcessor) handleEpochStartBlock(header *block.Block) error {
 func (mp *metaProcessor) verifyBlockTrieRoots(header *block.Block) error {
 	if !mp.verifyStateRootAccount(header.GetTrieRoot()) {
 		log.Debug("processBlock.verifyStateRootAccount", "blockTrieRoot", logger.DisplayByteSlice(header.GetTrieRoot()))
-		err := process.ErrRootStateDoesNotMatch
+		err := process.WrapBlockExecutionNotMatchingHeader(process.ErrRootStateDoesNotMatch)
 		_ = bugsnag.Notify(fmt.Errorf("process account state: %w", err), bugsnag.MetaData{"data": {"header": header}})
 		return err
 	}
@@ -461,11 +463,11 @@ func (mp *metaProcessor) verifyKAppRootHash(header *block.Block) error {
 
 	if !mp.verifyStateRootKApp(header.GetKAppsTrieRoot()) {
 		log.Debug("kApp root hash mismatch", "received", header.GetKAppsTrieRoot())
-		return fmt.Errorf("%s, received: %s, meta header nonce: %d",
+		return process.WrapBlockExecutionNotMatchingHeader(fmt.Errorf("%w, received: %s, meta header nonce: %d",
 			process.ErrRootStateDoesNotMatch,
 			logger.DisplayByteSlice(header.GetKAppsTrieRoot()),
 			header.Header.Nonce,
-		)
+		))
 	}
 
 	return nil
@@ -487,7 +489,7 @@ func (mp *metaProcessor) verifyValidatorStatisticsRootHash(header *block.Block) 
 			"computed", validatorStatsRH,
 			"received", header.GetValidatorsTrieRoot(),
 		)
-		return fmt.Errorf("%s, metachain, computed: %s, received: %s, meta header nonce: %d",
+		return fmt.Errorf("%w, metachain, computed: %s, received: %s, meta header nonce: %d",
 			process.ErrValidatorStatsRootHashDoesNotMatch,
 			logger.DisplayByteSlice(validatorStatsRH),
 			logger.DisplayByteSlice(header.GetValidatorsTrieRoot()),
@@ -570,34 +572,18 @@ func snapshotEpochTrigger(trigger process.EpochStartTriggerHandler) func() {
 // later in the same baseProcessEpochStartBlock run. Holding it back would change
 // how many FPR buckets are rolled and burned, which moves the KApp trie root.
 // So the write stays where it is and is undone on failure instead.
+//
+// Both the snapshot and the restore go through the controller so they are
+// serialized against the API and fee readers on other goroutines.
 func snapshotProposalParameters(controller kapps.ActiveProposalController) func() {
 	if check.IfNil(controller) {
 		return nil
 	}
 
-	live := controller.GetActiveParameters()
-	snapshot := make(map[int32]*kapps.Parameter, len(live))
-	for key, param := range live {
-		if param == nil {
-			continue
-		}
-
-		value := make([]byte, len(param.Value))
-		copy(value, param.Value)
-		snapshot[key] = &kapps.Parameter{Type: param.Type, Value: value}
-	}
+	snapshot := controller.GetActiveParameters()
 
 	return func() {
-		live := controller.GetActiveParameters()
-		// UpdateParameters only overwrites and adds, so parameters a settled
-		// proposal introduced have to be dropped before merging the snapshot back.
-		for key := range live {
-			if _, ok := snapshot[key]; !ok {
-				delete(live, key)
-			}
-		}
-
-		controller.UpdateParameters(snapshot)
+		controller.RestoreParameters(snapshot)
 	}
 }
 
@@ -620,6 +606,20 @@ func (mp *metaProcessor) restoreEpochState(
 	if restoreEpochTrigger != nil {
 		restoreEpochTrigger()
 	}
+}
+
+// epochToRestore is the epoch a rejected block returns the fork flags to. The notifier holds 0
+// from a start until the first block advances it, while the committed head is already in a later
+// epoch: restoring 0 there switches every fork off, and the revert then reloads the proposal
+// parameters with the defaults of no fork, dropping the ones the trie never held (GasMultiplier,
+// MaxGasPerTX), so every contract call gets 0 gas on each retry of the block. The head is the
+// state the revert goes back to, so its epoch wins whenever the notifier lags behind it.
+func epochToRestore(notifierEpoch uint32, head data.HeaderHandler) uint32 {
+	if check.IfNil(head) || head.GetEpoch() <= notifierEpoch {
+		return notifierEpoch
+	}
+
+	return head.GetEpoch()
 }
 
 // CreateBlock creates the final block and header for the current slot
@@ -797,6 +797,13 @@ func (mp *metaProcessor) CommitBlock(
 	mp.saveHeader(header, headerHash, marshalizedBlock)
 
 	mp.saveBody(header)
+
+	// SC logs are cached during execution and persisted only once the block has
+	// passed validation. Not critical: a missing log costs an API detail, never state.
+	errNotCriticalLogs := mp.txCoordinator.SaveLogsToStorage()
+	if errNotCriticalLogs != nil {
+		log.Debug("txCoordinator.SaveLogsToStorage", "error", errNotCriticalLogs.Error())
+	}
 
 	err = mp.commitAll()
 	if err != nil {
@@ -999,6 +1006,44 @@ func (mp *metaProcessor) RevertStateToBlock(header data.HeaderHandler) error {
 		return err
 	}
 
+	return mp.reloadProposalParameters()
+}
+
+// RevertStateToSnapshot reverts the accounts, then reloads the proposal parameters from
+// the reverted KApp trie.
+func (mp *metaProcessor) RevertStateToSnapshot(header data.HeaderHandler) {
+	mp.baseProcessor.RevertStateToSnapshot(header)
+
+	err := mp.reloadProposalParameters()
+	if err != nil {
+		// the live set no longer matches the committed state, and fees are computed from it
+		log.Error("RevertStateToSnapshot: reload proposal parameters", "error", err.Error())
+	}
+}
+
+// reloadProposalParameters replaces the live parameter set with the one in the KApp trie,
+// which no accounts snapshot covers. It merges the defaults of the active forks, so restore
+// the fork flags first (KLC-2814).
+func (mp *metaProcessor) reloadProposalParameters() error {
+	live := mp.proposalController.Get()
+	if check.IfNil(live) {
+		// storage bootstrap reverts before the node publishes the controller
+		return nil
+	}
+
+	_, current, err := mp.loadProposalController()
+	if errors.Is(err, common.ErrNilTrie) {
+		// genesis holds no proposal KApp: startup writes it and block 1 commits it, so a
+		// revert to genesis starts from the defaults, as StartProposalsKApp does
+		current, err = &kapps.ProposalController{}, nil
+	}
+	if err != nil {
+		return err
+	}
+
+	mergeInitialParameters(current, mp.forkController)
+	live.RestoreParameters(current.ActiveParameters)
+
 	return nil
 }
 
@@ -1040,8 +1085,8 @@ func (mp *metaProcessor) applyHeader(blk *block.Block) error {
 	blk.Header.TxFees = mp.feeHandler.GetAccumulatedTxFees()
 	blk.Header.TxBurnedFees = mp.feeHandler.GetAccumulatedTxFees() - mp.validatorStatisticsProcessor.LeaderRewards(blk.GetTxFees())
 	blk.Header.KAppFees = mp.feeHandler.GetAccumulatedKAppFees()
-	blk.Header.BlockRewards = mp.proposalController.GetParameterInt(kapps.EnumParameter_BlockRewards)
-	blk.Header.StakingRewards = mp.proposalController.GetParameterInt(kapps.EnumParameter_StakingRewards)
+	blk.Header.BlockRewards = mp.proposalController.Get().GetParameterInt(kapps.EnumParameter_BlockRewards)
+	blk.Header.StakingRewards = mp.proposalController.Get().GetParameterInt(kapps.EnumParameter_StakingRewards)
 
 	sw.Start("UpdatePeerState")
 	currentBlockHeader := mp.blockChain.GetCurrentBlockHeader()
@@ -1338,10 +1383,12 @@ func (mp *metaProcessor) epochStartNativeStakingKapps(blk data.HeaderHandler) er
 		return err
 	}
 
-	maxEpochUnclaimed := mp.proposalController.GetParameterInt(kapps.EnumParameter_MaxEpochsUnclaimed)
+	maxEpochUnclaimed := mp.proposalController.Get().GetParameterInt(kapps.EnumParameter_MaxEpochsUnclaimed)
 
 	amountKLVToBurn := int64(0)
-	if len(klv.FPR) == int(maxEpochUnclaimed) {
+	if mp.forkController.FixAuditChangesV6() {
+		amountKLVToBurn = trimExpiredFPR(klv, maxEpochUnclaimed)
+	} else if len(klv.FPR) == int(maxEpochUnclaimed) {
 		amountKLVToBurn = klv.FPR[0].TotalAmount - klv.FPR[0].TotalClaimed
 
 		klv.FPR = klv.FPR[1:]
@@ -1355,7 +1402,9 @@ func (mp *metaProcessor) epochStartNativeStakingKapps(blk data.HeaderHandler) er
 	})
 
 	amountKLVToBurnKFI := int64(0)
-	if len(kfi.FPR) == int(maxEpochUnclaimed) {
+	if mp.forkController.FixAuditChangesV6() {
+		amountKLVToBurnKFI = trimExpiredFPR(kfi, maxEpochUnclaimed)
+	} else if len(kfi.FPR) == int(maxEpochUnclaimed) {
 		amountKLVToBurnKFI = kfi.FPR[0].TotalAmount - kfi.FPR[0].TotalClaimed
 
 		kfi.FPR = kfi.FPR[1:]
@@ -1384,6 +1433,23 @@ func (mp *metaProcessor) epochStartNativeStakingKapps(blk data.HeaderHandler) er
 	blk.SetBurnedUnclaimed(burned)
 
 	return mp.setNativeStakingKApps(staking, klv, kfi)
+}
+
+// trimExpiredFPR drops the oldest entries until the one about to be appended fits
+// within maxEpochUnclaimed, and returns their unclaimed remainder, which is burned.
+// It is the FixAuditChangesV6 trim: the equality check it replaces stopped matching
+// for good once a proposal lowered the parameter below the current length, so the
+// list grew by one entry per epoch and nothing was burned again. While the parameter
+// is not lowered the loop runs at most once, exactly like that check.
+func trimExpiredFPR(staking *kapps.StakingData, maxEpochUnclaimed int64) int64 {
+	amountToBurn := int64(0)
+	for len(staking.FPR) > 0 && int64(len(staking.FPR)) >= maxEpochUnclaimed {
+		amountToBurn += staking.FPR[0].TotalAmount - staking.FPR[0].TotalClaimed
+
+		staking.FPR = staking.FPR[1:]
+	}
+
+	return amountToBurn
 }
 
 // processProposalsEndOfEpoch settles the proposals active in the header's epoch
@@ -1453,11 +1519,25 @@ func (mp *metaProcessor) processSingleProposal(proposalKApp state.KAppAccountHan
 	proposal.ProposalStatus = mp.determineProposalStatus(proposal, kfi)
 	proposal.TotalStaked = kfi.TotalStaked
 
-	// Update parameters if proposal is approved
-	if proposal.ProposalStatus == kapps.ProposalData_ApprovedProposal {
-		if err := mp.updateApprovedProposalParameters(proposal, controller); err != nil {
-			return nil, err
+	if proposal.ProposalStatus != kapps.ProposalData_ApprovedProposal {
+		return proposal, nil
+	}
+
+	// Voters approved the parameters as one set, so it lands whole or not at all. Failing
+	// here would fail the epoch start block identically on every node and every retry, so
+	// from FixAuditChangesV6 a proposal holding an invalid parameter is denied instead.
+	if mp.forkController.FixAuditChangesV6() {
+		if err := mp.validateProposalParameters(proposal, controller); err != nil {
+			log.Warn("denying approved proposal with an invalid parameter",
+				"proposal", proposalID, "error", err)
+			proposal.ProposalStatus = kapps.ProposalData_DeniedProposal
+
+			return proposal, nil
 		}
+	}
+
+	if err := mp.updateApprovedProposalParameters(proposal, controller); err != nil {
+		return nil, err
 	}
 
 	return proposal, nil
@@ -1468,6 +1548,20 @@ func (mp *metaProcessor) determineProposalStatus(proposal *kapps.ProposalData, k
 		return kapps.ProposalData_ApprovedProposal
 	}
 	return kapps.ProposalData_DeniedProposal
+}
+
+// validateProposalParameters checks every parameter of proposal without applying any. Each
+// check is against constant bounds, never against another parameter or chain state, so the
+// result does not depend on map order and the apply pass that follows cannot fail.
+func (mp *metaProcessor) validateProposalParameters(proposal *kapps.ProposalData, controller *kapps.ProposalController) error {
+	for parameter, value := range proposal.Parameters {
+		_, err := controller.ParseParamAndValidate(kapps.EnumParameter(parameter), value, mp.forkController)
+		if err != nil {
+			return fmt.Errorf("%s: %w", kapps.EnumParameter(parameter), err)
+		}
+	}
+
+	return nil
 }
 
 func (mp *metaProcessor) updateApprovedProposalParameters(proposal *kapps.ProposalData, controller *kapps.ProposalController) error {
@@ -1507,7 +1601,7 @@ func (mp *metaProcessor) finalizeProposalUpdates(proposalKApp state.KAppAccountH
 	// also the one epoch start mutation that no accounts DB snapshot covers, so
 	// ProcessBlock snapshots the parameter set up front and restores it on
 	// failure (see snapshotProposalParameters).
-	mp.proposalController.UpdateParameters(controller.ActiveParameters)
+	mp.proposalController.Get().UpdateParameters(controller.ActiveParameters)
 
 	return nil
 }

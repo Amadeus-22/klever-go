@@ -145,7 +145,7 @@ trace: ## Run node in trace mode (verbose logging)
 	$(GORUN) ./cmd/node --log-level=*:TRACE,ntp:INFO,debug/p2p:INFO,state:DEBUG,trie:INFO,facade:INFO,sharding/networksharding:INFO,p2p/libp2p:INFO,basichost:INFO,dht:INFO,pubsub:INFO,heartbeat/process:INFO,statistics/machine:INFO,process/rating:INFO,consensus/chronology:INFO --use-log-view --log-save
 
 redundancy: ## Run node with redundancy for testing
-	$(GORUN) ./cmd/node --log-level="${LOG}" --redundancy-level=1 --working-directory=./db/db1  --p2p-seed=node1 --rest-api-interface=127.0.0.1:8091 --use-log-view #--log-save
+	$(GORUN) ./cmd/node --log-level="${LOG}" --redundancy-level=1 --working-directory=./db/db1  --p2p-key-pem-file=./db/db1/p2pKey.pem --rest-api-interface=127.0.0.1:8091 --use-log-view #--log-save
 
 seednode: ## Run seednode for network bootstrap
 	$(GORUN) ./cmd/seednode --log-level=*:DEBUG --rest-api-interface=8081

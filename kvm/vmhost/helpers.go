@@ -5,9 +5,11 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 
 	logger "github.com/klever-io/klever-go-logger"
 	"github.com/klever-io/klever-go/kvm/math"
+	"github.com/klever-io/klever-go/vmcommon"
 )
 
 // Zero is the big integer 0
@@ -157,4 +159,15 @@ func SliceIsOutOfBounds(fixAuditChangesV5 bool, startingPosition int32, sliceLen
 	endPosition, err := math.AddInt32WithErr(startingPosition, sliceLength)
 
 	return err != nil || int(endPosition) > bufferLength
+}
+
+// WithoutZeroValueTransfers returns the transfers that carry a non-zero value, in order, in a new
+// slice; the input is never modified. KleverTransfer settles a zero-value transfer without moving
+// anything, for any asset id or nonce, so from FixAuditChangesV6 such a transfer is not the
+// callee's call value (KLC-2830). The kept elements are the same pointers, so the built-in marking
+// them executed is still seen through the result.
+func WithoutZeroValueTransfers(transfers []*vmcommon.KDATransfer) []*vmcommon.KDATransfer {
+	return slices.DeleteFunc(slices.Clone(transfers), func(transfer *vmcommon.KDATransfer) bool {
+		return transfer.KDAValue == nil || transfer.KDAValue.Sign() == 0
+	})
 }

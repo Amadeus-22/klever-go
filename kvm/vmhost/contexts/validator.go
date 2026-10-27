@@ -110,14 +110,12 @@ func (validator *wasmValidator) verifyProtectedFunctions(instance executor.Insta
 }
 
 func (validator *wasmValidator) verifyValidFunctionName(functionName string) error {
-	const maxLengthOfFunctionName = 256
-
 	errInvalidName := fmt.Errorf("%w: %s", vmhost.ErrInvalidFunctionName, functionName)
 
 	if len(functionName) == 0 {
 		return errInvalidName
 	}
-	if len(functionName) >= maxLengthOfFunctionName {
+	if len(functionName) >= vmhost.MaxFunctionNameLength {
 		return errInvalidName
 	}
 	if isFirstCharacterNumeric(functionName) {

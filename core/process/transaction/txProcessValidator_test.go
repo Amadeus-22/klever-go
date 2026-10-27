@@ -56,6 +56,7 @@ func TestCreateValidatorTxProcessor_ShouldError(t *testing.T) {
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       []byte("invalid"),
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -74,6 +75,7 @@ func TestCreateValidatorTxProcessor_ShouldError(t *testing.T) {
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -93,6 +95,7 @@ func TestCreateValidatorTxProcessor_ShouldError(t *testing.T) {
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: -100_000_000_000_000_000,
@@ -111,6 +114,7 @@ func TestCreateValidatorTxProcessor_ShouldError(t *testing.T) {
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -137,6 +141,7 @@ func TestCreateValidatorTxProcessor_ShouldError(t *testing.T) {
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -156,6 +161,7 @@ func TestCreateValidatorTxProcessor_ShouldError(t *testing.T) {
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -193,6 +199,7 @@ func TestCreateValidatorTxProcessor_CreateTwoValidatorsWithTheSameOwner_ShouldEr
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -210,6 +217,7 @@ func TestCreateValidatorTxProcessor_CreateTwoValidatorsWithTheSameOwner_ShouldEr
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -261,6 +269,7 @@ func TestCreateValidatorTxProcessor_CreateTwoValidatorsWithTheSameBLSPubkey_Shou
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -279,6 +288,7 @@ func TestCreateValidatorTxProcessor_CreateTwoValidatorsWithTheSameBLSPubkey_Shou
 		OwnerAddress: accountForValidator,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", accountForValidator),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -314,6 +324,7 @@ func TestCreateValidatorTxProcessor_ShouldWork(t *testing.T) {
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -349,6 +360,7 @@ func TestConfigValidatorTxProcessor_ShouldError(t *testing.T) {
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -429,6 +441,7 @@ func TestConfigValidatorTxProcessor_ChangeBLSPubkeyWithoutBeenValidatorOwner_Sho
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -445,6 +458,7 @@ func TestConfigValidatorTxProcessor_ChangeBLSPubkeyWithoutBeenValidatorOwner_Sho
 	configValidatorContract := transaction.ValidatorConfigContract{
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey: newBLS,
+			BLSSignature: validBLSKeyProof("newBLS", accountForValidator),
 		},
 	}
 
@@ -495,6 +509,7 @@ func TestConfigValidatorTxProcessor_ChangeBLSPubkeyForOtherThatIsAlreadyInUse_Sh
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -513,6 +528,7 @@ func TestConfigValidatorTxProcessor_ChangeBLSPubkeyForOtherThatIsAlreadyInUse_Sh
 		OwnerAddress: accountForValidator,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress2,
+			BLSSignature:        validBLSKeyProof("peerAddress2", accountForValidator),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -530,6 +546,7 @@ func TestConfigValidatorTxProcessor_ChangeBLSPubkeyForOtherThatIsAlreadyInUse_Sh
 	configValidatorContract := transaction.ValidatorConfigContract{
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey: peerAddress2,
+			BLSSignature: validBLSKeyProof("peerAddress2", testOwnerAddress),
 		},
 	}
 
@@ -564,6 +581,7 @@ func TestConfigValidatorTxProcessor_ShouldWork(t *testing.T) {
 		OwnerAddress: testOwnerAddress,
 		Config: &transaction.ValidatorConfig{
 			BLSPublicKey:        peerAddress,
+			BLSSignature:        validBLSKeyProof("peerAddress", testOwnerAddress),
 			RewardAddress:       testReferralAddress,
 			CanDelegate:         true,
 			MaxDelegationAmount: 100_000_000_000,
@@ -581,6 +599,7 @@ func TestConfigValidatorTxProcessor_ShouldWork(t *testing.T) {
 		Config: &transaction.ValidatorConfig{
 			MaxDelegationAmount: 10,
 			BLSPublicKey:        newBLS,
+			BLSSignature:        validBLSKeyProof("newBLS", testOwnerAddress),
 			RewardAddress:       accountForValidator,
 			CanDelegate:         false,
 			Commission:          1,

@@ -1,14 +1,18 @@
 package address_test
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -18,14 +22,12 @@ import (
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/kapps"
 	"github.com/klever-io/klever-go/network/api/address"
-	apiErrors "github.com/klever-io/klever-go/network/api/errors"
 	"github.com/klever-io/klever-go/network/api/middleware"
 	"github.com/klever-io/klever-go/network/api/mock"
 	"github.com/klever-io/klever-go/network/api/models"
 	"github.com/klever-io/klever-go/network/api/shared"
 	"github.com/klever-io/klever-go/network/api/wrapper"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 const validAddress = "klv17e8zzgn73h6ehe3c6q9vlt77kuxk5euddmhymy5uhv2rhv0dc0nqlfp0ap"
@@ -525,7 +527,7 @@ func TestGetAvailableClaimList(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			facade := mock.Facade{}
 			if tc.mockHandler != nil {
-				facade.RewardsAvailableToClaimHandler = tc.mockHandler
+				facade.RewardsAvailableToClaimListHandler = perAssetClaimList(tc.mockHandler)
 			}
 
 			ws := startNodeServer(&facade)
@@ -560,7 +562,7 @@ func TestGetAvailableClaimListDeduplicatesRequestedAssets(t *testing.T) {
 	callsPerAsset := make(map[string]int)
 
 	facade := mock.Facade{
-		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+		RewardsAvailableToClaimListHandler: perAssetClaimList(func(address, assetId string) (*models.AvailableClaimResponse, error) {
 			lock.Lock()
 			callsPerAsset[assetId]++
 			lock.Unlock()
@@ -570,7 +572,7 @@ func TestGetAvailableClaimListDeduplicatesRequestedAssets(t *testing.T) {
 				AllStakingRewards: map[string]int64{assetId: 200},
 				Allowance:         300,
 			}, nil
-		},
+		}),
 	}
 
 	ws := startNodeServer(&facade)
@@ -631,7 +633,7 @@ func TestGetAvailableClaimListRejectsExcessiveAssetCount(t *testing.T) {
 			var calls atomic.Int64
 
 			facade := mock.Facade{
-				RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+				RewardsAvailableToClaimListHandler: perAssetClaimList(func(address, assetId string) (*models.AvailableClaimResponse, error) {
 					calls.Add(1)
 
 					return &models.AvailableClaimResponse{
@@ -639,7 +641,7 @@ func TestGetAvailableClaimListRejectsExcessiveAssetCount(t *testing.T) {
 						AllStakingRewards: map[string]int64{assetId: 200},
 						Allowance:         300,
 					}, nil
-				},
+				}),
 			}
 
 			ws := startNodeServer(&facade)
@@ -683,13 +685,13 @@ func TestGetAvailableClaimListReturnsAllRequestedAssets(t *testing.T) {
 	}
 
 	facade := mock.Facade{
-		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
+		RewardsAvailableToClaimListHandler: perAssetClaimList(func(address, assetId string) (*models.AvailableClaimResponse, error) {
 			return &models.AvailableClaimResponse{
 				StakingRewards:    rewardsPerAsset[assetId],
 				AllStakingRewards: map[string]int64{assetId: 200},
 				Allowance:         300,
 			}, nil
-		},
+		}),
 	}
 
 	ws := startNodeServer(&facade)
@@ -726,32 +728,22 @@ func TestGetAvailableClaimListReturnsAllRequestedAssets(t *testing.T) {
 	}
 }
 
-func TestGetAvailableClaimListBoundsConcurrentLookups(t *testing.T) {
+func TestGetAvailableClaimListMakesSingleFacadeCall(t *testing.T) {
 	t.Parallel()
 
-	const expectedMaxConcurrentLookups = int64(address.MaxConcurrentClaimLookups)
-
-	var inFlight atomic.Int64
-	var peakInFlight atomic.Int64
+	var calls atomic.Int64
+	var receivedAssets []string
 
 	facade := mock.Facade{
-		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
-			current := inFlight.Add(1)
-			for {
-				peak := peakInFlight.Load()
-				if current <= peak || peakInFlight.CompareAndSwap(peak, current) {
-					break
-				}
+		RewardsAvailableToClaimListHandler: func(_ context.Context, addr string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+			calls.Add(1)
+			receivedAssets = assetIds
+
+			claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+			for _, assetId := range assetIds {
+				claims[assetId] = &models.AvailableClaimResponse{StakingRewards: 100}
 			}
-
-			time.Sleep(2 * time.Millisecond)
-			inFlight.Add(-1)
-
-			return &models.AvailableClaimResponse{
-				StakingRewards:    100,
-				AllStakingRewards: map[string]int64{assetId: 200},
-				Allowance:         300,
-			}, nil
+			return claims, nil, nil
 		},
 	}
 
@@ -769,62 +761,21 @@ func TestGetAvailableClaimListBoundsConcurrentLookups(t *testing.T) {
 	ws.ServeHTTP(resp, req)
 
 	assert.Equal(t, http.StatusOK, resp.Code)
-
-	var response shared.GenericAPIResponse
-	err := json.Unmarshal(resp.Body.Bytes(), &response)
-	assert.NoError(t, err)
-	assert.Empty(t, response.Error)
-	assert.Len(t, extractClaimListAssets(t, response), len(requestedAssets))
-
-	assert.Zero(t, inFlight.Load())
-	assert.LessOrEqual(t, peakInFlight.Load(), expectedMaxConcurrentLookups)
-	assert.Greater(t, peakInFlight.Load(), int64(1))
+	assert.Equal(t, int64(1), calls.Load())
+	assert.Equal(t, requestedAssets, receivedAssets)
 }
 
-func TestGetAvailableClaimListReleasesSlotsOnLookupError(t *testing.T) {
+func TestGetAvailableClaimListReportsRequestErrorPerAsset(t *testing.T) {
 	t.Parallel()
 
-	const expectedMaxConcurrentLookups = int64(address.MaxConcurrentClaimLookups)
-
-	var calls atomic.Int64
-	var inFlight atomic.Int64
-	var peakInFlight atomic.Int64
-
 	facade := mock.Facade{
-		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
-			current := inFlight.Add(1)
-			for {
-				peak := peakInFlight.Load()
-				if current <= peak || peakInFlight.CompareAndSwap(peak, current) {
-					break
-				}
-			}
-
-			time.Sleep(time.Millisecond)
-			inFlight.Add(-1)
-
-			// Fail most lookups: if a failing lookup did not release its semaphore slot,
-			// the dispatch loop would block once the bound is exhausted and never return.
-			if calls.Add(1)%3 != 0 {
-				return nil, fmt.Errorf("lookup failed for %s", assetId)
-			}
-
-			return &models.AvailableClaimResponse{
-				StakingRewards:    100,
-				AllStakingRewards: map[string]int64{assetId: 200},
-				Allowance:         300,
-			}, nil
+		RewardsAvailableToClaimListHandler: func(context.Context, string, []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+			return nil, nil, fmt.Errorf("account not found")
 		},
 	}
 
-	requestedAssets := buildRequestedAssets(address.MaxAssetsPerClaimList)
-
 	ws := startNodeServer(&facade)
-	url := fmt.Sprintf(
-		"/address/%s/allowance/list?asset=%s",
-		validAddress,
-		strings.Join(requestedAssets, ","),
-	)
+	url := fmt.Sprintf("/address/%s/allowance/list?asset=KLV,BTC", validAddress)
 
 	req, _ := http.NewRequest("GET", url, nil)
 	resp := httptest.NewRecorder()
@@ -835,56 +786,205 @@ func TestGetAvailableClaimListReleasesSlotsOnLookupError(t *testing.T) {
 	var response shared.GenericAPIResponse
 	err := json.Unmarshal(resp.Body.Bytes(), &response)
 	assert.NoError(t, err)
-	assert.NotEmpty(t, response.Error)
-
-	// Every asset was dispatched, so no slot was leaked by a failing lookup.
-	assert.Equal(t, int64(len(requestedAssets)), calls.Load())
-	assert.Zero(t, inFlight.Load())
-	assert.LessOrEqual(t, peakInFlight.Load(), expectedMaxConcurrentLookups)
+	assert.Equal(
+		t,
+		"could not get rewards for requested account asset list: map[BTC:account not found KLV:account not found]",
+		response.Error,
+	)
+	assert.Nil(t, response.Data)
 }
 
-func TestGetAvailableClaimListRecoversFromLookupPanic(t *testing.T) {
+// The lookup runs under a deadline and is not tied to the connection: net/http cancels the request
+// context for a client that only closed its write side, and that client still gets its answer.
+func TestGetAvailableClaimListRunsUnderDeadlineOnly(t *testing.T) {
 	t.Parallel()
 
+	reqCtx, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+
 	var calls atomic.Int64
-
 	facade := mock.Facade{
-		RewardsAvailableToClaimHandler: func(address, assetId string) (*models.AvailableClaimResponse, error) {
-			// Panic on a subset; gin.Recovery cannot reach these goroutines, so an
-			// unrecovered panic here would take the whole process down.
-			if calls.Add(1)%2 == 0 {
-				panic("simulated lookup panic for " + assetId)
-			}
+		RewardsAvailableToClaimListHandler: func(ctx context.Context, _ string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+			calls.Add(1)
 
-			return &models.AvailableClaimResponse{
-				StakingRewards:    100,
-				AllStakingRewards: map[string]int64{assetId: 200},
-				Allowance:         300,
-			}, nil
+			deadline, hasDeadline := ctx.Deadline()
+			assert.True(t, hasDeadline, "the lookup must run under a request deadline")
+			assert.LessOrEqual(t, time.Until(deadline), address.AvailableClaimListTimeout)
+
+			cancelRequest()
+			assert.NoError(t, ctx.Err(), "the request context's cancellation must not end the lookup")
+
+			claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+			for _, assetId := range assetIds {
+				claims[assetId] = &models.AvailableClaimResponse{StakingRewards: 100}
+			}
+			return claims, nil, nil
 		},
 	}
 
-	requestedAssets := buildRequestedAssets(20)
-
 	ws := startNodeServer(&facade)
-	url := fmt.Sprintf(
-		"/address/%s/allowance/list?asset=%s",
-		validAddress,
-		strings.Join(requestedAssets, ","),
-	)
+	url := fmt.Sprintf("/address/%s/allowance/list?asset=KLV,BTC", validAddress)
 
-	req, _ := http.NewRequest("GET", url, nil)
+	req, _ := http.NewRequestWithContext(reqCtx, "GET", url, nil)
 	resp := httptest.NewRecorder()
+	ws.ServeHTTP(resp, req)
 
-	require.NotPanics(t, func() { ws.ServeHTTP(resp, req) })
-
-	assert.Equal(t, http.StatusBadRequest, resp.Code)
-	assert.Equal(t, int64(len(requestedAssets)), calls.Load())
+	assert.Equal(t, int64(1), calls.Load())
+	assert.Equal(t, http.StatusOK, resp.Code)
 
 	var response shared.GenericAPIResponse
 	err := json.Unmarshal(resp.Body.Bytes(), &response)
 	assert.NoError(t, err)
-	assert.Contains(t, fmt.Sprint(response.Error), apiErrors.ErrClaimLookupFailed.Error())
+	assert.Len(t, extractClaimListAssets(t, response), 2)
+}
+
+func TestGetAvailableClaimListReportsTimeout(t *testing.T) {
+	t.Parallel()
+
+	facade := mock.Facade{
+		RewardsAvailableToClaimListHandler: func(context.Context, string, []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+			return nil, nil, context.DeadlineExceeded
+		},
+	}
+
+	ws := startNodeServer(&facade)
+	url := fmt.Sprintf("/address/%s/allowance/list?asset=KLV,BTC", validAddress)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := httptest.NewRecorder()
+	ws.ServeHTTP(resp, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, resp.Code)
+
+	var response shared.GenericAPIResponse
+	err := json.Unmarshal(resp.Body.Bytes(), &response)
+	assert.NoError(t, err)
+	assert.Equal(t, shared.ReturnCodeSystemBusy, response.Code)
+	assert.Equal(t, "could not get rewards for requested account asset list: request timed out", response.Error)
+	assert.Nil(t, response.Data)
+}
+
+// A lookup that returns a result after the deadline passed is a timeout too, not a late 200.
+// It runs in a synctest bubble, so the real 10s deadline expires on a fake clock.
+func TestGetAvailableClaimListReportsTimeoutWhenLookupFinishesLate(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		facade := mock.Facade{
+			RewardsAvailableToClaimListHandler: func(ctx context.Context, _ string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+				// the last asset runs past the deadline and the lookup still succeeds
+				<-ctx.Done()
+
+				claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+				for _, assetId := range assetIds {
+					claims[assetId] = &models.AvailableClaimResponse{StakingRewards: 100}
+				}
+				return claims, nil, nil
+			},
+		}
+
+		ws := startNodeServer(&facade)
+		url := fmt.Sprintf("/address/%s/allowance/list?asset=KLV,BTC", validAddress)
+
+		start := time.Now()
+		req, _ := http.NewRequest("GET", url, nil)
+		resp := httptest.NewRecorder()
+		ws.ServeHTTP(resp, req)
+
+		// The literal is deliberate: it pins the intended deadline, so shortening the production
+		// constant fails here instead of moving both sides of the comparison.
+		assert.Equal(t, 10*time.Second, time.Since(start), "the lookup must end exactly at the intended deadline")
+		assert.Equal(t, http.StatusServiceUnavailable, resp.Code)
+
+		var response shared.GenericAPIResponse
+		err := json.Unmarshal(resp.Body.Bytes(), &response)
+		assert.NoError(t, err)
+		assert.Equal(t, shared.ReturnCodeSystemBusy, response.Code)
+		assert.Equal(t, "could not get rewards for requested account asset list: request timed out", response.Error)
+		assert.Nil(t, response.Data)
+	})
+}
+
+// A client that half-closes its connection after sending the request is still waiting for the
+// answer. net/http cancels the request context when it reads EOF on such a connection, so this
+// runs through a real server: the lookup waits until that cancellation has happened, and must
+// not see it, and the client must still get its 200.
+func TestGetAvailableClaimListAnswersHalfClosedClient(t *testing.T) {
+	t.Parallel()
+
+	requestCtx := make(chan context.Context, 1)
+	facade := mock.Facade{
+		RewardsAvailableToClaimListHandler: func(ctx context.Context, _ string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+			// wait for net/http to cancel the request context on the client's EOF
+			select {
+			case <-(<-requestCtx).Done():
+			case <-time.After(3 * time.Second):
+				t.Error("net/http never cancelled the request context of the half-closed client")
+				return nil, nil, fmt.Errorf("request context was not cancelled")
+			}
+
+			if !assert.NoError(t, ctx.Err(), "the request context's cancellation must not reach the lookup") {
+				return nil, nil, ctx.Err()
+			}
+
+			claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+			for _, assetId := range assetIds {
+				claims[assetId] = &models.AvailableClaimResponse{StakingRewards: 100}
+			}
+			return claims, nil, nil
+		},
+	}
+
+	ws := startNodeServer(&facade)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCtx <- r.Context()
+		ws.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	_, err = fmt.Fprintf(conn, "GET /address/%s/allowance/list?asset=KLV,BTC HTTP/1.1\r\nHost: node\r\nConnection: close\r\n\r\n", validAddress)
+	assert.NoError(t, err)
+	assert.NoError(t, conn.(*net.TCPConn).CloseWrite())
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var response shared.GenericAPIResponse
+	assert.NoError(t, json.NewDecoder(resp.Body).Decode(&response))
+	assert.Len(t, extractClaimListAssets(t, response), 2)
+}
+
+// perAssetClaimList adapts a per-asset claim mock into the list facade call, collecting
+// per-asset errors the way the node does.
+func perAssetClaimList(
+	handler func(address, assetId string) (*models.AvailableClaimResponse, error),
+) func(_ context.Context, address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+	return func(_ context.Context, address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error) {
+		claims := make(map[string]*models.AvailableClaimResponse, len(assetIds))
+		claimErrors := make(map[string]error)
+		for _, assetId := range assetIds {
+			claim, err := handler(address, assetId)
+			if err != nil {
+				claimErrors[assetId] = err
+				continue
+			}
+			claims[assetId] = claim
+		}
+
+		return claims, claimErrors, nil
+	}
 }
 
 func buildRequestedAssets(count int) []string {

@@ -12,5 +12,10 @@ func (e *epochStartBlockProcessor) GetMapMetaBlock() map[string]*block.Block {
 	e.mutReceivedMetaBlocks.RLock()
 	defer e.mutReceivedMetaBlocks.RUnlock()
 
-	return e.mapReceivedMetaBlocks
+	metaBlocks := make(map[string]*block.Block)
+	for _, vote := range e.mapVotes {
+		metaBlocks[vote.headerHash] = vote.metaBlock
+	}
+
+	return metaBlocks
 }

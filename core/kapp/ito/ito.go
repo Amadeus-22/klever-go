@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/klever-io/klever-go/common"
+	"github.com/klever-io/klever-go/common/types"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
 	"github.com/klever-io/klever-go/core/process"
@@ -219,6 +220,12 @@ func (i *itoKapp) Buy(sender []byte, tc *transaction.BuyContract) (transaction.T
 		return status, err
 	}
 
+	// the payment currency's pause and transfer restriction apply as in a direct transfer
+	paymentCurrency, status, err := i.loadPaymentCurrency(ctx, currencyID)
+	if err != nil {
+		return status, err
+	}
+
 	if asset.Royalties == nil {
 		asset.Royalties = &kapps.RoyaltiesData{}
 	}
@@ -241,7 +248,12 @@ func (i *itoKapp) Buy(sender []byte, tc *transaction.BuyContract) (transaction.T
 	itoOwnerAmount := valueInt - royaltiesPercentAmount
 
 	//Compute ITO Percent Royalties
-	status, err = i.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, valueInt, royaltiesPercentAmount)
+	status, err = i.ComputeITOPercentBuyRoyalties(ctx, asset, ownerAcc, currencyID, valueInt, royaltiesPercentAmount, paymentCurrency)
+	if err != nil {
+		return status, err
+	}
+
+	status, err = checkPaymentDestination(ctx, paymentCurrency, sender, ito.GetReceiverAddress(), itoOwnerAmount)
 	if err != nil {
 		return status, err
 	}
@@ -315,6 +327,13 @@ func (i *itoKapp) ValidateBuyContract(ctx kapp.KappContext, sender []byte, asset
 	if err != nil {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetNotFound, err.Error())
 		return nil, nil, nil, transaction.Transaction_KAPPError, err
+	}
+
+	// a paused asset cannot be minted to a buyer (see the KDA Mint); refused here, before the whitelist
+	// limit, the ITO minted amount or the payment are touched
+	if i.forkController.FixAuditChangesV6() && asset.GetAttributes().GetIsPaused() {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetPaused, process.ErrAssetIsPaused.Error())
+		return nil, nil, nil, transaction.Transaction_AssetPaused, process.ErrAssetIsPaused
 	}
 
 	if !i.ValidAssetType(asset.AssetType) {
@@ -412,15 +431,17 @@ func (i *itoKapp) ComputeBuyITOWhitelist(ctx kapp.KappContext, sender []byte, it
 	return transaction.Transaction_Ok, nil
 }
 
-func (i *itoKapp) ComputeITOPercentBuyRoyalties(ctx kapp.KappContext, asset *kapps.KDAData, ownerAcc state.UserAccountHandler, currencyID []byte, valueInt int64, royaltiesPercentAmount int64) (transaction.Transaction_TXResultCode, error) {
+func (i *itoKapp) ComputeITOPercentBuyRoyalties(ctx kapp.KappContext, asset *kapps.KDAData, ownerAcc state.UserAccountHandler, currencyID []byte, valueInt int64, royaltiesPercentAmount int64, paymentCurrency *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	if royaltiesPercentAmount <= 0 {
 		return transaction.Transaction_Ok, nil
 	}
 
 	royaltiesITOPercentageToPay := royaltiesPercentAmount
-	for key, value := range asset.Royalties.SplitRoyalties {
+	// Split payouts become ordered back transfers visible to a calling contract.
+	for _, key := range types.OrderedKeys(asset.Royalties.SplitRoyalties, i.forkController.FixAuditChangesV6()) {
+		value := asset.Royalties.SplitRoyalties[key]
 		status, err := i.computeSplitRoyalties(ctx, key, currencyID, ownerAcc,
-			royaltiesPercentAmount, int64(value.PercentITOPercentage), &royaltiesITOPercentageToPay)
+			royaltiesPercentAmount, int64(value.PercentITOPercentage), &royaltiesITOPercentageToPay, paymentCurrency)
 		if err != nil {
 			return status, err
 		}
@@ -430,17 +451,25 @@ func (i *itoKapp) ComputeITOPercentBuyRoyalties(ctx kapp.KappContext, asset *kap
 		return transaction.Transaction_Ok, nil
 	}
 
+	// A receiver without an account used to fail the buy. Under FixAuditChangesV6 it is created
+	// like the fixed-royalty receiver and every other payee; before the fork the legacy loads
+	// are kept as they were.
 	var kdaOwner state.UserAccountHandler
 	var err error
-
-	switch i.forkController.KdaFpr() {
-	case true:
+	if i.forkController.FixAuditChangesV6() {
+		kdaOwner, err = i.LoadUserAccount(asset.Royalties.Address)
+	} else if i.forkController.KdaFpr() {
 		kdaOwner, err = i.GetExistingUserAccount(asset.Royalties.Address)
-	default:
+	} else {
 		kdaOwner, err = i.GetExistingUserAccount(asset.OwnerAddress)
 	}
 	if err != nil {
 		return transaction.Transaction_LoadAccountError, err
+	}
+
+	status, err := checkPaymentDestination(ctx, paymentCurrency, ownerAcc.AddressBytes(), kdaOwner.AddressBytes(), royaltiesITOPercentageToPay)
+	if err != nil {
+		return status, err
 	}
 
 	err = kdaOwner.AddToBalance(royaltiesITOPercentageToPay, currencyID, i.forkController.EnableSmartContracts())
@@ -488,9 +517,11 @@ func (i *itoKapp) ComputeITOFixedBuyRoyalties(ctx kapp.KappContext, asset *kapps
 	}
 
 	royaltiesITOFixedToPay := asset.Royalties.ITOFixed
-	for key, value := range asset.Royalties.SplitRoyalties {
+	// KLV-only payouts no contract can tell apart, so sorting changes receipt order only and needs no fork gate.
+	for _, key := range types.OrderedKeys(asset.Royalties.SplitRoyalties, true) {
+		value := asset.Royalties.SplitRoyalties[key]
 		status, err := i.computeSplitRoyalties(ctx, key, kdautils.KLVIdentifier, ownerAcc,
-			asset.Royalties.ITOFixed, int64(value.PercentITOFixed), &royaltiesITOFixedToPay)
+			asset.Royalties.ITOFixed, int64(value.PercentITOFixed), &royaltiesITOFixedToPay, nil)
 		if err != nil {
 			return status, err
 		}
@@ -530,7 +561,7 @@ func (i *itoKapp) ComputeITOFixedBuyRoyalties(ctx kapp.KappContext, asset *kapps
 	return transaction.Transaction_Ok, nil
 }
 
-func (i *itoKapp) computeSplitRoyalties(ctx kapp.KappContext, address string, assetID []byte, acntSrc state.UserAccountHandler, value int64, percentage int64, royaltiesToPay *int64) (transaction.Transaction_TXResultCode, error) {
+func (i *itoKapp) computeSplitRoyalties(ctx kapp.KappContext, address string, assetID []byte, acntSrc state.UserAccountHandler, value int64, percentage int64, royaltiesToPay *int64, paymentCurrency *kapps.KDAData) (transaction.Transaction_TXResultCode, error) {
 	decodedAddress, err := hex.DecodeString(address)
 	if err != nil {
 		return transaction.Transaction_LoadAccountError, err
@@ -559,6 +590,11 @@ func (i *itoKapp) computeSplitRoyalties(ctx kapp.KappContext, address string, as
 	}
 	*royaltiesToPay -= splitToPay
 
+	status, err := checkPaymentDestination(ctx, paymentCurrency, acntSrc.AddressBytes(), decodedAddress, splitToPay)
+	if err != nil {
+		return status, err
+	}
+
 	err = splitRoyalty.AddToBalance(splitToPay, assetID, i.forkController.EnableSmartContracts())
 	if err != nil {
 		return transaction.Transaction_BalanceError, err
@@ -582,6 +618,39 @@ func (i *itoKapp) computeSplitRoyalties(ctx kapp.KappContext, address string, as
 	))
 
 	return transaction.Transaction_Ok, nil
+}
+
+// loadPaymentCurrency returns the payment currency under FixAuditChangesV6, refusing the buy while it is
+// paused, and nil before the fork.
+func (i *itoKapp) loadPaymentCurrency(ctx kapp.KappContext, currencyID []byte) (*kapps.KDAData, transaction.Transaction_TXResultCode, error) {
+	if !i.forkController.FixAuditChangesV6() {
+		return nil, transaction.Transaction_Ok, nil
+	}
+
+	_, currency, err := i.KAppController.GetKDAKApp().GetKDA(currencyID)
+	if err != nil {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetNotFound, err.Error())
+		return nil, transaction.Transaction_KAPPError, err
+	}
+
+	if currency.GetAttributes().GetIsPaused() {
+		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldAssetPaused, process.ErrAssetIsPaused.Error())
+		return nil, transaction.Transaction_AssetPaused, process.ErrAssetIsPaused
+	}
+
+	return currency, transaction.Transaction_Ok, nil
+}
+
+// checkPaymentDestination refuses paying amount to destination when a direct transfer from the buyer would be
+// refused. A nil currency (before FixAuditChangesV6) or an amount of zero is never refused. A refusal fails
+// the transaction, which undoes any destination already paid.
+func checkPaymentDestination(ctx kapp.KappContext, currency *kapps.KDAData, buyer []byte, destination []byte, amount int64) (transaction.Transaction_TXResultCode, error) {
+	if currency == nil || amount <= 0 || currency.IsTransferAllowed(buyer, destination) {
+		return transaction.Transaction_Ok, nil
+	}
+
+	ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldTransferNotAllowed, process.ErrKDATransferNotAllowed.Error())
+	return transaction.Transaction_KDATransferNotAllowed, process.ErrKDATransferNotAllowed
 }
 
 func (i *itoKapp) BuyITOMint(ctx kapp.KappContext, itoKapp state.KAppAccountHandler, ito *kapps.ITOData, assetID []byte, sender []byte, tc *transaction.BuyContract) (transaction.Transaction_TXResultCode, error) {
@@ -622,7 +691,7 @@ func (i *itoKapp) Config(sender []byte, tc *transaction.ConfigITOContract) (tran
 		return transaction.Transaction_AssetTypeInvalid, common.ErrInvalidValue
 	}
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -808,12 +877,7 @@ func (i *itoKapp) Config(sender []byte, tc *transaction.ConfigITOContract) (tran
 
 			newPacks := make([]*kapps.Pack, len(packInfo.Packs))
 			for index, pack := range packInfo.Packs {
-				invalidPrice := pack.Price < 0
-				if !i.forkController.KdaFpr() {
-					invalidPrice = pack.Price <= 0
-				}
-
-				if pack.Amount <= 0 || invalidPrice {
+				if pack.Amount <= 0 || i.isInvalidPackPrice(pack.Price) {
 					return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
 				}
 
@@ -1072,6 +1136,17 @@ func (i *itoKapp) processPackData(ctx kapp.KappContext, key string, packData *tr
 	return &kapps.PackData{Packs: newPacks}, transaction.Transaction_Ok, nil
 }
 
+// isInvalidPackPrice reports whether ConfigITO or the SetITOPrices trigger must reject a
+// pack price. KdaFpr relaxed both paths to accept a zero price, which SetPrices never
+// did; FixAuditChangesV6 rejects it again so all three paths agree.
+func (i *itoKapp) isInvalidPackPrice(price int64) bool {
+	if !i.forkController.KdaFpr() || i.forkController.FixAuditChangesV6() {
+		return price <= 0
+	}
+
+	return price < 0
+}
+
 func (i *itoKapp) SetPrices(sender []byte, tc *transaction.SetITOPricesContract) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
@@ -1182,12 +1257,7 @@ func (i *itoKapp) SetITOPrices(triggerContract *transaction.ITOTriggerContract, 
 
 		newPacks := make([]*kapps.Pack, len(packData.Packs))
 		for index, pack := range packData.Packs {
-			invalidPrice := pack.Price < 0
-			if !i.forkController.KdaFpr() {
-				invalidPrice = pack.Price <= 0
-			}
-
-			if pack.Amount <= 0 || invalidPrice || (ito.MaxAmount > 0 && pack.Amount > ito.MaxAmount) {
+			if pack.Amount <= 0 || i.isInvalidPackPrice(pack.Price) || (ito.MaxAmount > 0 && pack.Amount > ito.MaxAmount) {
 				ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPrice, common.ErrInvalidValue.Error())
 				return transaction.Transaction_ParameterInvalid, common.ErrInvalidValue
 			}
@@ -1213,7 +1283,7 @@ func (i *itoKapp) SetITOPrices(triggerContract *transaction.ITOTriggerContract, 
 func (i *itoKapp) UpdateStatus(triggerContract *transaction.ITOTriggerContract, kdaKapp state.KAppAccountHandler, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1266,7 +1336,7 @@ func (i *itoKapp) UpdateStatus(triggerContract *transaction.ITOTriggerContract, 
 func (i *itoKapp) UpdateReceiverAddress(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1284,7 +1354,7 @@ func (i *itoKapp) UpdateReceiverAddress(triggerContract *transaction.ITOTriggerC
 func (i *itoKapp) UpdateMaxAmount(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1307,7 +1377,7 @@ func (i *itoKapp) UpdateMaxAmount(triggerContract *transaction.ITOTriggerContrac
 func (i *itoKapp) UpdateDefaultLimitPerAddress(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1325,7 +1395,7 @@ func (i *itoKapp) UpdateDefaultLimitPerAddress(triggerContract *transaction.ITOT
 func (i *itoKapp) UpdateTimes(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1346,7 +1416,7 @@ func (i *itoKapp) UpdateTimes(triggerContract *transaction.ITOTriggerContract, i
 func (i *itoKapp) AddToWhitelist(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte, whitelistData map[string]*kapps.WhitelistData) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1391,7 +1461,7 @@ func (i *itoKapp) AddToWhitelist(triggerContract *transaction.ITOTriggerContract
 func (i *itoKapp) RemoveFromWhitelist(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte, whitelistData map[string]*kapps.WhitelistData) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1436,7 +1506,7 @@ func (i *itoKapp) RemoveFromWhitelist(triggerContract *transaction.ITOTriggerCon
 func (i *itoKapp) UpdateWhitelistTimes(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}
@@ -1457,7 +1527,7 @@ func (i *itoKapp) UpdateWhitelistTimes(triggerContract *transaction.ITOTriggerCo
 func (i *itoKapp) UpdateWhitelistStatus(triggerContract *transaction.ITOTriggerContract, ito *kapps.ITOData, asset *kapps.KDAData, sender []byte) (transaction.Transaction_TXResultCode, error) {
 	ctx := i.KAppController.GetCurrentKAppContext()
 
-	if !bytes.Equal(asset.OwnerAddress, sender) && !bytes.Equal(asset.AdminAddress, sender) {
+	if !asset.IsOwnerOrAdmin(sender) {
 		ctx.Receipts().AddError(ctx.ContractID(), common.ErrFieldInvalidPermission, common.ErrAccNotOwner.Error())
 		return transaction.Transaction_AccountNotOwner, common.ErrAccNotOwner
 	}

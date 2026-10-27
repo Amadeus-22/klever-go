@@ -10,6 +10,7 @@ operator validator config [OWNER_ADDRESS] [flags]
 
 ```
       --bls string            set node BLS PublicKey
+      --bls-proof string      hex BLS key proof of possession, produced on the node host with keygenerator bls-proof; required from fork FixAuditChangesV6 on for registration and for key rotation
       --canDelegate           set if validator can delegate (default true)
       --commission float      set validator commission (default 10)
   -h, --help                  help for config

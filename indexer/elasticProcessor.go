@@ -10,6 +10,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/elastic/go-elasticsearch/v8/esapi"
 	"github.com/klever-io/klever-go/common"
@@ -534,15 +535,15 @@ func (ei *elasticProcessor) SaveTransactions(
 ) error {
 	headerTimestamp := header.GetTimestamp()
 
-	txs, txsMap, ad, err := ei.resolvePreparedBlockData(header, pool, prepared)
+	block, err := ei.resolvePreparedBlockData(header, pool, prepared)
 	if err != nil {
 		return err
 	}
 
-	ld := ei.logsAndEventsProc.ExtractDataFromLogs(pool, txs, headerTimestamp)
+	ld := ei.logsAndEventsProc.ExtractDataFromLogs(pool, block.Txs, headerTimestamp)
 	buffers := data.NewBufferSlice(data.DefaultMaxBulkSize)
 
-	if err := ei.indexBlockArtifacts(buffers, headerTimestamp, txs, txsMap, ad, ld, pool); err != nil {
+	if err := ei.indexBlockArtifacts(buffers, headerTimestamp, block, ld, pool); err != nil {
 		return err
 	}
 
@@ -554,17 +555,58 @@ func (ei *elasticProcessor) SaveTransactions(
 	return nil
 }
 
+// PrepareBlockData builds the payload the indexer worker consumes, including the account
+// documents resolved from chain state. It runs on the commit goroutine, where the live
+// state adapter still holds the committed state of this block; the worker drains its
+// queue later and would otherwise read whatever has committed since, writing those
+// balances under this block's timestamp (KLR-68). A retry then replays this same
+// snapshot instead of drifting further.
+//
+// Returns nil when the accounts index is disabled, since indexAlteredAccounts would
+// discard the documents, and for a nil header, which the work item skips. An account
+// that cannot be resolved is left out of the payload and its error returned: this
+// block's state cannot be read again once the next one commits.
+func (ei *elasticProcessor) PrepareBlockData(
+	header nodeData.HeaderHandler,
+	pool *indexer.Pool,
+	prepared any,
+) (*data.PreparedBlockData, error) {
+	if !ei.isIndexEnabled(accountsIndex) || check.IfNil(header) {
+		return nil, nil
+	}
+	if pool == nil {
+		pool = &indexer.Pool{}
+	}
+
+	block, err := ei.resolvePreparedBlockData(header, pool, prepared)
+	if err != nil {
+		return nil, err
+	}
+
+	// a new payload: the one passed in is shared with the websocket dispatcher
+	payload := &data.PreparedBlockData{Txs: block.Txs, TxsMap: block.TxsMap, Altered: block.Altered}
+	payload.Accounts, payload.AccountsKDA, err = ei.resolveAlteredAccounts(header.GetTimestamp(), block.Altered.Accounts.GetAll(), block.Accounts)
+
+	return payload, err
+}
+
 // resolvePreparedBlockData returns the prepared block data if provided,
 // otherwise it runs prepareTransactionsForDatabase as a fallback.
 func (ei *elasticProcessor) resolvePreparedBlockData(
 	header nodeData.HeaderHandler,
 	pool *indexer.Pool,
 	prepared any,
-) ([]*data.Transaction, map[string]*data.Transaction, *data.AlteredData, error) {
+) (*data.PreparedBlockData, error) {
 	if p, ok := prepared.(*data.PreparedBlockData); ok && p != nil {
-		return p.Txs, p.TxsMap, p.Altered, nil
+		return p, nil
 	}
-	return ei.prepareTransactionsForDatabase(header, pool)
+
+	txs, txsMap, ad, err := ei.prepareTransactionsForDatabase(header, pool)
+	if err != nil {
+		return nil, err
+	}
+
+	return &data.PreparedBlockData{Txs: txs, TxsMap: txsMap, Altered: ad}, nil
 }
 
 // indexBlockArtifacts runs every sub-index step for a block. The list is
@@ -572,22 +614,21 @@ func (ei *elasticProcessor) resolvePreparedBlockData(
 func (ei *elasticProcessor) indexBlockArtifacts(
 	buffers *data.BufferSlice,
 	headerTimestamp int64,
-	txs []*data.Transaction,
-	txsMap map[string]*data.Transaction,
-	ad *data.AlteredData,
+	block *data.PreparedBlockData,
 	ld *data.PreparedLogsResults,
 	pool *indexer.Pool,
 ) error {
+	ad := block.Altered
 	steps := []func() error{
-		func() error { return ei.indexTransactions(txs, buffers) },
+		func() error { return ei.indexTransactions(block.Txs, buffers) },
 		func() error { return ei.indexKDAPools(ad.KDAPool.GetAll(), buffers) },
 		func() error { return ei.indexAssets(ad.Assets.GetAll(), buffers) },
 		func() error { return ei.indexProposals(ad.Proposals.GetAll(), buffers) },
 		func() error { return ei.indexITOs(ad.ITO.GetAll(), buffers) },
 		func() error { return ei.indexMarketplaces(ad.Marketplaces.GetAll(), buffers) },
 		func() error { return ei.indexOrders(ad.Orders.GetAll(), buffers) },
-		func() error { return ei.indexAlteredAccounts(headerTimestamp, ad.Accounts.GetAll(), buffers) },
-		func() error { return ei.prepareAndIndexLogs(pool.Logs, txsMap, headerTimestamp, buffers) },
+		func() error { return ei.indexAlteredAccounts(headerTimestamp, block, buffers) },
+		func() error { return ei.prepareAndIndexLogs(pool.Logs, block.TxsMap, headerTimestamp, buffers) },
 		func() error { return ei.indexScDeploys(ld.ScDeploys, buffers) },
 		func() error { return ei.indexAlteredSmartContracts(ld.AlteredSCs, buffers) },
 	}
@@ -1352,93 +1393,195 @@ func (ei *elasticProcessor) indexAlteredSmartContracts(alteredSCsHandler data.Al
 	return SerializeAlteredSmartContracts(alteredSCs, buffSlice, scDeploysIndex)
 }
 
+// indexAlteredAccounts serializes the account documents resolved on the commit goroutine
+// and carried in the payload. It never resolves them itself: on the worker that would
+// read whatever block has committed since (KLR-68).
 func (ei *elasticProcessor) indexAlteredAccounts(
 	blockTimestamp int64,
-	accounts map[string][]*data.AlteredAccount,
+	block *data.PreparedBlockData,
 	buffSlice *data.BufferSlice,
 ) error {
-	if !ei.isIndexEnabled(accountsIndex) || len(accounts) == 0 {
+	if !ei.isIndexEnabled(accountsIndex) {
 		return nil
 	}
-
-	accountsToIndex := make([]state.UserAccountHandler, 0)
-	accountsKDAToIndex := make([]*data.AccountKDA, 0)
-
-	for address, alteredInfo := range accounts {
-		addressBytes, err := ei.addressPubkeyConverter.Decode(address)
-		if err != nil {
-			log.Warn("cannot decode address", "address", address, "error", err)
-			continue
-		}
-
-		var account state.AccountHandler
-
-		account, err = ei.accountsDB.LoadAccount(addressBytes)
-		if err != nil {
-			log.Warn("cannot load user account", "address", address, "error", err)
-			continue
-		}
-
-		userAccount, ok := account.(state.UserAccountHandler)
-		if !ok {
-			log.Warn("cannot cast AccountHandler to type UserAccountHandler")
-			continue
-		}
-
-		accountsToIndex = append(accountsToIndex, userAccount)
-
-		// check if it is a kapp account
-		if kappName := kapps.KAppsAddressList[string(addressBytes)]; len(kappName) > 0 {
-			log.Debug("index kapp altered account", "address", address, "kappName", kappName)
-			account, err = ei.kappsDB.LoadAccount(addressBytes)
-			if err != nil {
-				log.Warn("cannot load kapp account", "address", address, "error", err)
-				continue
-			}
-		}
-
-		for _, alteredData := range alteredInfo {
-			if alteredData.IsKDAOperation {
-				accountKDA, ok := account.(state.AccountHandlerWithGetUserKDA)
-				if !ok {
-					log.Warn("cannot cast AccountHandler to type AccountHandlerWithGetUserKDA")
-					continue
-				}
-
-				d, err := ei.getKDAInfo(accountKDA, address, alteredData)
-				if err != nil {
-					log.Error("error getting KDA Info", "error", err.Error())
-					continue
-				}
-
-				accountsKDAToIndex = append(accountsKDAToIndex, d)
-			}
-		}
+	if block.Accounts == nil {
+		log.Warn("no account snapshot taken at commit, indexing block without account documents", "timestamp", blockTimestamp)
+		return nil
 	}
-
-	if len(accountsToIndex) == 0 {
+	if len(block.Accounts) == 0 {
 		log.Debug("no account to index from provided transactions")
 		return nil
 	}
 
-	accountsSlice := make([]*data.Account, len(accountsToIndex))
-	for idx, account := range accountsToIndex {
-		accountsSlice[idx] = &data.Account{
-			UserAccount: account,
-			IsSender:    false,
+	if err := serializeAccountsKDA(block.AccountsKDA, buffSlice); err != nil {
+		return err
+	}
+	// ei.saveAccountsKDAHistory(blockTimestamp, block.AccountsKDA)
+
+	return ei.indexResolvedAccounts(blockTimestamp, block.Accounts, buffSlice)
+}
+
+// resolveAlteredAccounts reads the chain state for a block's altered accounts and builds
+// their documents, reusing those already in built. It must run while the live state
+// adapter still holds the committed state of that block - on the commit goroutine, before
+// the indexing job is queued. An account whose document cannot be built is left out and
+// its error joined into the returned one, so that one bad account does not drop the block.
+func (ei *elasticProcessor) resolveAlteredAccounts(
+	blockTimestamp int64,
+	accounts map[string][]*data.AlteredAccount,
+	built map[string]*data.AccountInfo,
+) (map[string]*data.AccountInfo, []*data.AccountKDA, error) {
+	accountsInfo := make(map[string]*data.AccountInfo, len(accounts))
+	accountsKDAToIndex := make([]*data.AccountKDA, 0)
+	var errs []error
+
+	// the two KApp accounts every KDA entry reads are the same for the whole block, so
+	// they are loaded on the first entry that needs them and reused by the rest - a
+	// failure included, so it is neither retried nor logged per entry
+	loadLookups := sync.OnceValues(func() (*kdaKAppLookups, error) {
+		lookups, err := ei.loadKDAKAppLookups()
+		if err != nil {
+			log.Error("cannot load kapp accounts for KDA info", "error", err.Error())
+		}
+
+		return lookups, err
+	})
+
+	for address, alteredInfo := range accounts {
+		acc, account, err := ei.loadAlteredAccount(address, blockTimestamp, built[address])
+		if err != nil {
+			errs = append(errs, fmt.Errorf("account %s: %w", address, err))
+			continue
+		}
+		if acc == nil {
+			continue
+		}
+
+		accountsInfo[acc.Address] = acc
+		if account == nil {
+			continue
+		}
+
+		accountsKDAToIndex = append(accountsKDAToIndex, ei.resolveAccountKDA(account, address, alteredInfo, loadLookups)...)
+	}
+
+	return accountsInfo, accountsKDAToIndex, errors.Join(errs...)
+}
+
+// loadAlteredAccount builds one altered account's document, unless acc already holds it,
+// and returns the state handler its KDA entries are to be read from - the KApp account for
+// a KApp address, the user account otherwise. A nil document means the address is to be
+// skipped entirely; a nil handler with a document means index the document but skip its
+// KDA entries.
+func (ei *elasticProcessor) loadAlteredAccount(
+	address string,
+	blockTimestamp int64,
+	acc *data.AccountInfo,
+) (*data.AccountInfo, state.AccountHandler, error) {
+	addressBytes, err := ei.addressPubkeyConverter.Decode(address)
+	if err != nil {
+		log.Warn("cannot decode address", "address", address, "error", err)
+		return nil, nil, nil
+	}
+
+	account, err := ei.accountsDB.LoadAccount(addressBytes)
+	if err != nil {
+		log.Warn("cannot load user account", "address", address, "error", err)
+		return nil, nil, nil
+	}
+
+	userAccount, ok := account.(state.UserAccountHandler)
+	if !ok {
+		log.Warn("cannot cast AccountHandler to type UserAccountHandler")
+		return nil, nil, nil
+	}
+
+	if acc == nil {
+		acc, err = buildAccountInfo(ei.addressPubkeyConverter, ei.kappsController, userAccount, blockTimestamp)
+		if err != nil {
+			return nil, nil, err
 		}
 	}
 
-	err := serializeAccountsKDA(accountsKDAToIndex, buffSlice)
-	if err != nil {
-		return err
+	// check if it is a kapp account
+	if kappName := kapps.KAppsAddressList[string(addressBytes)]; len(kappName) > 0 {
+		log.Debug("index kapp altered account", "address", address, "kappName", kappName)
+		account, err = ei.kappsDB.LoadAccount(addressBytes)
+		if err != nil {
+			log.Warn("cannot load kapp account", "address", address, "error", err)
+			return acc, nil, nil
+		}
 	}
-	// ei.saveAccountsKDAHistory(blockTimestamp, accountsKDAToIndex)
 
-	return ei.saveAccounts(blockTimestamp, accountsSlice, buffSlice)
+	return acc, account, nil
 }
 
-func (ei *elasticProcessor) getKDAInfo(account state.AccountHandlerWithGetUserKDA, accountAddress string, alteredData *data.AlteredAccount) (*data.AccountKDA, error) {
+// resolveAccountKDA builds the KDA documents of one altered account. An entry whose state
+// cannot be read is logged and skipped, so that one bad entry does not drop the block.
+func (ei *elasticProcessor) resolveAccountKDA(
+	account state.AccountHandler,
+	address string,
+	alteredInfo []*data.AlteredAccount,
+	loadLookups func() (*kdaKAppLookups, error),
+) []*data.AccountKDA {
+	accountsKDA := make([]*data.AccountKDA, 0, len(alteredInfo))
+
+	for _, alteredData := range alteredInfo {
+		if !alteredData.IsKDAOperation {
+			continue
+		}
+
+		accountKDA, ok := account.(state.AccountHandlerWithGetUserKDA)
+		if !ok {
+			log.Warn("cannot cast AccountHandler to type AccountHandlerWithGetUserKDA")
+			return accountsKDA
+		}
+
+		lookups, err := loadLookups()
+		if err != nil {
+			return accountsKDA
+		}
+
+		d, err := ei.getKDAInfo(accountKDA, address, alteredData, lookups)
+		if err != nil {
+			log.Error("error getting KDA Info", "error", err.Error())
+			continue
+		}
+
+		accountsKDA = append(accountsKDA, d)
+	}
+
+	return accountsKDA
+}
+
+// kdaKAppLookups holds the KDA and staking KApp accounts getKDAInfo reads for every
+// altered entry. They are the same two addresses for a whole block, so they are loaded
+// once per block rather than once per entry.
+type kdaKAppLookups struct {
+	kda     state.KAppAccountHandler
+	staking state.KAppAccountHandler
+}
+
+func (ei *elasticProcessor) loadKDAKAppLookups() (*kdaKAppLookups, error) {
+	kdaKapp, err := ei.loadKAppHandler(kapps.KDAKAppAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	stakingKapp, err := ei.loadKAppHandler(kapps.StakingKAppAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	return &kdaKAppLookups{kda: kdaKapp, staking: stakingKapp}, nil
+}
+
+func (ei *elasticProcessor) getKDAInfo(
+	account state.AccountHandlerWithGetUserKDA,
+	accountAddress string,
+	alteredData *data.AlteredAccount,
+	lookups *kdaKAppLookups,
+) (*data.AccountKDA, error) {
 	var nonce []byte
 	assetID := alteredData.TokenIdentifier
 	if len(alteredData.NFTNonce) > 0 {
@@ -1452,21 +1595,10 @@ func (ei *elasticProcessor) getKDAInfo(account state.AccountHandlerWithGetUserKD
 		return nil, err
 	}
 
-	//Get Asset Precision
-	//TODO: Add cache for this
-	assetKDAaccount, err := ei.kappsDB.LoadAccount(kapps.KDAKAppAddress)
-	if err != nil {
-		return nil, err
-	}
-
-	kdaKapp, ok := assetKDAaccount.(state.KAppAccountHandler)
-	if !ok {
-		return nil, common.ErrWrongTypeAssertion
-	}
-
 	key := kdautils.ToKDAKey([]byte(alteredData.TokenIdentifier), nil)
 
-	kdaBytes, err := kdaKapp.DataTrieTracker().RetrieveValue(key)
+	//Get Asset Precision
+	kdaBytes, err := lookups.kda.DataTrieTracker().RetrieveValue(key)
 	if err != nil {
 		return nil, err
 	}
@@ -1482,17 +1614,7 @@ func (ei *elasticProcessor) getKDAInfo(account state.AccountHandlerWithGetUserKD
 	}
 
 	//Check Staking Data to get the address type
-	stakingKDAAccount, err := ei.kappsDB.LoadAccount(kapps.StakingKAppAddress)
-	if err != nil {
-		return nil, err
-	}
-
-	stakingKapp, ok := stakingKDAAccount.(state.KAppAccountHandler)
-	if !ok {
-		return nil, common.ErrWrongTypeAssertion
-	}
-
-	stakedBytes, err := stakingKapp.DataTrieTracker().RetrieveValue(key)
+	stakedBytes, err := lookups.staking.DataTrieTracker().RetrieveValue(key)
 	if err != nil {
 		return nil, err
 	}
@@ -1583,23 +1705,37 @@ func (ei *elasticProcessor) saveAccounts(
 		return nil
 	}
 
-	newAccountsMap := make(map[string]*data.AccountInfo)
-	updateAccountsMap := make(map[string]*data.AccountInfo)
-	historyAccountsMap := make(map[string]*data.AccountInfo)
-
+	accountsInfo := make(map[string]*data.AccountInfo, len(accountsSlice))
 	for _, userAccount := range accountsSlice {
 		acc, err := buildAccountInfo(ei.addressPubkeyConverter, ei.kappsController, userAccount.UserAccount, blockTimestamp)
 		if err != nil {
 			return err
 		}
 
-		address := acc.Address
+		accountsInfo[acc.Address] = acc
+	}
+
+	return ei.indexResolvedAccounts(blockTimestamp, accountsInfo, buffSlice)
+}
+
+// indexResolvedAccounts partitions already-built account documents into new and updated
+// ones and writes them, plus the account-history rows. The DocExists probe is an
+// Elasticsearch round-trip per account, so this half stays on the indexer worker: block
+// commit must never wait on Elasticsearch.
+func (ei *elasticProcessor) indexResolvedAccounts(
+	blockTimestamp int64,
+	accountsInfo map[string]*data.AccountInfo,
+	buffSlice *data.BufferSlice,
+) error {
+	newAccountsMap := make(map[string]*data.AccountInfo)
+	updateAccountsMap := make(map[string]*data.AccountInfo)
+
+	for address, acc := range accountsInfo {
 		if ei.elasticClient.DocExists(accountsIndex, address) {
 			updateAccountsMap[address] = acc
 		} else {
 			newAccountsMap[address] = acc
 		}
-		historyAccountsMap[address] = acc
 	}
 
 	if err := serializeAccounts(newAccountsMap, buffSlice, accountsIndex); err != nil {
@@ -1610,7 +1746,7 @@ func (ei *elasticProcessor) saveAccounts(
 		return err
 	}
 
-	return ei.saveAccountsHistory(blockTimestamp, historyAccountsMap)
+	return ei.saveAccountsHistory(blockTimestamp, accountsInfo)
 }
 
 func (ei *elasticProcessor) saveAccountsHistory(blockTimestamp int64, accountsInfoMap map[string]*data.AccountInfo) error {

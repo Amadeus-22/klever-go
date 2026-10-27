@@ -79,15 +79,17 @@ func (ep *eventsProcessor) SaveBlock(args *indexerData.ArgsSaveBlockData) {
 		return
 	}
 
-	// Prep runs on the commit goroutine only when websocket subscribers need
-	// it. Indexer-only nodes let the elastic worker re-prep on its own
-	// goroutine via the fallback in elasticProcessor.SaveTransactions.
+	// Prep runs here only when websocket subscribers need it. Otherwise
+	// dataIndexer.SaveBlock preps through PrepareBlockData, still on the
+	// commit goroutine, whenever the accounts index is enabled (KLR-68).
+	// The dispatched account documents ride along in prepared.Accounts so
+	// PrepareBlockData does not resolve those accounts a second time.
 	if wsEnabled {
 		prepared := ep.prepare(args)
 		ep.dispatchBlockEvent(args)
 		if prepared != nil {
 			ep.dispatchTransactionEvents(prepared.Txs)
-			ep.dispatchAccountEventsFromAlteredAccounts(args.Header.GetTimestamp(), prepared.Altered.Accounts)
+			prepared.Accounts = ep.dispatchAccountEventsFromAlteredAccounts(args.Header.GetTimestamp(), prepared.Altered.Accounts)
 		}
 		if indexerEnabled {
 			args.Prepared = prepared
@@ -151,10 +153,11 @@ func (ep *eventsProcessor) dispatchTransactionEvents(txs []*data.Transaction) {
 
 // dispatchAccountEventsFromAlteredAccounts uses GetExistingAccount so that
 // addresses with no persisted state (e.g. ZeroAddress) are silently dropped
-// rather than broadcast as empty ghost accounts.
-func (ep *eventsProcessor) dispatchAccountEventsFromAlteredAccounts(blockTimestamp int64, alteredAccounts data.AlteredAccountsHandler) {
+// rather than broadcast as empty ghost accounts. It returns the dispatched
+// documents; the map is shared with the websocket hub and must not be written.
+func (ep *eventsProcessor) dispatchAccountEventsFromAlteredAccounts(blockTimestamp int64, alteredAccounts data.AlteredAccountsHandler) map[string]*data.AccountInfo {
 	if check.IfNil(ep.accountsDB) || alteredAccounts.Len() == 0 {
-		return
+		return nil
 	}
 
 	accountsMap := make(map[string]*data.AccountInfo, alteredAccounts.Len())
@@ -170,11 +173,9 @@ func (ep *eventsProcessor) dispatchAccountEventsFromAlteredAccounts(blockTimesta
 		accountsMap[info.Address] = info
 	}
 
-	if len(accountsMap) == 0 {
-		return
-	}
-
 	dispatchAccountEvents(accountsMap)
+
+	return accountsMap
 }
 
 // buildAlteredAccountInfo resolves an altered address into an AccountInfo.

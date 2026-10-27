@@ -228,18 +228,26 @@ func (arg Argument) String() string {
 	return string(arg)
 }
 
+func saturatedBigUint(arg Argument) *big.Int {
+	value := big.NewInt(0).SetBytes(arg)
+	if !value.IsUint64() {
+		value.SetUint64(math.MaxUint64)
+	}
+	return value
+}
+
 func (arg Argument) Uint64() uint64 {
 	if arg == nil {
 		return 0
 	}
-	return big.NewInt(0).SetBytes(arg).Uint64()
+	return saturatedBigUint(arg).Uint64()
 }
 
 func (arg Argument) Uint32() uint32 {
 	if arg == nil {
 		return 0
 	}
-	value := big.NewInt(0).SetBytes(arg).Uint64()
+	value := saturatedBigUint(arg).Uint64()
 
 	return tools.SafeU64ToU32(value)
 }
@@ -248,14 +256,14 @@ func (arg Argument) Int64() int64 {
 	if arg == nil {
 		return 0
 	}
-	return big.NewInt(0).SetBytes(arg).Int64()
+	return saturatedBigUint(arg).Int64()
 }
 
 func (arg Argument) Int32() int32 {
 	if arg == nil {
 		return 0
 	}
-	value := big.NewInt(0).SetBytes(arg).Uint64()
+	value := saturatedBigUint(arg).Uint64()
 	if value > math.MaxInt32 {
 		return math.MaxInt32 // overflow to return max value
 	}

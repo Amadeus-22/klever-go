@@ -23,9 +23,13 @@ type BlockProcessorMock struct {
 	CreateNewHeaderCalled            func(slot uint64, nonce uint64) data.HeaderHandler
 	RevertStateToBlockCalled         func(header data.HeaderHandler) error
 	RevertIndexedBlockCalled         func(header data.HeaderHandler)
+	SetProposalControllerCalled      func(controller kapps.ActiveProposalController) error
 }
 
 func (bpm *BlockProcessorMock) SetProposalController(controller kapps.ActiveProposalController) error {
+	if bpm.SetProposalControllerCalled != nil {
+		return bpm.SetProposalControllerCalled(controller)
+	}
 
 	return nil
 }

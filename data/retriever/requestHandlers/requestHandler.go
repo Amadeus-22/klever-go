@@ -319,9 +319,21 @@ func (rrh *resolverRequestHandler) ResetRequests() {
 	rrh.requestedItemsHandler.ResetAll()
 }
 
+// RemoveHeaderRequests forgets the requests made for the header with the given nonce and hash, so both can be requested again
+func (rrh *resolverRequestHandler) RemoveHeaderRequests(nonce uint64, hash []byte) {
+	rrh.requestedItemsHandler.Remove(headerNonceRequestKey(nonce))
+	if len(hash) > 0 {
+		rrh.requestedItemsHandler.Remove(string(hash))
+	}
+}
+
+func headerNonceRequestKey(nonce uint64) string {
+	return fmt.Sprintf("nonce-%d", nonce)
+}
+
 // RequestHeaderByNonce method asks for meta header from the connected peers by nonce
 func (rrh *resolverRequestHandler) RequestHeaderByNonce(nonce uint64) {
-	key := []byte(fmt.Sprintf("nonce-%d", nonce))
+	key := []byte(headerNonceRequestKey(nonce))
 	if !rrh.testIfRequestIsNeeded(key) {
 		return
 	}

@@ -61,3 +61,18 @@ func TestZeroValueIfNil(t *testing.T) {
 	assert.Equal(t, big.NewInt(0), ZeroValueIfNil(nil))
 	assert.Equal(t, big.NewInt(42), ZeroValueIfNil(big.NewInt(42)))
 }
+
+// ValidateTokenIdentifier answers 0, from FixAuditChangesV6, for a buffer longer than
+// TokenIdentifierMaxLength without reading it, so nothing longer may ever be valid: not the
+// official tokens either
+func TestVMCommon_TokenIdentifierMaxLength(t *testing.T) {
+	assert.Equal(t, identifierMaxLength, TokenIdentifierMaxLength)
+	assert.LessOrEqual(t, len("KLV"), TokenIdentifierMaxLength)
+	assert.LessOrEqual(t, len("KFI"), TokenIdentifierMaxLength)
+	assert.True(t, ValidateToken([]byte("KLV")))
+	assert.True(t, ValidateToken([]byte("KFI")))
+	for _, tokenID := range []string{"ABCDEFGHIJK-1A2B", "ABCDEFGHIJ-1A2BC", "ABCDEFGHIJ--1A2B"} {
+		assert.Greater(t, len(tokenID), TokenIdentifierMaxLength)
+		assert.False(t, ValidateToken([]byte(tokenID)), tokenID)
+	}
+}

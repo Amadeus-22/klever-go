@@ -53,7 +53,9 @@ import (
 	"github.com/klever-io/klever-go/tools/check"
 	"github.com/klever-io/klever-go/tools/debug"
 	"github.com/klever-io/klever-go/tools/marshal"
+	"github.com/klever-io/klever-go/tools/panicguard"
 	"github.com/klever-io/klever-go/tools/typeConverters"
+	clientSocket "github.com/klever-io/klever-go/websocket"
 )
 
 // SendTransactionsPipe is the pipe used for sending new transactions
@@ -127,8 +129,7 @@ type Node struct {
 	consensusTopic string
 	consensusType  string
 
-	currentSendingGoRoutines int32
-	bootstrapSlotIndex       uint64
+	bootstrapSlotIndex uint64
 
 	indexer                 process.Indexer
 	bootstrapper            process.Bootstrapper
@@ -144,6 +145,8 @@ type Node struct {
 	txSentCounter         uint32
 	inputAntifloodHandler P2PAntifloodHandler
 	txAccumulator         Accumulator
+	// broadcastBudgets overrides the process-wide broadcast panic budgets; nil in production
+	broadcastBudgets *broadcastPanicBudgets
 
 	//blockTracker             process.BlockTracker
 
@@ -171,7 +174,7 @@ type Node struct {
 	startWithInSync       bool
 	nodeRedundancyHandler consensus.NodeRedundancyHandler
 
-	proposalController kapps.ActiveProposalController
+	proposalController kapps.ProposalControllerHolder
 	forkController     core.ForkController
 	enableEpochsConfig config.EnableEpochsConfig
 
@@ -198,7 +201,6 @@ func (n *Node) ApplyOptions(opts ...Option) error {
 func NewNode(opts ...Option) (*Node, error) {
 	node := &Node{
 		ctx:                          context.Background(),
-		currentSendingGoRoutines:     0,
 		appStatusHandler:             statusHandler.NewNilStatusHandler(),
 		queryHandlers:                make(map[string]debug.QueryHandler),
 		consensusMonitorList:         make([]string, 0),
@@ -264,16 +266,7 @@ func (n *Node) StartConsensus() error {
 		return common.ErrGenesisBlockNotInitialized
 	}
 
-	if !n.indexer.IsNilIndexer() {
-		log.Warn("node is running with a valid indexer. Chronology watchdog will be turned off as " +
-			"it is incompatible with the indexing process.")
-		n.watchdog = &watchdog.DisabledWatchdog{}
-	}
-	if n.isInImportMode {
-		log.Warn("node is running in import mode. Chronology watchdog will be turned off as " +
-			"it is incompatible with the import-db process.")
-		n.watchdog = &watchdog.DisabledWatchdog{}
-	}
+	n.disableIncompatibleWatchdog()
 
 	alarmScheduler := alarm.NewAlarmScheduler()
 
@@ -314,66 +307,9 @@ func (n *Node) StartConsensus() error {
 
 	n.bootstrapper.LoadStorage()
 
-	log.Trace("creating proposal kapp")
+	epoch := n.currentEpoch()
 
-	acnt, err := n.kapps.LoadAccount(kapps.ProposalKAppAddress)
-	if err != nil {
-		return err
-	}
-
-	proposalKApp, ok := acnt.(state.KAppAccountHandler)
-	if !ok {
-		return common.ErrWrongTypeAssertion
-	}
-
-	epoch := n.blkc.GetGenesisHeader().GetEpoch()
-	crtBlockHeader := n.blkc.GetCurrentBlockHeader()
-	if !check.IfNil(crtBlockHeader) {
-		epoch = crtBlockHeader.GetEpoch()
-	}
-
-	if !check.IfNil(crtBlockHeader) && !check.IfNil(n.heartbeatHandler) {
-		n.heartbeatHandler.RefreshPeerTypeCache(epoch)
-	}
-
-	forkControllerSubscriber, ok := n.forkController.(core.EpochSubscriberHandler)
-	if !ok {
-		return common.ErrWrongTypeAssertion
-	}
-
-	forkControllerSubscriber.EpochConfirmed(epoch)
-
-	n.proposalController, err = proposalKApp.StartProposalsKApp(n.forkController)
-	if err != nil {
-		return err
-	}
-
-	err = n.kapps.SaveAccount(proposalKApp)
-	if err != nil {
-		return err
-	}
-
-	err = n.feeHandler.SetProposalController(n.proposalController)
-	if err != nil {
-		return err
-	}
-
-	err = n.blockProcessor.SetProposalController(n.proposalController)
-	if err != nil {
-		return err
-	}
-
-	err = n.txProcessor.SetProposalController(n.proposalController)
-	if err != nil {
-		return err
-	}
-
-	err = n.kappController.SetProposalController(n.proposalController)
-	if err != nil {
-		return err
-	}
-
-	err = n.kappControllerSimulator.SetProposalController(n.proposalController)
+	err = n.startProposalController(epoch)
 	if err != nil {
 		return err
 	}
@@ -494,6 +430,95 @@ func (n *Node) StartConsensus() error {
 	return nil
 }
 
+// disableIncompatibleWatchdog turns the chronology watchdog off for the running
+// modes it cannot coexist with.
+func (n *Node) disableIncompatibleWatchdog() {
+	if !n.indexer.IsNilIndexer() {
+		log.Warn("node is running with a valid indexer. Chronology watchdog will be turned off as " +
+			"it is incompatible with the indexing process.")
+		n.watchdog = &watchdog.DisabledWatchdog{}
+	}
+	if n.isInImportMode {
+		log.Warn("node is running in import mode. Chronology watchdog will be turned off as " +
+			"it is incompatible with the import-db process.")
+		n.watchdog = &watchdog.DisabledWatchdog{}
+	}
+}
+
+// currentEpoch returns the epoch of the current block header, falling back to
+// the genesis one before the first block is committed. It also refreshes the
+// heartbeat peer type cache once a current header exists.
+func (n *Node) currentEpoch() uint32 {
+	crtBlockHeader := n.blkc.GetCurrentBlockHeader()
+	if check.IfNil(crtBlockHeader) {
+		return n.blkc.GetGenesisHeader().GetEpoch()
+	}
+
+	epoch := crtBlockHeader.GetEpoch()
+	if !check.IfNil(n.heartbeatHandler) {
+		n.heartbeatHandler.RefreshPeerTypeCache(epoch)
+	}
+
+	return epoch
+}
+
+// startProposalController loads the proposal kapp, confirms the epoch on the
+// fork controller and publishes the resulting controller to its consumers.
+func (n *Node) startProposalController(epoch uint32) error {
+	log.Trace("creating proposal kapp")
+
+	acnt, err := n.kapps.LoadAccount(kapps.ProposalKAppAddress)
+	if err != nil {
+		return err
+	}
+
+	proposalKApp, ok := acnt.(state.KAppAccountHandler)
+	if !ok {
+		return common.ErrWrongTypeAssertion
+	}
+
+	forkControllerSubscriber, ok := n.forkController.(core.EpochSubscriberHandler)
+	if !ok {
+		return common.ErrWrongTypeAssertion
+	}
+
+	forkControllerSubscriber.EpochConfirmed(epoch)
+
+	proposalController, err := proposalKApp.StartProposalsKApp(n.forkController)
+	if err != nil {
+		return err
+	}
+
+	err = n.publishProposalController(proposalController)
+	if err != nil {
+		return err
+	}
+
+	return n.kapps.SaveAccount(proposalKApp)
+}
+
+// publishProposalController hands the same controller to every consumer that
+// reads proposal parameters. The node holder goes first so API readers stop
+// getting ErrProposalNotInitialized as early as possible.
+func (n *Node) publishProposalController(controller kapps.ActiveProposalController) error {
+	n.proposalController.Set(controller)
+
+	setters := []func(kapps.ActiveProposalController) error{
+		n.feeHandler.SetProposalController,
+		n.blockProcessor.SetProposalController,
+		n.kappController.SetProposalController,
+		n.kappControllerSimulator.SetProposalController,
+	}
+
+	for _, set := range setters {
+		if err := set(controller); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (n *Node) createBootstrapper(slotManager consensus.SlotManager) (process.Bootstrapper, error) {
 	return n.createMetaChainBootstrapper(slotManager)
 }
@@ -535,24 +560,73 @@ func (n *Node) sendFromTxAccumulator() {
 
 	for objs := range outputChannel {
 		//this will read continuously until the chan is closed
+		n.sendAccumulatedTransactions(objs)
+	}
+}
 
-		if len(objs) == 0 {
+// sendAccumulatedTransactions sends one batch drained from the tx accumulator. The barrier is per
+// batch, not around the loop: recovering outside the loop would keep the node up but end the loop,
+// silently stopping every later API-submitted transaction from being broadcast.
+func (n *Node) sendAccumulatedTransactions(objs []any) {
+	if len(objs) == 0 {
+		return
+	}
+
+	txs := make([]*transaction.Transaction, 0, len(objs))
+	for _, obj := range objs {
+		tx, ok := obj.(*transaction.Transaction)
+		if !ok {
 			continue
 		}
 
-		txs := make([]*transaction.Transaction, 0, len(objs))
-		for _, obj := range objs {
-			tx, ok := obj.(*transaction.Transaction)
-			if !ok {
-				continue
-			}
+		txs = append(txs, tx)
+	}
 
-			txs = append(txs, tx)
-		}
+	// A single poison tx is contained in marshalForBroadcast; this catches the rest of the batch
+	// (packing, spawning the broadcasts), which drops the whole batch, so the log says how many.
+	defer recoverBroadcastPanic("sendFromTxAccumulator", n.panicBudgets().accumulator, "droppedTxs", len(txs))
 
-		atomic.AddUint32(&n.txSentCounter, uint32(len(txs))) // #nosec G115
+	// Counted after the send, so a batch lost before the handoff does not show up as sent; a packet
+	// that fails after the handoff (a recovered panic, a failed broadcast) is still counted.
+	sent := n.sendBulkTransactions(txs)
+	atomic.AddUint32(&n.txSentCounter, uint32(sent)) // #nosec G115
+}
 
-		n.sendBulkTransactions(txs)
+// broadcastPanicMessage is the log line of every transaction broadcast barrier
+const broadcastPanicMessage = "panic in transaction broadcast goroutine"
+
+// broadcastPanicBudgets holds one log budget per barrier, so a flood of panics at one site cannot
+// silence another. Without them, a panic reachable from a crafted tx would buy a stack trace per
+// /transaction/broadcast.
+type broadcastPanicBudgets struct {
+	accumulator panicguard.Budget
+	marshal     panicguard.Budget
+	packet      panicguard.Budget
+	counter     panicguard.Budget
+}
+
+// defaultBroadcastPanicBudgets is shared by every node in the process, as the log it guards is
+var defaultBroadcastPanicBudgets = &broadcastPanicBudgets{
+	accumulator: clientSocket.NewDropWarner(clientSocket.PeerDrivenLogWindow),
+	marshal:     clientSocket.NewDropWarner(clientSocket.PeerDrivenLogWindow),
+	packet:      clientSocket.NewDropWarner(clientSocket.PeerDrivenLogWindow),
+	counter:     clientSocket.NewDropWarner(clientSocket.PeerDrivenLogWindow),
+}
+
+func (n *Node) panicBudgets() *broadcastPanicBudgets {
+	if n.broadcastBudgets != nil {
+		return n.broadcastBudgets
+	}
+	return defaultBroadcastPanicBudgets
+}
+
+// recoverBroadcastPanic is the barrier for the goroutines that broadcast API-submitted transactions
+// (KLC-2700). They run outside gin.Recovery(), after the request has already answered, so an
+// unrecovered panic in them takes the node down. It must be deferred directly for recover() to see
+// the panic.
+func recoverBroadcastPanic(goroutine string, budget panicguard.Budget, extra ...any) {
+	if r := recover(); r != nil {
+		panicguard.Log(log, broadcastPanicMessage, goroutine, r, budget, extra...)
 	}
 }
 
@@ -623,20 +697,17 @@ func (n *Node) SendBulkTransactions(txs []*transaction.Transaction) ([]string, e
 	return txsHashes, nil
 }
 
-// sendBulkTransactions sends the provided transactions as a bulk, optimizing transfer between nodes
-func (n *Node) sendBulkTransactions(txs []*transaction.Transaction) {
+// sendBulkTransactions sends the provided transactions as a bulk, optimizing transfer between nodes.
+// It returns how many of them were handed to the messenger.
+func (n *Node) sendBulkTransactions(txs []*transaction.Transaction) int {
 	transactions := make([][]byte, 0)
 	log.Trace("node.sendBulkTransactions sending txs",
 		"num", len(txs),
 	)
 
 	for _, tx := range txs {
-
-		marshalizedTx, err := n.internalMarshalizer.Marshal(tx)
-		if err != nil {
-			log.Warn("node.sendBulkTransactions",
-				"marshalizer error", err,
-			)
+		marshalizedTx, ok := n.marshalForBroadcast(tx)
+		if !ok {
 			continue
 		}
 
@@ -646,7 +717,32 @@ func (n *Node) sendBulkTransactions(txs []*transaction.Transaction) {
 	err := n.sendBulkTransactionsPack(transactions)
 	if err != nil {
 		log.Debug("sendBulkTransactions", "error", err.Error())
+		return 0
 	}
+
+	return len(transactions)
+}
+
+// marshalForBroadcast marshals one transaction under its own barrier, so a transaction that makes
+// the marshalizer panic is dropped alone instead of taking its whole accumulator batch with it. It
+// logs its own failure.
+func (n *Node) marshalForBroadcast(tx *transaction.Transaction) (marshalizedTx []byte, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicguard.Log(log, broadcastPanicMessage, "marshalForBroadcast", r, n.panicBudgets().marshal)
+			marshalizedTx, ok = nil, false
+		}
+	}()
+
+	marshalizedTx, err := n.internalMarshalizer.Marshal(tx)
+	if err != nil {
+		log.Warn("node.sendBulkTransactions",
+			"marshalizer error", err,
+		)
+		return nil, false
+	}
+
+	return marshalizedTx, true
 }
 
 func (n *Node) sendBulkTransactionsPack(transactions [][]byte) error {
@@ -662,23 +758,23 @@ func (n *Node) sendBulkTransactionsPack(transactions [][]byte) error {
 		return err
 	}
 
-	atomic.AddInt32(&n.currentSendingGoRoutines, int32(len(packets))) // #nosec G115
 	for _, buff := range packets {
 		go func(bufferToSend []byte) {
+			defer recoverBroadcastPanic("sendBulkTransactionsPack", n.panicBudgets().packet)
+
 			log.Trace("node.sendBulkTransactions",
 				"topic", identifier,
 				"size", len(bufferToSend),
 			)
-			err = n.messenger.BroadcastOnChannelBlocking(
+			// Packet goroutines run concurrently, so each keeps its own error.
+			errBroadcast := n.messenger.BroadcastOnChannelBlocking(
 				SendTransactionsPipe,
 				identifier,
 				bufferToSend,
 			)
-			if err != nil {
-				log.Debug("node.BroadcastOnChannelBlocking", "error", err.Error())
+			if errBroadcast != nil {
+				log.Debug("node.BroadcastOnChannelBlocking", "error", errBroadcast.Error())
 			}
-
-			atomic.AddInt32(&n.currentSendingGoRoutines, -1)
 		}(buff)
 	}
 
@@ -689,31 +785,43 @@ func (n *Node) sendBulkTransactionsPack(transactions [][]byte) error {
 // if this peak value is 0 (no transaction was sent through the REST API interface), the print will not be done
 // the peak counter resets after each print. There is also a total number of transactions sent to p2p
 func (n *Node) printTxSentCounter() {
-	maxTxCounter := uint32(0)
-	totalTxCounter := uint64(0)
-	counterSeconds := 0
+	stats := &txSentStats{}
 
 	for {
 		time.Sleep(time.Second)
+		n.recordTxSentSecond(stats)
+	}
+}
 
-		txSent := atomic.SwapUint32(&n.txSentCounter, 0)
-		if txSent > maxTxCounter {
-			maxTxCounter = txSent
+// txSentStats is the state printTxSentCounter carries from one second to the next
+type txSentStats struct {
+	maxTxCounter   uint32
+	totalTxCounter uint64
+	counterSeconds int
+}
+
+// recordTxSentSecond folds one second of sent transactions into stats. The barrier is per second, as
+// for the accumulator: a barrier around the loop would keep the node up but end the counter.
+func (n *Node) recordTxSentSecond(stats *txSentStats) {
+	defer recoverBroadcastPanic("printTxSentCounter", n.panicBudgets().counter)
+
+	txSent := atomic.SwapUint32(&n.txSentCounter, 0)
+	if txSent > stats.maxTxCounter {
+		stats.maxTxCounter = txSent
+	}
+	stats.totalTxCounter += uint64(txSent)
+
+	stats.counterSeconds++
+	if stats.counterSeconds > numSecondsBetweenPrints {
+		stats.counterSeconds = 0
+
+		if stats.maxTxCounter > 0 {
+			log.Info("sent transactions on network",
+				"max/sec", stats.maxTxCounter,
+				"total", stats.totalTxCounter,
+			)
 		}
-		totalTxCounter += uint64(txSent)
-
-		counterSeconds++
-		if counterSeconds > numSecondsBetweenPrints {
-			counterSeconds = 0
-
-			if maxTxCounter > 0 {
-				log.Info("sent transactions on network",
-					"max/sec", maxTxCounter,
-					"total", totalTxCounter,
-				)
-			}
-			maxTxCounter = 0
-		}
+		stats.maxTxCounter = 0
 	}
 }
 
@@ -955,7 +1063,12 @@ func (n *Node) GetPeerInfo(pid string) ([]core.QueryP2PPeerInfo, error) {
 }
 
 func (n *Node) GetProposalParameters() (map[int32]*kapps.Parameter, error) {
-	return n.proposalController.GetActiveParameters(), nil
+	controller := n.proposalController.Get()
+	if check.IfNil(controller) {
+		return nil, process.ErrProposalNotInitialized
+	}
+
+	return controller.GetActiveParameters(), nil
 }
 
 func (n *Node) createPidInfo(p core.PeerID) core.QueryP2PPeerInfo {

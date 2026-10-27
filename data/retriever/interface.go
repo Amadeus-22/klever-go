@@ -306,6 +306,7 @@ type WhiteListHandler interface {
 type RequestedItemsHandler interface {
 	Add(key string) error
 	Has(key string) bool
+	Remove(key string)
 	Sweep()
 	ResetAll()
 	IsInterfaceNil() bool

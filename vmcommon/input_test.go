@@ -136,9 +136,21 @@ func TestArgument_String(t *testing.T) {
 	assert.Equal(t, "", nilArg.String())
 }
 
+var (
+	maxUint64Argument  Argument = big.NewInt(0).SetUint64(math.MaxUint64).Bytes()
+	twoPow64Argument   Argument = big.NewInt(0).Lsh(big.NewInt(1), 64).Bytes()
+	oversizedArgument  Argument = big.NewInt(0).Add(big.NewInt(0).Lsh(big.NewInt(1), 64), big.NewInt(5)).Bytes()
+	zeroPaddedArgument Argument = []byte{0, 0, 0, 0, 0, 0, 0, 0, 5}
+)
+
 func TestArgument_Uint64(t *testing.T) {
 	var arg Argument = big.NewInt(100).Bytes()
 	assert.Equal(t, uint64(100), arg.Uint64())
+
+	assert.Equal(t, uint64(math.MaxUint64), maxUint64Argument.Uint64())
+	assert.Equal(t, uint64(math.MaxUint64), twoPow64Argument.Uint64())
+	assert.Equal(t, uint64(math.MaxUint64), oversizedArgument.Uint64())
+	assert.Equal(t, uint64(5), zeroPaddedArgument.Uint64())
 
 	var nilArg Argument = nil
 	assert.Equal(t, uint64(0), nilArg.Uint64())
@@ -148,6 +160,11 @@ func TestArgument_Uint32(t *testing.T) {
 	var arg Argument = big.NewInt(100).Bytes()
 	assert.Equal(t, uint32(100), arg.Uint32())
 
+	assert.Equal(t, uint32(math.MaxUint32), maxUint64Argument.Uint32())
+	assert.Equal(t, uint32(math.MaxUint32), twoPow64Argument.Uint32())
+	assert.Equal(t, uint32(math.MaxUint32), oversizedArgument.Uint32())
+	assert.Equal(t, uint32(5), zeroPaddedArgument.Uint32())
+
 	var nilArg Argument = nil
 	assert.Equal(t, uint32(0), nilArg.Uint32())
 }
@@ -155,6 +172,11 @@ func TestArgument_Uint32(t *testing.T) {
 func TestArgument_Int64(t *testing.T) {
 	var arg Argument = big.NewInt(100).Bytes()
 	assert.Equal(t, int64(100), arg.Int64())
+
+	assert.Equal(t, int64(-1), maxUint64Argument.Int64())
+	assert.Equal(t, int64(-1), twoPow64Argument.Int64())
+	assert.Equal(t, int64(-1), oversizedArgument.Int64())
+	assert.Equal(t, int64(5), zeroPaddedArgument.Int64())
 
 	var nilArg Argument = nil
 	assert.Equal(t, int64(0), nilArg.Int64())
@@ -166,6 +188,10 @@ func TestArgument_Int32(t *testing.T) {
 
 	var overflowArg Argument = big.NewInt(0).SetUint64(math.MaxUint64).Bytes()
 	assert.Equal(t, int32(math.MaxInt32), overflowArg.Int32()) // Overflow
+
+	assert.Equal(t, int32(math.MaxInt32), twoPow64Argument.Int32())
+	assert.Equal(t, int32(math.MaxInt32), oversizedArgument.Int32())
+	assert.Equal(t, int32(5), zeroPaddedArgument.Int32())
 
 	var nilArg Argument = nil
 	assert.Equal(t, int32(0), nilArg.Int32())

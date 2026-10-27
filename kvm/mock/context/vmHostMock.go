@@ -29,6 +29,8 @@ type VMHostMock struct {
 	ForkControllerContext core.ForkController
 	ManagedTypesContext   vmhost.ManagedTypesContext
 
+	CreateNewContractCalled func(input *vmcommon.ContractCreateInput, createContractCallType int) ([]byte, error)
+
 	IsBuiltinFunc bool
 
 	StoredInputs []*vmcommon.ContractCallInput
@@ -108,7 +110,10 @@ func (host *VMHostMock) ExecuteKDATransfer(_ *vmhost.KDATransfersArgs, _ vm.Call
 }
 
 // CreateNewContract mocked method
-func (host *VMHostMock) CreateNewContract(_ *vmcommon.ContractCreateInput, _ int) ([]byte, error) {
+func (host *VMHostMock) CreateNewContract(input *vmcommon.ContractCreateInput, createContractCallType int) ([]byte, error) {
+	if host.CreateNewContractCalled != nil {
+		return host.CreateNewContractCalled(input, createContractCallType)
+	}
 	return nil, nil
 }
 

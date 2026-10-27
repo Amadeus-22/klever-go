@@ -67,13 +67,10 @@ func (e EnableEpochs) Validate() error {
 			e.FixAuditChangesV5, e.FixAuditChangesV4)
 	}
 
-	// fixAuditChangesV6 must be strictly after fixAuditChangesV5: sharing or preceding it
-	// would apply the V6 changes to blocks already committed under V5 rules. A V5 left at
-	// the placeholder is not a real schedule, so it is not checked.
-	if e.FixAuditChangesV5 != 0 && e.FixAuditChangesV6 <= e.FixAuditChangesV5 {
-		return fmt.Errorf("fixAuditChangesV6 (%d) must be after fixAuditChangesV5 (%d), "+
-			"otherwise the V6 changes apply retroactively to blocks committed under V5 rules",
-			e.FixAuditChangesV6, e.FixAuditChangesV5)
+	if e.FixAuditChangesV6 < e.BigBucketsCompute {
+		return fmt.Errorf("fixAuditChangesV6 (%d) must not be before bigBucketsCompute (%d), "+
+			"otherwise V6 claims would use the legacy APR arithmetic",
+			e.FixAuditChangesV6, e.BigBucketsCompute)
 	}
 
 	return nil

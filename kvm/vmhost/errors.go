@@ -110,6 +110,9 @@ var ErrStoreReservedKey = errors.New("cannot write to storage under reserved key
 // ErrCannotWriteProtectedKey signals an attempt to write to a protected key, while storage protection is enforced
 var ErrCannotWriteProtectedKey = errors.New("cannot write to protected key")
 
+// ErrStorageKeyTooLong signals a storage write whose key exceeds common.MaxStorageKeyLength
+var ErrStorageKeyTooLong = errors.New("storage key too long")
+
 // ErrNonPayableFunctionKda signals that a non-payable function received non-zero KDA call value
 var ErrNonPayableFunctionKda = errors.New("function does not accept KDA payment")
 
@@ -157,6 +160,9 @@ var ErrAccountNotPayable = errors.New("sending value to non payable contract")
 
 // ErrInvalidPublicKeySize signals that the public key size is invalid
 var ErrInvalidPublicKeySize = errors.New("invalid public key size")
+
+// ErrInvalidSignatureSize signals that the signature size is invalid
+var ErrInvalidSignatureSize = errors.New("invalid signature size")
 
 // ErrNilCallbackFunction signals that a nil callback function has been provided
 var ErrNilCallbackFunction = errors.New("nil callback function")
@@ -272,6 +278,10 @@ var ErrManagedBufferLengthExceedsMaximum = errors.New("managed buffer length exc
 
 // ErrRAndSExceedsMax32BytesSecp256k1 signals that r and s are greater than 32 bytes max allowed on Secp256k1
 var ErrRAndSExceedsMax32BytesSecp256k1 = errors.New("invalid length of secp256k1 r and s")
+
+// ErrInvalidSecp256k1PlainMessageLength signals that a secp256k1 verification in plain-message
+// mode was given a message that is not exactly the 32-byte digest the curve signs
+var ErrInvalidSecp256k1PlainMessageLength = errors.New("secp256k1 plain message must be exactly 32 bytes")
 
 // ErrManagedBufferToHexLengthExceedsMaximum signals that the source buffer passed to
 // managedBufferToHex exceeds the protocol maximum

@@ -1,11 +1,12 @@
 package address
 
 import (
+	"context"
+	stdErrors "errors"
 	"fmt"
 	"net/http"
-	"runtime/debug"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	logger "github.com/klever-io/klever-go-logger"
@@ -30,20 +31,20 @@ const (
 
 	defaultAsset = "KLV"
 
-	// maxAssetsPerClaimList bounds the per-request fanout. Each asset costs three exclusive
-	// AccountsDB.LoadAccount acquisitions (the user account plus the Staking and KDA kapp
-	// accounts), on mutexes shared with block processing, so the cap is set from that cost
-	// rather than from what a client might conceivably ask for. Raise it once the invariant
-	// loads are hoisted out of the fanout (KLC-2652), which drops the per-request cost from
-	// 3n acquisitions to 3.
+	// maxAssetsPerClaimList bounds the per-request asset count. The user account and the
+	// Staking and KDA kapp accounts are loaded once per request (KLC-2652), so a request costs
+	// three exclusive AccountsDB acquisitions regardless of the asset count, plus one on the kapps
+	// adapter for the Validators kapp (KLV pending rewards) when KLV is requested. Each asset still
+	// costs three data-trie reads, computed sequentially, and each read takes that trie's
+	// exclusive lock; the Staking and KDA data tries are shared with block processing through
+	// the AccountsDB data-trie cache, so this cap is what bounds that remaining contention.
 	maxAssetsPerClaimList = 25
-	// maxConcurrentClaimLookups bounds in-flight lookups per request. Useful parallelism here
-	// is about two: LoadAccount holds an exclusive mutex for its whole call, and each asset
-	// takes one acquisition on the user adapter and two on the kapps adapter, so extra
-	// goroutines queue rather than overlap. Only the trie reads outside LoadAccount overlap,
-	// which is what the remaining headroom is for. Node-wide this multiplies by
-	// webServer.simultaneousRequests, so the constant is deliberately small.
-	maxConcurrentClaimLookups = 4
+
+	// availableClaimListTimeout is the deadline after which a claim-list request stops taking
+	// new state locks and is answered as timed out. The node checks it before each state load,
+	// before each asset and before the KLV pending-rewards load: a lookup already blocked on a
+	// state lock is not interrupted, and keeps the request's global throttler slot until it returns.
+	availableClaimListTimeout = 10 * time.Second
 )
 
 // FacadeHandler interface defines methods that can be used by the gin webserver
@@ -53,6 +54,7 @@ type FacadeHandler interface {
 	GetBalance(address string, kda string) (*models.BalanceResponse, error)
 	GetUserKDA(address string, kda string) (*kapps.UserKDA, error)
 	GetAvailableClaim(address string, assetId string) (*models.AvailableClaimResponse, error)
+	GetAvailableClaimList(ctx context.Context, address string, assetIds []string) (map[string]*models.AvailableClaimResponse, map[string]error, error)
 	IsInterfaceNil() bool
 }
 
@@ -393,6 +395,7 @@ func parseRequestedAssets(assets string) []string {
 // @Success 200 object shared.GenericAPIResponse{data=models.AvailableClaimListResponse} "ok"
 // @Failure 400 object shared.GenericAPIResponse "some error"
 // @Failure 500 object shared.GenericAPIResponse "internal error"
+// @Failure 503 object shared.GenericAPIResponse "request timed out"
 // @Router /address/{address}/allowance/list [get]
 // GetAvailableClaimList returns the rewards available for a specific list of asset in an account
 func GetAvailableClaimList(c *gin.Context) {
@@ -446,52 +449,40 @@ func GetAvailableClaimList(c *gin.Context) {
 		return
 	}
 
-	var wg sync.WaitGroup
-	var lock sync.Mutex
-	allowanceError := make(map[string]error)
-	assetData := make(map[string]*models.AvailableClaimResponse, len(assetList))
+	// One facade call per request: the account and kapp state is loaded once and shared by every
+	// requested asset, so a request costs a constant number of accounts-adapter lock acquisitions.
+	//
+	// The lookup runs under availableClaimListTimeout, so a request that outlives it stops
+	// instead of running every asset. The deadline is the only thing that ends it early: the
+	// request context's cancellation is deliberately dropped. net/http cancels that context when
+	// the read side of the connection reaches EOF, which also happens for a client that only
+	// closed its write side and is still waiting for the answer it has always received. It is not
+	// a bound either, since a client keeps the context alive by declaring a request body, which
+	// this route ignores, or by sending one more byte after the headers.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), availableClaimListTimeout)
+	defer cancel()
 
-	sem := make(chan struct{}, maxConcurrentClaimLookups)
-
-	for _, asset := range assetList {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(assetId string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			// gin.Recovery only wraps the handler goroutine, so an unrecovered panic here
-			// would terminate the node process rather than fail the request.
-			defer func() {
-				r := recover()
-				if r == nil {
-					return
-				}
-
-				log.Error("recovered from panic while computing available claim",
-					"address", addr,
-					"asset", assetId,
-					"panic", r,
-					"stack", string(debug.Stack()),
-				)
-
-				lock.Lock()
-				defer lock.Unlock()
-				allowanceError[assetId] = errors.ErrClaimLookupFailed
-			}()
-
-			claimResponse, err := facade.GetAvailableClaim(addr, assetId)
-
-			lock.Lock()
-			defer lock.Unlock()
-			if err != nil {
-				allowanceError[assetId] = err
-				return
-			}
-			assetData[assetId] = claimResponse
-		}(asset)
+	assetData, allowanceError, err := facade.GetAvailableClaimList(ctx, addr, assetList)
+	// The node checks the deadline before each asset but not after the last one, so a lookup can
+	// return a result after the deadline passed. That is a timeout too: the context is checked
+	// here so every request that outlives the deadline gets the same answer.
+	if stdErrors.Is(err, context.DeadlineExceeded) || stdErrors.Is(ctx.Err(), context.DeadlineExceeded) {
+		shared.RespondWith(
+			c,
+			http.StatusServiceUnavailable,
+			nil,
+			errors.APIErrorString(errors.ErrGetAvailableClaimList, errors.ErrRequestTimedOut),
+			shared.ReturnCodeSystemBusy,
+		)
+		return
 	}
-
-	wg.Wait()
+	if err != nil {
+		// keep the per-asset error shape clients already receive for request-level failures
+		allowanceError = make(map[string]error, len(assetList))
+		for _, assetId := range assetList {
+			allowanceError[assetId] = err
+		}
+	}
 
 	if len(allowanceError) > 0 {
 		c.JSON(

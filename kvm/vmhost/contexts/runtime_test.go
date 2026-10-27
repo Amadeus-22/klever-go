@@ -1491,3 +1491,23 @@ func TestRuntimeContext_DisarmPendingCodeVerification(t *testing.T) {
 	runtimeCtx.DisarmPendingCodeVerification()
 	require.False(t, runtimeCtx.verifyCode)
 }
+
+// TestRuntimeContext_APIErrorsFailExecution pins every VM API error to aborting the execution.
+// There is no sub-transaction rollback (KLC-2686): a transfer settled by a VM hook stays in the
+// accounts cacher until txProcess resets it, and txProcess resets it only when the transaction
+// fails. If any of these returned false, a contract could survive a failed transfer-and-execute
+// and keep the half-applied state.
+// Adding sub-call rollback is a precondition for flipping any of them.
+func TestRuntimeContext_APIErrorsFailExecution(t *testing.T) {
+	host := InitializeVMAndWasmer()
+	runtimeCtx := makeDefaultRuntimeContext(t, host)
+	defer runtimeCtx.ClearWarmInstanceCache()
+
+	require.True(t, runtimeCtx.BaseOpsErrorShouldFailExecution())
+	require.True(t, runtimeCtx.SyncExecAPIErrorShouldFailExecution())
+	require.True(t, runtimeCtx.BigIntAPIErrorShouldFailExecution())
+	require.True(t, runtimeCtx.BigFloatAPIErrorShouldFailExecution())
+	require.True(t, runtimeCtx.CryptoAPIErrorShouldFailExecution())
+	require.True(t, runtimeCtx.ManagedBufferAPIErrorShouldFailExecution())
+	require.True(t, runtimeCtx.ManagedMapAPIErrorShouldFailExecution())
+}

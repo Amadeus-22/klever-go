@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	logger "github.com/klever-io/klever-go-logger"
+	"github.com/klever-io/klever-go/common"
 	"github.com/klever-io/klever-go/kapps"
 	"github.com/klever-io/klever-go/kvm/config"
 	"github.com/klever-io/klever-go/kvm/math"
@@ -14,6 +15,8 @@ import (
 )
 
 var logStorage = logger.GetOrCreate("vm/storage")
+
+const storageSetLogMessage = "storage set"
 
 var _ vmhost.StorageContext = (*storageContext)(nil)
 
@@ -293,6 +296,11 @@ func (context *storageContext) setStorageToAddress(address []byte, key []byte, v
 		return context.storageUnchanged(lengthNewValue)
 	}
 
+	if lengthNewValue > 0 && len(key) > common.MaxStorageKeyLength && context.host.ForkController().FixAuditChangesV6() {
+		logStorage.Trace(storageSetLogMessage, "error", vmhost.ErrStorageKeyTooLong, "key", key)
+		return vmhost.StorageUnchanged, vmhost.ErrStorageKeyTooLong
+	}
+
 	lengthOldValue := len(oldValue)
 
 	deltaBytes := lengthNewValue - lengthOldValue
@@ -337,15 +345,15 @@ func (context *storageContext) setStorageToAddress(address []byte, key []byte, v
 
 func (context *storageContext) checkReservedAndProtection(key []byte) error {
 	if context.host.Runtime().ReadOnly() {
-		logStorage.Trace("storage set", "error", "cannot set storage in readonly mode")
+		logStorage.Trace(storageSetLogMessage, "error", "cannot set storage in readonly mode")
 		return vmhost.ErrCannotWriteOnReadOnly
 	}
 	if !context.isVMProtectedKey(key) && context.isProtocolProtectedKey(key) {
-		logStorage.Trace("storage set", "error", vmhost.ErrStoreReservedKey, "key", key)
+		logStorage.Trace(storageSetLogMessage, "error", vmhost.ErrStoreReservedKey, "key", key)
 		return vmhost.ErrStoreReservedKey
 	}
 	if context.isVMProtectedKey(key) && context.vmStorageProtectionEnabled {
-		logStorage.Trace("storage set", "error", vmhost.ErrCannotWriteProtectedKey, "key", key)
+		logStorage.Trace(storageSetLogMessage, "error", vmhost.ErrCannotWriteProtectedKey, "key", key)
 		return vmhost.ErrCannotWriteProtectedKey
 	}
 	return nil

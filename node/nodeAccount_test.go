@@ -1,6 +1,7 @@
 package node_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -9,10 +10,12 @@ import (
 	"github.com/klever-io/klever-go/common/mock"
 	"github.com/klever-io/klever-go/core"
 	"github.com/klever-io/klever-go/core/kapp"
+	"github.com/klever-io/klever-go/core/process/kda/kdautils"
 	"github.com/klever-io/klever-go/data"
 	"github.com/klever-io/klever-go/data/state"
 	"github.com/klever-io/klever-go/kapps"
 	"github.com/klever-io/klever-go/kvm/mock/stub"
+	"github.com/klever-io/klever-go/network/api/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -526,4 +529,440 @@ func TestGetAvailableClaim(t *testing.T) {
 			require.Equal(t, tt.wantAllowance, allowance)
 		})
 	}
+
+	aprSupplyTests := []struct {
+		name            string
+		computed        map[string]int64
+		computeErr      error
+		kda             *kapps.KDAData
+		expectedRewards int64
+	}{
+		{"gain overflowing int64 reports nothing", nil, common.ErrInt64Overflow, &kapps.KDAData{Name: []byte("MYTOKEN")}, 0},
+		{"negative supply reports nothing", map[string]int64{"MYTOKEN": 200}, nil, &kapps.KDAData{CirculatingSupply: -1}, 0},
+		{"uncapped supply overflow reports nothing", map[string]int64{"MYTOKEN": 200}, nil, &kapps.KDAData{CirculatingSupply: 1<<63 - 100}, 0},
+		{"gain above the cap reports nothing", map[string]int64{"MYTOKEN": 200}, nil, &kapps.KDAData{MaxSupply: 1000, CirculatingSupply: 1000}, 0},
+		{"gain within the cap is reported", map[string]int64{"MYTOKEN": 200}, nil, &kapps.KDAData{MaxSupply: 1000, CirculatingSupply: 800}, 200},
+	}
+
+	for _, tt := range aprSupplyTests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			computed, computeErr := tt.computed, tt.computeErr
+			userAcc := &mock.UserAccountHandlerStub{
+				AddressBytesCalled: func() []byte { return []byte{0xAA, 0xBB} },
+				GetUserKDACalled:   func([]byte, []byte, bool) (*kapps.UserKDA, error) { return &kapps.UserKDA{}, nil },
+				ComputeAvailableClaimCalled: func([]byte, uint32, int64, *kapps.UserKDA, *kapps.StakingData, core.ForkController) (map[string]int64, error) {
+					return computed, computeErr
+				},
+			}
+
+			kdaBytes, _ := marshalizer.Marshal(tt.kda)
+			n, err := createNodeWithOptions(t, nodeTestOptions{
+				accAdapter:   createAccDBWithUser(userAcc),
+				kappsAdapter: createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes),
+				blockchain:   createBlockchainWithHeader(10, 1234567890),
+			})
+			require.NoError(t, err)
+
+			rewards, _, _, err := n.GetAvailableClaim("AABB", "MYTOKEN")
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedRewards, rewards)
+		})
+	}
+}
+
+func TestGetAvailableClaimList(t *testing.T) {
+	t.Parallel()
+
+	marshalizer := &mock.ProtoMarshalizerMock{}
+	stakingBytes, _ := marshalizer.Marshal(&kapps.StakingData{TotalStaked: 1000})
+	kdaBytes, _ := marshalizer.Marshal(&kapps.KDAData{Name: []byte("KDA")})
+
+	claimingUserAcc := func() *mock.UserAccountHandlerStub {
+		return &mock.UserAccountHandlerStub{
+			AddressBytesCalled: func() []byte { return []byte{0xAA, 0xBB} },
+			GetAllowanceCalled: func() int64 { return 1000 },
+			GetUserKDACalled:   func([]byte, []byte, bool) (*kapps.UserKDA, error) { return &kapps.UserKDA{}, nil },
+			ComputeAvailableClaimCalled: func(assetID []byte, _ uint32, _ int64, _ *kapps.UserKDA, _ *kapps.StakingData, _ core.ForkController) (map[string]int64, error) {
+				return map[string]int64{string(assetID): 100}, nil
+			},
+		}
+	}
+
+	t.Run("loads the shared account state once per request", func(t *testing.T) {
+		t.Parallel()
+
+		var userLoads, kappLoads, pendingRewardsReads int
+		accDB := createAccDBWithUser(claimingUserAcc())
+		getExisting := accDB.GetExistingAccountCalled
+		accDB.GetExistingAccountCalled = func(address []byte) (state.AccountHandler, error) {
+			userLoads++
+			return getExisting(address)
+		}
+		kappsDB := createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes)
+		loadKapp := kappsDB.LoadAccountCalled
+		kappsDB.LoadAccountCalled = func(address []byte) (state.AccountHandler, error) {
+			kappLoads++
+			return loadKapp(address)
+		}
+		// GetPendingRewards loads the Validators kapp from the kapps adapter in production, so it
+		// is the fourth exclusive acquisition of a request that includes KLV.
+		kappCtrl := &stub.KAppControllerStub{
+			GetValidatorsKAppCalled: func() kapp.ValidatorsKapp {
+				return &mock.ValidatorsKAppStub{
+					GetPendingRewardsCalled: func([]byte) (int64, error) {
+						pendingRewardsReads++
+						return 500, nil
+					},
+				}
+			},
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:     accDB,
+			kappsAdapter:   kappsDB,
+			kappController: kappCtrl,
+			blockchain:     createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		assetIds := []string{"KLV", "KFI", "AAA-1234", "BBB-1234", "CCC-1234", "DDD-1234"}
+		claims, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", assetIds)
+		require.NoError(t, err)
+		require.Empty(t, claimErrors)
+		require.Len(t, claims, len(assetIds))
+
+		require.Equal(t, 1, userLoads, "user account must be loaded once per request")
+		require.Equal(t, 2, kappLoads, "staking and KDA kapps must each be loaded once per request")
+		require.Equal(t, 1, pendingRewardsReads, "KLV pending rewards must be read once per request")
+
+		require.Equal(t, int64(1500), claims["KLV"].Allowance)
+		require.Equal(t, int64(100), claims["KLV"].StakingRewards)
+		require.Equal(t, int64(0), claims["AAA-1234"].Allowance)
+		require.Equal(t, map[string]int64{"AAA-1234": 100}, claims["AAA-1234"].AllStakingRewards)
+	})
+
+	t.Run("reads the header after each asset's user data", func(t *testing.T) {
+		t.Parallel()
+
+		userKDAReads, headerReads := 0, 0
+		userAcc := claimingUserAcc()
+		userAcc.GetUserKDACalled = func([]byte, []byte, bool) (*kapps.UserKDA, error) {
+			userKDAReads++
+			return &kapps.UserKDA{}, nil
+		}
+		blockchain := createBlockchainWithHeader(10, 1234567890)
+		getHeader := blockchain.GetCurrentBlockHeaderCalled
+		blockchain.GetCurrentBlockHeaderCalled = func() data.HeaderHandler {
+			headerReads++
+			require.Equal(t, headerReads, userKDAReads, "header must be read after the asset's user data")
+			return getHeader()
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   createAccDBWithUser(userAcc),
+			kappsAdapter: createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes),
+			blockchain:   blockchain,
+		})
+		require.NoError(t, err)
+
+		assetIds := []string{"AAA-1234", "BBB-1234", "CCC-1234"}
+		_, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", assetIds)
+		require.NoError(t, err)
+		require.Empty(t, claimErrors)
+		require.Equal(t, len(assetIds), headerReads)
+	})
+
+	const headerEpoch, headerTimestamp = uint32(10), int64(1234567890)
+	claimInFlightTests := []struct {
+		name         string
+		lastClaim    *kapps.LastClaim
+		wantInFlight bool
+	}{
+		{"claim newer than header by timestamp", &kapps.LastClaim{Timestamp: headerTimestamp + 1, Epoch: headerEpoch}, true},
+		{"claim newer than header by epoch only", &kapps.LastClaim{Timestamp: headerTimestamp, Epoch: headerEpoch + 1}, true},
+		{"claim in the current header", &kapps.LastClaim{Timestamp: headerTimestamp, Epoch: headerEpoch}, false},
+	}
+
+	for _, tt := range claimInFlightTests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			computeCalls := 0
+			userAcc := claimingUserAcc()
+			userAcc.GetUserKDACalled = func([]byte, []byte, bool) (*kapps.UserKDA, error) {
+				return &kapps.UserKDA{LastClaim: tt.lastClaim}, nil
+			}
+			userAcc.ComputeAvailableClaimCalled = func([]byte, uint32, int64, *kapps.UserKDA, *kapps.StakingData, core.ForkController) (map[string]int64, error) {
+				computeCalls++
+				return map[string]int64{"KLV": 100}, nil
+			}
+
+			n, err := createNodeWithOptions(t, nodeTestOptions{
+				accAdapter:   createAccDBWithUser(userAcc),
+				kappsAdapter: createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes),
+				blockchain:   createBlockchainWithHeader(headerEpoch, headerTimestamp),
+			})
+			require.NoError(t, err)
+
+			claims, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", []string{"KLV"})
+			require.NoError(t, err)
+			require.Empty(t, claimErrors)
+			require.Equal(t, int64(1000), claims["KLV"].Allowance, "allowance does not depend on the claim maths")
+
+			if tt.wantInFlight {
+				require.Zero(t, computeCalls, "claim maths must not run while a claim is in flight")
+				require.Zero(t, claims["KLV"].StakingRewards)
+				require.Nil(t, claims["KLV"].AllStakingRewards)
+				return
+			}
+			require.Equal(t, 1, computeCalls)
+			require.Equal(t, int64(100), claims["KLV"].StakingRewards)
+		})
+	}
+
+	t.Run("reports per-asset failures keyed by asset", func(t *testing.T) {
+		t.Parallel()
+
+		missingKey := string(kdautils.ToKDAKey([]byte("MISSING-1234"), nil))
+		loads := 0
+		kappsDB := &mock.AccountsStub{
+			LoadAccountCalled: func([]byte) (state.AccountHandler, error) {
+				loads++
+				isStaking := loads == 1
+				payload := stakingBytes
+				if !isStaking {
+					payload = kdaBytes
+				}
+				return &mock.KAppAccountHandlerStub{
+					DataTrieTrackerCalled: func() state.DataTrieTracker {
+						return &mock.DataTrieTrackerStub{
+							RetrieveValueCalled: func(key []byte) ([]byte, error) {
+								if isStaking && string(key) == missingKey {
+									return nil, nil
+								}
+								return payload, nil
+							},
+						}
+					},
+				}, nil
+			},
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   createAccDBWithUser(claimingUserAcc()),
+			kappsAdapter: kappsDB,
+			blockchain:   createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		claims, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", []string{"KLV", "MISSING-1234"})
+		require.NoError(t, err)
+		require.Len(t, claimErrors, 1)
+		require.ErrorIs(t, claimErrors["MISSING-1234"], common.ErrStakingNotFound)
+		require.Contains(t, claims, "KLV")
+		require.NotContains(t, claims, "MISSING-1234")
+	})
+
+	t.Run("returns request-level error when a shared load fails", func(t *testing.T) {
+		t.Parallel()
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   createAccDBWithUser(claimingUserAcc()),
+			kappsAdapter: createKappsDBWithLoadError(common.ErrAccountNotFound),
+			blockchain:   createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		claims, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", []string{"KLV", "KFI"})
+		require.ErrorIs(t, err, common.ErrAccountNotFound)
+		require.Nil(t, claims)
+		require.Nil(t, claimErrors)
+	})
+
+	t.Run("returns zero values for non-user account", func(t *testing.T) {
+		t.Parallel()
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   createAccDBWithUser(&mock.KAppAccountHandlerStub{}),
+			kappsAdapter: &mock.AccountsStub{},
+			blockchain:   &mock.BlockChainMock{},
+		})
+		require.NoError(t, err)
+
+		claims, claimErrors, err := n.GetAvailableClaimList(context.Background(), "AABB", []string{"KLV", "KFI"})
+		require.NoError(t, err)
+		require.Empty(t, claimErrors)
+		require.Len(t, claims, 2)
+		require.Equal(t, &models.AvailableClaimResponse{}, claims["KLV"])
+		require.Equal(t, &models.AvailableClaimResponse{}, claims["KFI"])
+	})
+
+	t.Run("does not touch the state when the context is already done", func(t *testing.T) {
+		t.Parallel()
+
+		var userLoads, kappLoads int
+		accDB := createAccDBWithUser(claimingUserAcc())
+		accDB.GetExistingAccountCalled = func([]byte) (state.AccountHandler, error) {
+			userLoads++
+			return nil, errors.New("must not be called")
+		}
+		kappsDB := createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes)
+		kappsDB.LoadAccountCalled = func([]byte) (state.AccountHandler, error) {
+			kappLoads++
+			return nil, errors.New("must not be called")
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   accDB,
+			kappsAdapter: kappsDB,
+			blockchain:   createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		claims, claimErrors, err := n.GetAvailableClaimList(ctx, "AABB", []string{"KLV", "KFI"})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, claims)
+		require.Nil(t, claimErrors)
+		require.Zero(t, userLoads, "a cancelled request must not load the user account")
+		require.Zero(t, kappLoads, "a cancelled request must not load the kapps")
+	})
+
+	t.Run("stops at the next asset once the context is done", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		const assetsBeforeCancel = 2
+		userKDAReads := 0
+		userAcc := claimingUserAcc()
+		userAcc.GetUserKDACalled = func([]byte, []byte, bool) (*kapps.UserKDA, error) {
+			userKDAReads++
+			if userKDAReads == assetsBeforeCancel {
+				cancel()
+			}
+			return &kapps.UserKDA{}, nil
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   createAccDBWithUser(userAcc),
+			kappsAdapter: createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes),
+			blockchain:   createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		assetIds := []string{"AAA-1234", "BBB-1234", "CCC-1234", "DDD-1234"}
+		claims, claimErrors, err := n.GetAvailableClaimList(ctx, "AABB", assetIds)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, claims, "a request that did not finish must not return partial results")
+		require.Nil(t, claimErrors)
+		require.Equal(t, assetsBeforeCancel, userKDAReads, "no asset may be read after the context is done")
+	})
+
+	t.Run("stops loading the state once the context is done", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		accDB := createAccDBWithUser(claimingUserAcc())
+		getExisting := accDB.GetExistingAccountCalled
+		accDB.GetExistingAccountCalled = func(address []byte) (state.AccountHandler, error) {
+			cancel()
+			return getExisting(address)
+		}
+		kappLoads := 0
+		kappsDB := createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes)
+		loadKapp := kappsDB.LoadAccountCalled
+		kappsDB.LoadAccountCalled = func(address []byte) (state.AccountHandler, error) {
+			kappLoads++
+			return loadKapp(address)
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   accDB,
+			kappsAdapter: kappsDB,
+			blockchain:   createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		claims, claimErrors, err := n.GetAvailableClaimList(ctx, "AABB", []string{"KLV", "KFI"})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, claims)
+		require.Nil(t, claimErrors)
+		require.Zero(t, kappLoads, "no kapp may be loaded after the context is done")
+	})
+
+	t.Run("does not load the KDA kapp once the context is done", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		kappLoads := 0
+		kappsDB := createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes)
+		loadKapp := kappsDB.LoadAccountCalled
+		kappsDB.LoadAccountCalled = func(address []byte) (state.AccountHandler, error) {
+			kappLoads++
+			cancel()
+			return loadKapp(address)
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:   createAccDBWithUser(claimingUserAcc()),
+			kappsAdapter: kappsDB,
+			blockchain:   createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		claims, claimErrors, err := n.GetAvailableClaimList(ctx, "AABB", []string{"KLV", "KFI"})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, claims)
+		require.Nil(t, claimErrors)
+		require.Equal(t, 1, kappLoads, "the KDA kapp must not be loaded after the context is done")
+	})
+
+	t.Run("does not read the KLV pending rewards once the context is done", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		userAcc := claimingUserAcc()
+		userAcc.GetUserKDACalled = func([]byte, []byte, bool) (*kapps.UserKDA, error) {
+			cancel()
+			return &kapps.UserKDA{}, nil
+		}
+		pendingRewardsReads := 0
+		kappCtrl := &stub.KAppControllerStub{
+			GetValidatorsKAppCalled: func() kapp.ValidatorsKapp {
+				return &mock.ValidatorsKAppStub{
+					GetPendingRewardsCalled: func([]byte) (int64, error) {
+						pendingRewardsReads++
+						return 500, nil
+					},
+				}
+			},
+		}
+
+		n, err := createNodeWithOptions(t, nodeTestOptions{
+			accAdapter:     createAccDBWithUser(userAcc),
+			kappsAdapter:   createKappsDBWithStakingAndKDA(stakingBytes, kdaBytes),
+			kappController: kappCtrl,
+			blockchain:     createBlockchainWithHeader(10, 1234567890),
+		})
+		require.NoError(t, err)
+
+		// KLV is the last asset, so no later per-asset check can end the request
+		claims, claimErrors, err := n.GetAvailableClaimList(ctx, "AABB", []string{"KLV"})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Nil(t, claims, "a request that did not finish must not return partial results")
+		require.Nil(t, claimErrors)
+		require.Zero(t, pendingRewardsReads, "the Validators kapp must not be loaded after the context is done")
+	})
 }

@@ -1,6 +1,7 @@
 package kapps_test
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/klever-io/klever-go/common"
@@ -167,4 +168,169 @@ func TestKDAData_GetTransferRoyaltyByAmount(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestKDAData_IsOwnerOrAdmin(t *testing.T) {
+	owner := bytes.Repeat([]byte{1}, 32)
+	admin := bytes.Repeat([]byte{2}, 32)
+	other := bytes.Repeat([]byte{3}, 32)
+
+	tests := []struct {
+		name                 string
+		ownerAddress         []byte
+		adminAddress         []byte
+		address              []byte
+		expectedOwner        bool
+		expectedOwnerOrAdmin bool
+	}{
+		{name: "owner", ownerAddress: owner, adminAddress: admin, address: owner, expectedOwner: true, expectedOwnerOrAdmin: true},
+		{name: "admin", ownerAddress: owner, adminAddress: admin, address: admin, expectedOwner: false, expectedOwnerOrAdmin: true},
+		{name: "other address", ownerAddress: owner, adminAddress: admin, address: other, expectedOwner: false, expectedOwnerOrAdmin: false},
+		{name: "nil address with unset admin", ownerAddress: owner, adminAddress: nil, address: nil, expectedOwner: false, expectedOwnerOrAdmin: false},
+		{name: "empty address with unset admin", ownerAddress: owner, adminAddress: nil, address: []byte{}, expectedOwner: false, expectedOwnerOrAdmin: false},
+		{name: "nil address with unset owner and admin", ownerAddress: nil, adminAddress: nil, address: nil, expectedOwner: false, expectedOwnerOrAdmin: false},
+		{name: "empty address with empty owner and admin", ownerAddress: []byte{}, adminAddress: []byte{}, address: []byte{}, expectedOwner: false, expectedOwnerOrAdmin: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kda := &kapps.KDAData{
+				OwnerAddress: tt.ownerAddress,
+				AdminAddress: tt.adminAddress,
+			}
+
+			assert.Equal(t, tt.expectedOwner, kda.IsOwner(tt.address))
+			assert.Equal(t, tt.expectedOwnerOrAdmin, kda.IsOwnerOrAdmin(tt.address))
+		})
+	}
+}
+
+func TestKDAData_GetRoleByAddress(t *testing.T) {
+	owner := bytes.Repeat([]byte{1}, 32)
+	admin := bytes.Repeat([]byte{2}, 32)
+	holder := bytes.Repeat([]byte{3}, 32)
+	holderRole := &kapps.RolesData{Address: holder, HasRoleTransfer: true}
+
+	tests := []struct {
+		name          string
+		ownerAddress  []byte
+		adminAddress  []byte
+		address       []byte
+		expectedRole  *kapps.RolesData
+		expectedError error
+	}{
+		{
+			name:         "owner has every role",
+			ownerAddress: owner,
+			adminAddress: admin,
+			address:      owner,
+			expectedRole: &kapps.RolesData{Address: owner, HasRoleMint: true, HasRoleSetITOPrices: true, HasRoleDeposit: true, HasRoleTransfer: true},
+		},
+		{
+			name:         "admin has every role",
+			ownerAddress: owner,
+			adminAddress: admin,
+			address:      admin,
+			expectedRole: &kapps.RolesData{Address: admin, HasRoleMint: true, HasRoleSetITOPrices: true, HasRoleDeposit: true, HasRoleTransfer: true},
+		},
+		{
+			name:         "role holder gets its role",
+			ownerAddress: owner,
+			address:      holder,
+			expectedRole: holderRole,
+		},
+		{
+			name:          "nil address has no role when admin is unset",
+			ownerAddress:  owner,
+			address:       nil,
+			expectedError: common.ErrRoleNotFound,
+		},
+		{
+			name:          "empty address has no role when owner and admin are unset",
+			address:       []byte{},
+			expectedError: common.ErrRoleNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kda := &kapps.KDAData{
+				OwnerAddress: tt.ownerAddress,
+				AdminAddress: tt.adminAddress,
+				Roles:        []*kapps.RolesData{holderRole},
+			}
+
+			role, err := kda.GetRoleByAddress(tt.address)
+
+			assert.Equal(t, tt.expectedError, err)
+			assert.Equal(t, tt.expectedRole, role)
+		})
+	}
+}
+
+func TestKDAData_CanSenderTransfer(t *testing.T) {
+	t.Parallel()
+
+	owner := []byte("owner")
+	admin := []byte("admin")
+	holder := []byte("holder")
+	depositor := []byte("depositor")
+	stranger := []byte("stranger")
+
+	limited := func(limitTransfer bool) *kapps.KDAData {
+		return &kapps.KDAData{
+			OwnerAddress: owner,
+			AdminAddress: admin,
+			Properties:   &kapps.PropertiesData{LimitTransfer: limitTransfer},
+			Roles: []*kapps.RolesData{
+				{Address: holder, HasRoleTransfer: true},
+				{Address: depositor, HasRoleDeposit: true},
+			},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		kda      *kapps.KDAData
+		sender   []byte
+		expected bool
+	}{
+		{"an unrestricted asset lets anyone send", limited(false), stranger, true},
+		{"an asset with no properties lets anyone send", &kapps.KDAData{}, stranger, true},
+		{"the owner sends a limit-transfer asset", limited(true), owner, true},
+		{"the admin sends a limit-transfer asset", limited(true), admin, true},
+		{"the transfer role sends a limit-transfer asset", limited(true), holder, true},
+		{"the deposit role alone does not send a limit-transfer asset", limited(true), depositor, false},
+		{"an address with no role does not send a limit-transfer asset", limited(true), stranger, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, tt.kda.CanSenderTransfer(tt.sender))
+		})
+	}
+}
+
+func TestKDAData_IsTransferAllowed(t *testing.T) {
+	t.Parallel()
+
+	holder := []byte("holder")
+	depositor := []byte("depositor")
+	stranger := []byte("stranger")
+	other := []byte("other")
+
+	kda := &kapps.KDAData{
+		OwnerAddress: []byte("owner"),
+		Properties:   &kapps.PropertiesData{LimitTransfer: true},
+		Roles: []*kapps.RolesData{
+			{Address: holder, HasRoleTransfer: true},
+			{Address: depositor, HasRoleDeposit: true},
+		},
+	}
+
+	assert.True(t, kda.IsTransferAllowed(holder, other), "a sender with the transfer role reaches any destination")
+	assert.True(t, kda.IsTransferAllowed(stranger, depositor), "a destination with the deposit role takes from any sender")
+	assert.False(t, kda.IsTransferAllowed(stranger, other), "neither side holding a role is refused")
+	assert.True(t, (&kapps.KDAData{Properties: &kapps.PropertiesData{}}).IsTransferAllowed(stranger, other))
+	assert.True(t, (&kapps.KDAData{}).IsTransferAllowed(stranger, other), "an asset with no properties does not limit transfers")
 }

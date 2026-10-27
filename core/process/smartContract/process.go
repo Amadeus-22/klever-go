@@ -60,33 +60,33 @@ type scProcessor struct {
 	txFeeHandler   process.TransactionFeeHandler
 	economicsFee   process.EconomicsDataHandler
 
-	builtInGasCosts     map[string]uint64
-	persistPerByte      uint64
-	storePerByte        uint64
-	mutGasLock          sync.RWMutex
-	txLogsProcessor     process.TransactionLogProcessor
-	vmOutputCacher      storage.Cacher
-	isGenesisProcessing bool
+	builtInGasCosts map[string]uint64
+	persistPerByte  uint64
+	storePerByte    uint64
+	mutGasLock      sync.RWMutex
+	txLogsProcessor process.TransactionLogProcessor
+	vmOutputCacher  storage.Cacher
+	allowDeploy     bool
 }
 
 // ArgsNewSmartContractProcessor defines the arguments needed for new smart contract processor
 type ArgsNewSmartContractProcessor struct {
-	VmContainer         process.VirtualMachinesContainer
-	ArgsParser          process.ArgumentsParser
-	Hasher              hashing.Hasher
-	Marshalizer         marshal.Marshalizer
-	BlockChainHook      process.BlockChainHookHandler
-	BuiltInFunctions    vmcommon.BuiltInFunctionContainer
-	PubkeyConv          core.PubkeyConverter
-	TxFeeHandler        process.TransactionFeeHandler
-	EconomicsFee        process.EconomicsDataHandler
-	GasSchedule         core.GasScheduleNotifier
-	TxLogsProcessor     process.TransactionLogProcessor
-	ForkController      core.ForkController
-	VMOutputCacher      storage.Cacher
-	WasmVMChangeLocker  common.Locker
-	AccountsCacher      state.AccountsCacher
-	IsGenesisProcessing bool
+	VmContainer        process.VirtualMachinesContainer
+	ArgsParser         process.ArgumentsParser
+	Hasher             hashing.Hasher
+	Marshalizer        marshal.Marshalizer
+	BlockChainHook     process.BlockChainHookHandler
+	BuiltInFunctions   vmcommon.BuiltInFunctionContainer
+	PubkeyConv         core.PubkeyConverter
+	TxFeeHandler       process.TransactionFeeHandler
+	EconomicsFee       process.EconomicsDataHandler
+	GasSchedule        core.GasScheduleNotifier
+	TxLogsProcessor    process.TransactionLogProcessor
+	ForkController     core.ForkController
+	VMOutputCacher     storage.Cacher
+	WasmVMChangeLocker common.Locker
+	AccountsCacher     state.AccountsCacher
+	AllowDeploy        bool
 }
 
 // NewSmartContractProcessor creates a smart contract processor that creates and interprets VM data
@@ -140,24 +140,24 @@ func NewSmartContractProcessor(args ArgsNewSmartContractProcessor) (*scProcessor
 	builtInFuncCost := args.GasSchedule.LatestGasSchedule()[common.BuiltInCost]
 	baseOperationCost := args.GasSchedule.LatestGasSchedule()[common.BaseOperationCost]
 	sc := &scProcessor{
-		vmContainer:         args.VmContainer,
-		argsParser:          args.ArgsParser,
-		hasher:              args.Hasher,
-		marshalizer:         args.Marshalizer,
-		blockChainHook:      args.BlockChainHook,
-		pubkeyConv:          args.PubkeyConv,
-		txFeeHandler:        args.TxFeeHandler,
-		economicsFee:        args.EconomicsFee,
-		builtInGasCosts:     builtInFuncCost,
-		txLogsProcessor:     args.TxLogsProcessor,
-		forkController:      args.ForkController,
-		builtInFunctions:    args.BuiltInFunctions,
-		isGenesisProcessing: args.IsGenesisProcessing,
-		wasmVMChangeLocker:  args.WasmVMChangeLocker,
-		vmOutputCacher:      args.VMOutputCacher,
-		accountsCacher:      args.AccountsCacher,
-		storePerByte:        baseOperationCost["StorePerByte"],
-		persistPerByte:      baseOperationCost["PersistPerByte"],
+		vmContainer:        args.VmContainer,
+		argsParser:         args.ArgsParser,
+		hasher:             args.Hasher,
+		marshalizer:        args.Marshalizer,
+		blockChainHook:     args.BlockChainHook,
+		pubkeyConv:         args.PubkeyConv,
+		txFeeHandler:       args.TxFeeHandler,
+		economicsFee:       args.EconomicsFee,
+		builtInGasCosts:    builtInFuncCost,
+		txLogsProcessor:    args.TxLogsProcessor,
+		forkController:     args.ForkController,
+		builtInFunctions:   args.BuiltInFunctions,
+		allowDeploy:        args.AllowDeploy,
+		wasmVMChangeLocker: args.WasmVMChangeLocker,
+		vmOutputCacher:     args.VMOutputCacher,
+		accountsCacher:     args.AccountsCacher,
+		storePerByte:       baseOperationCost["StorePerByte"],
+		persistPerByte:     baseOperationCost["PersistPerByte"],
 	}
 
 	var err error
@@ -608,8 +608,7 @@ func (sc *scProcessor) doDeploySmartContract(
 	txHash := ctx.TxHash()
 
 	var vmOutput *vmcommon.VMOutput
-	shouldAllowDeploy := sc.isGenesisProcessing
-	if !shouldAllowDeploy {
+	if !sc.allowDeploy {
 		log.Trace("deploy is disabled")
 		return vmcommon.VMUserError, sc.ProcessIfError(ctx, tc, process.ErrSmartContractDeploymentIsDisabled.Error(), []byte(""))
 	}
@@ -802,6 +801,13 @@ func (sc *scProcessor) processSCOutputAccounts(
 	outputAccounts []*vmcommon.OutputAccount,
 ) error {
 	for _, outAcc := range outputAccounts {
+		// from FixAuditChangesV6 no user account may exist under an address that is not pubkey-length,
+		// so loading one here, which creates and persists it, is refused instead
+		if sc.forkController.FixAuditChangesV6() && len(outAcc.Address) != sc.pubkeyConv.Len() {
+			log.Warn("processSCOutputAccounts", "error", process.ErrInvalidOutputAccountAddressLength, "addressLength", len(outAcc.Address))
+			return process.ErrInvalidOutputAccountAddressLength
+		}
+
 		acc, err := sc.getAccountFromAddress(outAcc.Address)
 		if err != nil {
 			return err
@@ -831,6 +837,13 @@ func (sc *scProcessor) saveStorageUpdates(acc state.UserAccountHandler, outAcc *
 		if sc.forkController.FixAuditChangesV3() && storeUpdate.Written && isProtectedStorageKey(storeUpdate.Offset) {
 			log.Warn("saveKeyValue", "error", process.ErrStoreProtectedKey, "key", storeUpdate.Offset)
 			return process.ErrStoreProtectedKey
+		}
+		if !storeUpdate.Written && sc.forkController.FixAuditChangesV6() {
+			continue
+		}
+		if len(storeUpdate.Data) > 0 && len(storeUpdate.Offset) > common.MaxStorageKeyLength && sc.forkController.FixAuditChangesV6() {
+			log.Warn("saveKeyValue", "error", process.ErrStorageKeyTooLong, "keyLength", len(storeUpdate.Offset))
+			return process.ErrStorageKeyTooLong
 		}
 		err := acc.SaveKeyValue(storeUpdate.Offset, storeUpdate.Data)
 		if err != nil {
@@ -926,7 +939,7 @@ func (sc *scProcessor) updateSmartContractCode(
 func (sc *scProcessor) deleteAccounts(deletedAccounts [][]byte) error {
 	for _, value := range deletedAccounts {
 		// delete account code
-		err := sc.accountsCacher.RemoveCode(value)
+		err := sc.removeAccountCode(value)
 		if err != nil {
 			log.Error("deleteAccounts remove code", "address", value, "error", err.Error())
 			return err
@@ -934,6 +947,27 @@ func (sc *scProcessor) deleteAccounts(deletedAccounts [][]byte) error {
 	}
 
 	return nil
+}
+
+// removeAccountCode empties the account's code. Since FixAuditChangesV6 the shared code
+// entry is left to the account save, which decrements it once against the code hash
+// stored in the trie, so removal is idempotent and an address listed more than once is
+// harmless. Before it, the legacy RemoveCode is kept so pre-fork blocks replay identically.
+func (sc *scProcessor) removeAccountCode(address []byte) error {
+	if !sc.forkController.FixAuditChangesV6() {
+		return sc.accountsCacher.RemoveCode(address)
+	}
+
+	acc, err := sc.accountsCacher.GetExistingUser(address)
+	if err != nil {
+		return err
+	}
+
+	acc.SetCode(make([]byte, 0))
+	acc.SetCodeHash(make([]byte, 0))
+
+	// persists immediately when the cache is off; with the cache on, SaveAll flushes it
+	return sc.accountsCacher.UpdateUser(acc)
 }
 
 func (sc *scProcessor) getAccountFromAddress(address []byte) (state.UserAccountHandler, error) {
@@ -950,21 +984,27 @@ func (sc *scProcessor) checkUpgradePermission(contract state.UserAccountHandler,
 	if !isUpgradeCalled {
 		return nil
 	}
-	if check.IfNil(contract) {
-		return process.ErrUpgradeNotAllowed
+	// Only the code metadata decides "is a contract" here: an account that was
+	// never deployed to has none, and a deleted contract keeps its metadata so it
+	// is still recognised. The account itself is never nil at this point; the
+	// callers load it with GetExistingUser and prepareExecution rejects nil first.
+	if len(contract.GetCodeMetadata()) == 0 {
+		return process.ErrUpgradeContractNotFound
 	}
 
+	// Each refusal names its own cause so an owner upgrading a non-upgradeable
+	// contract is not sent looking at keys. Not-upgradeable is checked before
+	// ownership because it is the condition no caller can work around.
 	codeMetadata := vmcommon.CodeMetadataFromBytes(contract.GetCodeMetadata())
-	isUpgradeable := codeMetadata.Upgradeable
-	callerAddress := vmInput.CallerAddr
-	ownerAddress := contract.GetOwnerAddress()
-	isCallerOwner := bytes.Equal(callerAddress, ownerAddress)
-
-	if isUpgradeable && isCallerOwner {
-		return nil
+	if !codeMetadata.Upgradeable {
+		return process.ErrUpgradeContractNotUpgradeable
 	}
 
-	return process.ErrUpgradeNotAllowed
+	if !bytes.Equal(vmInput.CallerAddr, contract.GetOwnerAddress()) {
+		return process.ErrUpgradeCallerNotOwner
+	}
+
+	return nil
 }
 
 func (sc *scProcessor) createCompleteEventLogIfNoMoreAction(

@@ -108,7 +108,7 @@ func (sesb *storageEpochStartBootstrap) Bootstrap() (Parameters, error) {
 		return Parameters{}, err
 	}
 
-	sesb.prevEpochStartMeta, err = sesb.epochStartMetaBlockSyncer.SyncPrevEpochStartMeta(timeToWait, sesb.epochStartMeta.GetEpoch()-1)
+	sesb.prevEpochStartMeta, err = syncPrevEpochStartMeta(sesb.epochStartMetaBlockSyncer, sesb.epochStartMeta, timeToWait)
 	if err != nil {
 		return Parameters{}, err
 	}

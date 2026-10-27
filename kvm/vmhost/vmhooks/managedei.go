@@ -3,6 +3,7 @@ package vmhooks
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"math/big"
 	"slices"
 
@@ -10,8 +11,10 @@ import (
 	"github.com/klever-io/klever-go/tools/check"
 
 	"github.com/klever-io/klever-go/data/state"
+	"github.com/klever-io/klever-go/kapps"
 	"github.com/klever-io/klever-go/kvm/math"
 	"github.com/klever-io/klever-go/kvm/vmhost"
+	"github.com/klever-io/klever-go/vmcommon"
 )
 
 const (
@@ -103,10 +106,36 @@ func (context *VMHooksImpl) ManagedSignalError(errHandle int32) {
 	managedType := context.GetManagedTypesContext()
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
-	metering.StartGasTracing(managedSignalErrorName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.SignalError
-	metering.UseAndTraceGas(gasToUse)
+	err := startTracingAndUseGas(context.host, managedSignalErrorName, gasToUse)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
+
+	// from FixAuditChangesV6 the message is paid for, DataCopyPerByte and PersistPerByte a byte and
+	// bounded, before it is cloned: the amounts charged after the clone before the fork. A missing
+	// buffer is not charged, so that GetBytes reports it as before. An underfunded call fails the
+	// execution with ErrNotEnoughGas rather than with the message, as it did pre-fork once the
+	// persist charge found the gas overdrawn
+	if context.host.ForkController().FixAuditChangesV6() {
+		errLen := managedType.GetLength(errHandle)
+		if errLen >= 0 {
+			gasSchedule := metering.GasSchedule()
+			gasPerByte := math.AddUint64(gasSchedule.BaseOperationCost.DataCopyPerByte, gasSchedule.BaseOperationCost.PersistPerByte)
+			err = metering.UseGasBounded(math.MulUint64(gasPerByte, uint64(errLen)))
+			if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+				return
+			}
+		}
+
+		errBytes, err := managedType.GetBytes(errHandle)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return
+		}
+		runtime.SignalUserError(string(errBytes))
+		return
+	}
 
 	errBytes, err := managedType.GetBytes(errHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
@@ -135,24 +164,38 @@ func (context *VMHooksImpl) ManagedWriteLog(
 	metering := context.GetMeteringContext()
 	managedType := context.GetManagedTypesContext()
 	metering.StartGasTracing(managedWriteLogName)
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
 
 	topics, sumOfTopicByteLengths, err := managedType.ReadManagedVecOfManagedBuffers(topicsHandle)
 	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
 	}
 
+	// post-fork the data is paid, bounded, before it is cloned
+	if fixAuditV6 {
+		err = consumeGasForBufferLenBounded(managedType, dataHandle)
+		if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
+			return
+		}
+	}
 	dataBytes, err := managedType.GetBytes(dataHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return
 	}
-	managedType.ConsumeGasForBytes(dataBytes)
+	if !fixAuditV6 {
+		managedType.ConsumeGasForBytes(dataBytes)
+	}
 	dataByteLen := uint64(len(dataBytes))
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.Log
-	gasForData := math.MulUint64(
-		metering.GasSchedule().BaseOperationCost.DataCopyPerByte,
-		sumOfTopicByteLengths+dataByteLen)
-	gasToUse = math.AddUint64(gasToUse, gasForData)
+	// pre-fork the topics and the data were charged per byte a second time here, on top of the
+	// copies already charged above; post-fork each byte is paid once, as in WriteEventLog
+	if !fixAuditV6 {
+		gasForData := math.MulUint64(
+			metering.GasSchedule().BaseOperationCost.DataCopyPerByte,
+			sumOfTopicByteLengths+dataByteLen)
+		gasToUse = math.AddUint64(gasToUse, gasForData)
+	}
 	metering.UseAndTraceGas(gasToUse)
 
 	output.WriteLog(runtime.GetContextAddress(), topics, [][]byte{dataBytes})
@@ -217,15 +260,39 @@ func (context *VMHooksImpl) ManagedGetReturnData(resultID int32, resultHandle in
 	output := context.GetOutputContext()
 	metering := context.GetMeteringContext()
 	managedType := context.GetManagedTypesContext()
+	fixAuditV6 := context.host.ForkController().FixAuditChangesV6()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetReturnData
-	metering.UseGasAndAddTracedGas(managedGetReturnDataName, gasToUse)
+	if !fixAuditV6 {
+		metering.UseGasAndAddTracedGas(managedGetReturnDataName, gasToUse)
+	} else {
+		err := metering.UseGasBoundedAndAddTracedGas(managedGetReturnDataName, gasToUse)
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return
+		}
+	}
 
 	returnData := output.ReturnData()
 	// #nosec G115
 	if resultID >= int32(len(returnData)) || resultID < 0 {
 		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
 		return
+	}
+
+	// pre-fork the item was copied for the flat cost alone, into a new handle when resultHandle had
+	// none; post-fork a new handle is priced as MBufferNewFromBytes and the item's bytes are paid,
+	// bounded, before anything is copied
+	if fixAuditV6 {
+		if managedType.GetLength(resultHandle) < 0 {
+			err := metering.UseGasBounded(metering.GasSchedule().ManagedBufferAPICost.MBufferNewFromBytes)
+			if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+				return
+			}
+		}
+		err := managedType.ConsumeGasForByteLenBounded(uint64(len(returnData[resultID])))
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return
+		}
 	}
 
 	managedType.SetBytes(resultHandle, returnData[resultID])
@@ -238,12 +305,17 @@ func (context *VMHooksImpl) ManagedGetKDACallValue(kdaCallValueHandle int32, kda
 	metering := context.GetMeteringContext()
 	managedType := context.GetManagedTypesContext()
 
+	host := context.GetVMHost()
 	gasToUse := context.ComputeGetCallValueGas()
-	metering.UseGasAndAddTracedGas(managedGetKDACallValueName, gasToUse)
-
-	tokenID, err := managedType.GetBytes(kdaHandle)
+	err := startTracingAndUseGas(host, managedGetKDACallValueName, gasToUse)
 	if err != nil {
-		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
+		return
+	}
+
+	tokenID, err := loadMBufferBytes(host, kdaHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
+	if err != nil {
+		faultKDAArg(host, err)
 		return
 	}
 
@@ -261,13 +333,42 @@ func (context *VMHooksImpl) ManagedGetMultiKDACallValue(multiCallValueHandle int
 	managedType := context.GetManagedTypesContext()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetCallValue
-	metering.UseGasAndAddTracedGas(managedGetMultiKDACallValueName, gasToUse)
+	if !context.host.ForkController().FixAuditChangesV6() {
+		metering.UseGasAndAddTracedGas(managedGetMultiKDACallValueName, gasToUse)
 
+		kdaTransfers := runtime.GetVMInput().KDATransfers
+		multiCallBytes := writeKDATransfersToBytes(managedType, kdaTransfers)
+		managedType.ConsumeGasForBytes(multiCallBytes)
+
+		managedType.SetBytes(multiCallValueHandle, multiCallBytes)
+		return
+	}
+
+	// from FixAuditChangesV6 the fixed cost and the encoded transfers are paid for, bounded, before the
+	// transfers are encoded: the amounts charged after the encoding before the fork
+	err := startTracingAndUseGas(context.host, managedGetMultiKDACallValueName, gasToUse)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
+
+	// from FixAuditChangesV6 the transfer values are paid for too, bounded and each on its own, before
+	// they are copied into new big int handles: above 32 bytes they pay the big int copy, like the
+	// family's other copies
 	kdaTransfers := runtime.GetVMInput().KDATransfers
-	multiCallBytes := writeKDATransfersToBytes(managedType, kdaTransfers)
-	managedType.ConsumeGasForBytes(multiCallBytes)
+	err = consumeGasForKDATransfersBounded(managedType, kdaTransfers, nil)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
 
-	managedType.SetBytes(multiCallValueHandle, multiCallBytes)
+	managedType.SetBytes(multiCallValueHandle, writeKDATransfersToBytes(managedType, kdaTransfers))
+}
+
+// isKLVTransferName tells whether ManagedGetMultiKDAWithoutKLVCallValue leaves a transfer of this
+// token out: no name, KLV's, and from FixAuditChangesV4 an empty one
+func isKLVTransferName(kdaName []byte, fixAuditChangesV4 bool) bool {
+	return kdaName == nil ||
+		len(kdaName) == 0 && fixAuditChangesV4 ||
+		bytes.Equal(kdaName, kdautils.KLVIdentifier)
 }
 
 // ManagedGetMultiKDAWithoutKLVCallValue VMHooks implementation.
@@ -276,22 +377,44 @@ func (context *VMHooksImpl) ManagedGetMultiKDAWithoutKLVCallValue(multiCallValue
 	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
 	managedType := context.GetManagedTypesContext()
+	fixAuditChangesV4 := context.host.ForkController().FixAuditChangesV4()
+	fixAuditChangesV6 := context.host.ForkController().FixAuditChangesV6()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetCallValue
-	metering.UseGasAndAddTracedGas(managedGetMultiKDAWithoutKLVCallValueName, gasToUse)
+	if !fixAuditChangesV6 {
+		metering.UseGasAndAddTracedGas(managedGetMultiKDAWithoutKLVCallValueName, gasToUse)
+	}
 
 	kdaTransfers := runtime.GetVMInput().KDATransfers
-	if context.host.ForkController().FixAuditChangesV4() {
+	if fixAuditChangesV6 {
+		// from FixAuditChangesV6 the fixed cost and the encoded transfers that are not KLV are paid
+		// for, bounded, before anything is cloned, filtered or encoded: the amounts charged after the
+		// encoding before the fork. Counting them reads the transfers and copies nothing
+		err := startTracingAndUseGas(context.host, managedGetMultiKDAWithoutKLVCallValueName, gasToUse)
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return
+		}
+
+		// from FixAuditChangesV6 the values of the transfers that are not KLV are paid for too,
+		// bounded and each on its own, before they are copied into new big int handles: above 32
+		// bytes they pay the big int copy, like the family's other copies
+		isKLVTransfer := func(kdaTransfer *vmcommon.KDATransfer) bool {
+			return isKLVTransferName(kdaTransfer.KDATokenName, fixAuditChangesV4)
+		}
+		err = consumeGasForKDATransfersBounded(managedType, kdaTransfers, isKLVTransfer)
+		if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return
+		}
+	}
+
+	if fixAuditChangesV4 {
 		// the loop below deletes in place, which would shuffle the runtime input's backing array
 		// it would also leave duplicate elements in the backing array
 		kdaTransfers = slices.Clone(kdaTransfers)
 	}
 	// remove klv transfers if any
 	for i := 0; i < len(kdaTransfers); {
-		kdaName := kdaTransfers[i].KDATokenName
-		if kdaName == nil ||
-			len(kdaName) == 0 && context.host.ForkController().FixAuditChangesV4() ||
-			bytes.Equal(kdaName, kdautils.KLVIdentifier) {
+		if isKLVTransferName(kdaTransfers[i].KDATokenName, fixAuditChangesV4) {
 			// Remove the element by creating a new slice without it
 			kdaTransfers = append(kdaTransfers[:i], kdaTransfers[i+1:]...)
 		} else {
@@ -299,7 +422,9 @@ func (context *VMHooksImpl) ManagedGetMultiKDAWithoutKLVCallValue(multiCallValue
 		}
 	}
 	multiCallBytes := writeKDATransfersToBytes(managedType, kdaTransfers)
-	managedType.ConsumeGasForBytes(multiCallBytes)
+	if !fixAuditChangesV6 {
+		managedType.ConsumeGasForBytes(multiCallBytes)
+	}
 
 	managedType.SetBytes(multiCallValueHandle, multiCallBytes)
 }
@@ -307,46 +432,113 @@ func (context *VMHooksImpl) ManagedGetMultiKDAWithoutKLVCallValue(multiCallValue
 // ManagedGetBackTransfers VMHooks implementation.
 // @autogenerate(VMHooks)
 func (context *VMHooksImpl) ManagedGetBackTransfers(kdaTransfersValueHandle int32, callValueHandle int32) {
+	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
 	managedType := context.GetManagedTypesContext()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetCallValue
-	metering.UseGasAndAddTracedGas(managedGetBackTransferName, gasToUse)
+	if !context.host.ForkController().FixAuditChangesV6() {
+		metering.UseGasAndAddTracedGas(managedGetBackTransferName, gasToUse)
+
+		kdaTransfers, transferValue := managedType.GetBackTransfers()
+		multiCallBytes := writeKDATransfersToBytes(managedType, kdaTransfers)
+		managedType.ConsumeGasForBytes(multiCallBytes)
+		managedType.ConsumeGasForBigIntCopy(transferValue)
+
+		managedType.SetBytes(kdaTransfersValueHandle, multiCallBytes)
+		managedType.GetBigIntOrCreate(callValueHandle).Set(transferValue)
+		return
+	}
+
+	// from FixAuditChangesV6 the fixed cost, the encoded transfers, the transfer values and the call
+	// value copy are paid for, bounded and in that order, before the transfers are encoded or the value
+	// is copied: the amounts charged after the encoding before the fork, and the transfer values, which
+	// are copied into new big int handles and above 32 bytes pay the big int copy, each on its own,
+	// like the family's other copies. GetBackTransfers hands the transfers over and clears
+	// them, so a call that cannot pay for them still consumes them, as it did before the fork
+	err := startTracingAndUseGas(context.host, managedGetBackTransferName, gasToUse)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
 
 	kdaTransfers, transferValue := managedType.GetBackTransfers()
-	multiCallBytes := writeKDATransfersToBytes(managedType, kdaTransfers)
-	managedType.ConsumeGasForBytes(multiCallBytes)
-	managedType.ConsumeGasForBigIntCopy(transferValue)
+	err = consumeGasForKDATransfersBounded(managedType, kdaTransfers, nil)
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
+	err = managedType.ConsumeGasForThisIntNumberOfBytesBounded(int64((transferValue.BitLen() + 7) / 8))
+	if context.WithFault(err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
 
-	managedType.SetBytes(kdaTransfersValueHandle, multiCallBytes)
+	managedType.SetBytes(kdaTransfersValueHandle, writeKDATransfersToBytes(managedType, kdaTransfers))
 	managedType.GetBigIntOrCreate(callValueHandle).Set(transferValue)
+}
+
+// faultKDAArg keeps the KDA getters' historical ErrArgOutOfRange for a bad handle or a missing
+// token, while reporting a shortfall on the pre-charged buffer copy as itself: a contract that
+// cannot pay for the copy must not be told its argument is out of range
+func faultKDAArg(host vmhost.VMHost, err error) {
+	if !errors.Is(err, vmhost.ErrNotEnoughGas) {
+		err = vmhost.ErrArgOutOfRange
+	}
+	_ = WithFaultAndHost(host, err, host.Runtime().BaseOpsErrorShouldFailExecution())
+}
+
+// loadKDAToken is everything the two-handle KDA getters do before they start writing handles: the
+// fixed cost first and bounded from FixAuditChangesV6, then the address and ticker buffers paid for
+// before they are cloned, then the token read, then from FixAuditChangesV6 the decoded records (see
+// chargeKDATokenDecode). The error is returned for the caller to pass to
+// faultKDAArg, which keeps the historical ErrArgOutOfRange for everything but a shortfall
+func loadKDAToken(
+	host vmhost.VMHost,
+	hookName string,
+	gasToUse uint64,
+	addressHandle int32,
+	tickerHandle int32,
+	nonce int64,
+) (*kapps.KDAData, *kapps.UserKDA, error) {
+	dataCopyPerByte := host.Metering().GasSchedule().BaseOperationCost.DataCopyPerByte
+
+	err := startTracingAndUseGas(host, hookName, gasToUse)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	address, err := loadMBufferBytes(host, addressHandle, 0, dataCopyPerByte)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ticker, err := loadMBufferBytes(host, tickerHandle, 0, dataCopyPerByte)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	kdaData, userKDA, err := host.Blockchain().GetKDAToken(address, ticker, uint64(nonce)) // #nosec G115
+	if err != nil {
+		return kdaData, userKDA, err
+	}
+
+	err = chargeKDATokenDecode(host, kdaData, userKDA)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return kdaData, userKDA, nil
 }
 
 // ManagedGetKDABalance VMHooks implementation.
 // @autogenerate(VMHooks)
 func (context *VMHooksImpl) ManagedGetKDABalance(addressHandle int32, tokenIDHandle int32, nonce int64, valueHandle int32) {
-	runtime := context.GetRuntimeContext()
 	metering := context.GetMeteringContext()
-	blockchain := context.GetBlockchainContext()
 	managedType := context.GetManagedTypesContext()
+	host := context.GetVMHost()
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetExternalBalance
-	metering.UseGasAndAddTracedGas(managedGetKDABalanceName, gasToUse)
-
-	address, err := managedType.GetBytes(addressHandle)
+	_, kdaToken, err := loadKDAToken(host, managedGetKDABalanceName, gasToUse, addressHandle, tokenIDHandle, nonce)
 	if err != nil {
-		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
-	}
-	tokenID, err := managedType.GetBytes(tokenIDHandle)
-	if err != nil {
-		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
-	}
-
-	_, kdaToken, err := blockchain.GetKDAToken(address, tokenID, uint64(nonce)) // #nosec G115
-	if err != nil {
-		_ = context.WithFault(vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
 		return
 	}
 
@@ -405,30 +597,50 @@ func ManagedGetKDARolesWithHost(
 	host vmhost.VMHost,
 	tickerHandle int32,
 	rolesHandle int32) {
-	runtime := host.Runtime()
 	metering := host.Metering()
 	blockchain := host.Blockchain()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedGetKDARolesName)
-
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetKDARoles
-	metering.UseAndTraceGas(gasToUse)
-
-	ticker, err := managedType.GetBytes(tickerHandle)
+	err := startTracingAndUseGas(host, managedGetKDARolesName, gasToUse)
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
+		return
+	}
+
+	ticker, err := loadMBufferBytes(host, tickerHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
+	if err != nil {
+		faultKDAArg(host, err)
 		return
 	}
 
 	kda, _, err := blockchain.GetKDAToken(nil, ticker, 0)
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
 		return
 	}
 
-	roles := writeRolesToBytes(managedType, kda.Roles)
+	// read without an address, so only the KDAData was decoded and only it is paid for
+	err = chargeKDATokenDecode(host, kda, nil)
+	if err != nil {
+		faultKDAArg(host, err)
+		return
+	}
+
+	// from FixAuditChangesV6 the roles are paid for, bounded, before they are written: the amount
+	// charged while and after writing them before the fork, which is then not charged again
+	chargeAfter := managedType
+	if host.ForkController().FixAuditChangesV6() {
+		err = managedType.ConsumeGasForByteLenBounded(rolesChargedLen(kda.Roles))
+		if err != nil {
+			faultKDAArg(host, err)
+			return
+		}
+		chargeAfter = unchargedManagedTypes{managedType}
+	}
+
+	roles := writeRolesToBytes(chargeAfter, kda.Roles)
 	managedType.SetBytes(rolesHandle, roles)
-	managedType.ConsumeGasForBytes(roles)
+	chargeAfter.ConsumeGasForBytes(roles)
 }
 
 func ManagedGetUserKDAWithHost(
@@ -438,30 +650,28 @@ func ManagedGetUserKDAWithHost(
 	nonce int64,
 	balanceHandle, frozenHandle, lastClaimHandle, bucketsHandle, mimeHandle, metadataHandle int32) {
 
-	runtime := host.Runtime()
 	metering := host.Metering()
-	blockchain := host.Blockchain()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedGetUserKDAName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetUserKDA
-	metering.UseAndTraceGas(gasToUse)
-
-	address, err := managedType.GetBytes(addressHandle)
+	_, userKDA, err := loadKDAToken(host, managedGetUserKDAName, gasToUse, addressHandle, tickerHandle, nonce)
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
-	}
-	ticker, err := managedType.GetBytes(tickerHandle)
-	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
 		return
 	}
 
-	_, userKDA, err := blockchain.GetKDAToken(address, ticker, uint64(nonce)) // #nosec G115
-	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
+	// from FixAuditChangesV6 the buckets, MIME and metadata are paid for, bounded, before any output is
+	// written: the amounts charged while and after writing them before the fork, which are then not
+	// charged again
+	chargeAfter := managedType
+	if host.ForkController().FixAuditChangesV6() {
+		outputLen := math.AddUint64(userBucketsChargedLen(userKDA.Buckets), uint64(len(userKDA.MIME)+len(userKDA.Metadata)))
+		err = managedType.ConsumeGasForByteLenBounded(outputLen)
+		if err != nil {
+			faultKDAArg(host, err)
+			return
+		}
+		chargeAfter = unchargedManagedTypes{managedType}
 	}
 
 	managedType.GetBigIntOrCreate(balanceHandle).Set(big.NewInt(int64(userKDA.Balance)))
@@ -470,14 +680,14 @@ func ManagedGetUserKDAWithHost(
 	lastClaim := writeLastClaim(managedType, userKDA.LastClaim)
 	managedType.SetBytes(lastClaimHandle, lastClaim)
 
-	buckets := writeUserBuckets(managedType, userKDA.Buckets)
+	buckets := writeUserBuckets(chargeAfter, userKDA.Buckets)
 	managedType.SetBytes(bucketsHandle, buckets)
-	managedType.ConsumeGasForBytes(buckets)
+	chargeAfter.ConsumeGasForBytes(buckets)
 
 	managedType.SetBytes(mimeHandle, userKDA.MIME)
-	managedType.ConsumeGasForBytes(userKDA.MIME)
+	chargeAfter.ConsumeGasForBytes(userKDA.MIME)
 	managedType.SetBytes(metadataHandle, userKDA.Metadata)
-	managedType.ConsumeGasForBytes(userKDA.Metadata)
+	chargeAfter.ConsumeGasForBytes(userKDA.Metadata)
 }
 
 func ManagedGetKDATokenDataWithHost(
@@ -486,30 +696,32 @@ func ManagedGetKDATokenDataWithHost(
 	tickerHandle int32,
 	nonce int64,
 	precisionHandle, idHandle, nameHandle, creatorHandle, adminHandle, logoHandle, urisHandle, initialSupplyHandle, circulatingSupplyHandle, maxSupplyHandle, mintedHandle, burnedHandle, royaltiesHandle, propertiesHandle, attributesHandle, rolesHandle, issueDateHandle int32) {
-	runtime := host.Runtime()
 	metering := host.Metering()
-	blockchain := host.Blockchain()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedGetKDATokenDataName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetKDATokenData
-	metering.UseAndTraceGas(gasToUse)
-
-	address, err := managedType.GetBytes(addressHandle)
+	kda, _, err := loadKDAToken(host, managedGetKDATokenDataName, gasToUse, addressHandle, tickerHandle, nonce)
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
-	}
-	ticker, err := managedType.GetBytes(tickerHandle)
-	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
 		return
 	}
 
-	kda, _, err := blockchain.GetKDAToken(address, ticker, uint64(nonce)) // #nosec G115
-	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
-		return
+	// from FixAuditChangesV6 every byte output is paid for, bounded, before any output is written: the
+	// logo, royalties, roles and URIs for the amounts charged while and after writing them before the
+	// fork, which are then not charged again, and the id, name, creator and admin, which were written
+	// for free before it (KLC-2755)
+	chargeAfter := managedType
+	if host.ForkController().FixAuditChangesV6() {
+		outputLen := uint64(len(kda.ID) + len(kda.Name) + len(kda.OwnerAddress) + len(kda.AdminAddress) + len(kda.Logo))
+		outputLen = math.AddUint64(outputLen, royaltiesChargedLen(kda.Royalties))
+		outputLen = math.AddUint64(outputLen, rolesChargedLen(kda.Roles))
+		outputLen = math.AddUint64(outputLen, urisChargedLen(kda.URIs))
+		err = managedType.ConsumeGasForByteLenBounded(outputLen)
+		if err != nil {
+			faultKDAArg(host, err)
+			return
+		}
+		chargeAfter = unchargedManagedTypes{managedType}
 	}
 
 	managedType.GetBigIntOrCreate(precisionHandle).Set(big.NewInt(int64(kda.Precision)))
@@ -518,7 +730,7 @@ func ManagedGetKDATokenDataWithHost(
 	managedType.SetBytes(creatorHandle, kda.OwnerAddress)
 	managedType.SetBytes(adminHandle, kda.AdminAddress)
 	managedType.SetBytes(logoHandle, []byte(kda.Logo))
-	managedType.ConsumeGasForBytes([]byte(kda.Logo))
+	chargeAfter.ConsumeGasForBytes([]byte(kda.Logo))
 
 	managedType.GetBigIntOrCreate(initialSupplyHandle).Set(big.NewInt(int64(kda.InitialSupply)))
 	managedType.GetBigIntOrCreate(circulatingSupplyHandle).Set(big.NewInt(int64(kda.CirculatingSupply)))
@@ -527,20 +739,20 @@ func ManagedGetKDATokenDataWithHost(
 	managedType.GetBigIntOrCreate(burnedHandle).Set(big.NewInt(int64(kda.BurnedValue)))
 	managedType.GetBigIntOrCreate(issueDateHandle).Set(big.NewInt(int64(kda.IssueDate)))
 
-	royalties := writeRoyaltiesToBytes(managedType, kda.Royalties)
+	royalties := writeRoyaltiesToBytes(chargeAfter, kda.Royalties)
 	managedType.SetBytes(royaltiesHandle, royalties)
-	managedType.ConsumeGasForBytes(royalties)
+	chargeAfter.ConsumeGasForBytes(royalties)
 
 	managedType.GetBigIntOrCreate(propertiesHandle).Set(big.NewInt(int64(getPropertiesValue(kda.Properties, int32(kda.AssetType)))))
 	managedType.GetBigIntOrCreate(attributesHandle).Set(big.NewInt(int64(getAttributesValue(kda.Attributes))))
 
-	roles := writeRolesToBytes(managedType, kda.Roles)
+	roles := writeRolesToBytes(chargeAfter, kda.Roles)
 	managedType.SetBytes(rolesHandle, roles)
-	managedType.ConsumeGasForBytes(roles)
+	chargeAfter.ConsumeGasForBytes(roles)
 
-	uris := writeURIsToBytes(managedType, kda.URIs)
+	uris := writeURIsToBytes(chargeAfter, kda.URIs)
 	managedType.SetBytes(urisHandle, uris)
-	managedType.ConsumeGasForBytes(uris)
+	chargeAfter.ConsumeGasForBytes(uris)
 }
 
 // ManagedUpgradeFromSourceContract VMHooks implementation.
@@ -557,11 +769,12 @@ func (context *VMHooksImpl) ManagedUpgradeFromSourceContract(
 	host := context.GetVMHost()
 	runtime := host.Runtime()
 	metering := host.Metering()
-	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedUpgradeFromSourceContractName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.CreateContract
-	metering.UseAndTraceGas(gasToUse)
+	err := startTracingAndUseGas(host, managedUpgradeFromSourceContractName, gasToUse)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
 
 	vmInput, err := readDestinationValueArguments(host, destHandle, valueHandle, argumentsHandle)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
@@ -573,12 +786,22 @@ func (context *VMHooksImpl) ManagedUpgradeFromSourceContract(
 		return
 	}
 
-	sourceContractAddress, err := managedType.GetBytes(addressHandle)
+	// the source is an address, which ManagedDeployFromSourceContract and the memory path both read
+	// as at most AddressLen bytes, so from FixAuditChangesV6 a longer one is rejected before it is
+	// cloned, as they reject theirs
+	err = checkMBufferMaxLength(host, addressHandle, vmhost.ErrInvalidArgument, vmhost.AddressLen)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
+	sourceContractAddress, err := host.ManagedTypes().GetBytes(addressHandle)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
 	}
 
-	codeMetadata, err := managedType.GetBytes(codeMetadataHandle)
+	// the code metadata is paid for before it is cloned from FixAuditChangesV6, as the managed
+	// deploy hooks pay for theirs: it is whatever buffer the contract passes, and was cloned for
+	// free before
+	codeMetadata, err := loadMBufferBytes(host, codeMetadataHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
 	}
@@ -594,7 +817,8 @@ func (context *VMHooksImpl) ManagedUpgradeFromSourceContract(
 		gas,
 		codeMetadata,
 	)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution())
 }
 
 // ManagedUpgradeContract VMHooks implementation.
@@ -611,11 +835,12 @@ func (context *VMHooksImpl) ManagedUpgradeContract(
 	host := context.GetVMHost()
 	runtime := host.Runtime()
 	metering := host.Metering()
-	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedUpgradeContractName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.CreateContract
-	metering.UseAndTraceGas(gasToUse)
+	err := startTracingAndUseGas(host, managedUpgradeContractName, gasToUse)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
 
 	vmInput, err := readDestinationValueArguments(host, destHandle, valueHandle, argumentsHandle)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
@@ -627,16 +852,17 @@ func (context *VMHooksImpl) ManagedUpgradeContract(
 		return
 	}
 
-	codeMetadata, err := managedType.GetBytes(codeMetadataHandle)
+	// the code metadata and the code are paid for before they are cloned from FixAuditChangesV6, as
+	// the managed deploy hooks pay for theirs: both are whatever buffer the contract passes, and were
+	// cloned for free before. The code is priced as a copy, not compiled: the nested upgrade call
+	// charges CompilePerByte for it itself, in DeductInitialGasForIndirectDeployment
+	dataCopyPerByte := metering.GasSchedule().BaseOperationCost.DataCopyPerByte
+	codeMetadata, err := loadMBufferBytes(host, codeMetadataHandle, 0, dataCopyPerByte)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
 	}
 
-	code, err := managedType.GetBytes(codeHandle)
-	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
-		return
-	}
-
+	code, err := loadMBufferBytes(host, codeHandle, 0, dataCopyPerByte)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return
 	}
@@ -644,7 +870,8 @@ func (context *VMHooksImpl) ManagedUpgradeContract(
 	lenReturnData := len(host.Output().ReturnData())
 
 	upgradeContract(host, vmInput.destination, code, codeMetadata, vmInput.value.Bytes(), vmInput.arguments, gas)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution())
 }
 
 // ManagedDeleteContract VMHooks implementation.
@@ -676,6 +903,12 @@ func ManagedDeleteContractWithHost(
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.CreateContract
 	metering.UseAndTraceGas(gasToUse)
+
+	// the destination is an address; post-fork a longer one is rejected before it is cloned
+	err := checkMBufferMaxLength(host, destHandle, vmhost.ErrInvalidArgument, vmhost.AddressLen)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
 
 	calledSCAddress, err := managedType.GetBytes(destHandle)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
@@ -710,17 +943,21 @@ func (context *VMHooksImpl) ManagedDeployFromSourceContract(
 	runtime := host.Runtime()
 	metering := host.Metering()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedDeployFromSourceContractName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.CreateContract
-	metering.UseAndTraceGas(gasToUse)
+	err := startTracingAndUseGas(host, managedDeployFromSourceContractName, gasToUse)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return 1
+	}
 
 	vmInput, err := readDestinationValueArguments(host, addressHandle, valueHandle, argumentsHandle)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 1
 	}
 
-	codeMetadata, err := managedType.GetBytes(codeMetadataHandle)
+	// paid for before it is cloned from FixAuditChangesV6, like the code buffer: the managed hooks
+	// take whatever buffer the contract passes, where the legacy ones read a fixed CodeMetadataLen
+	codeMetadata, err := loadMBufferBytes(host, codeMetadataHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 1
 	}
@@ -740,7 +977,10 @@ func (context *VMHooksImpl) ManagedDeployFromSourceContract(
 	}
 
 	managedType.SetBytes(resultAddressHandle, newAddress)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return 1
+	}
 
 	return 0
 }
@@ -760,10 +1000,12 @@ func (context *VMHooksImpl) ManagedCreateContract(
 	runtime := host.Runtime()
 	metering := host.Metering()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedCreateContractName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.CreateContract
-	metering.UseAndTraceGas(gasToUse)
+	err := startTracingAndUseGas(host, managedCreateContractName, gasToUse)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return 1
+	}
 
 	sender := runtime.GetContextAddress()
 	value, err := managedType.GetBigInt(valueHandle)
@@ -776,15 +1018,23 @@ func (context *VMHooksImpl) ManagedCreateContract(
 		return 1
 	}
 
-	gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, actualLen)
-	metering.UseAndTraceGas(gasToUse)
+	// pre-fork the arguments were charged per byte a second time here, on top of the decode;
+	// post-fork the decode's charge is the only one
+	if !host.ForkController().FixAuditChangesV6() {
+		gasToUse = math.MulUint64(metering.GasSchedule().BaseOperationCost.DataCopyPerByte, actualLen)
+		metering.UseAndTraceGas(gasToUse)
+	}
 
-	codeMetadata, err := managedType.GetBytes(codeMetadataHandle)
+	// paid for before it is cloned from FixAuditChangesV6, like the code buffer: the managed hooks
+	// take whatever buffer the contract passes, where the legacy ones read a fixed CodeMetadataLen
+	codeMetadata, err := loadMBufferBytes(host, codeMetadataHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 1
 	}
 
-	code, err := managedType.GetBytes(codeHandle)
+	// from FixAuditChangesV6 the deployment's per-byte cost is charged here, before the buffer is
+	// cloned and before the BoundGasLimit inside createContract, instead of inside CreateNewContract
+	code, err := loadMBufferBytes(host, codeHandle, 0, metering.GasSchedule().BaseOperationCost.CompilePerByte)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return 1
 	}
@@ -796,22 +1046,28 @@ func (context *VMHooksImpl) ManagedCreateContract(
 	}
 
 	managedType.SetBytes(resultAddressHandle, newAddress)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return 1
+	}
 
 	return 0
 }
 
+// setReturnDataIfExists writes the return data the call added after oldLen into resultHandle as a
+// managed vector. From FixAuditChangesV6 the conversion is charged per item, bounded, and fails
+// with ErrNotEnoughGas instead of making handles it cannot pay for.
 func setReturnDataIfExists(
 	host vmhost.VMHost,
 	oldLen int,
 	resultHandle int32,
-) {
+) error {
 	returnData := host.Output().ReturnData()
 	if len(returnData) > oldLen {
-		host.ManagedTypes().WriteManagedVecOfManagedBuffers(returnData[oldLen:], resultHandle)
-	} else {
-		host.ManagedTypes().SetBytes(resultHandle, make([]byte, 0))
+		return host.ManagedTypes().WriteManagedVecOfManagedBuffers(returnData[oldLen:], resultHandle)
 	}
+	host.ManagedTypes().SetBytes(resultHandle, make([]byte, 0))
+	return nil
 }
 
 // ManagedExecuteReadOnly VMHooks implementation.
@@ -840,7 +1096,10 @@ func (context *VMHooksImpl) ManagedExecuteReadOnly(
 		vmInput.destination,
 		vmInput.arguments,
 	)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	if WithFaultAndHost(host, err, host.Runtime().BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
 	return returnVal
 }
 
@@ -872,7 +1131,10 @@ func (context *VMHooksImpl) ManagedExecuteOnSameContext(
 		vmInput.destination,
 		vmInput.arguments,
 	)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	if WithFaultAndHost(host, err, host.Runtime().BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
 	return returnVal
 }
 
@@ -904,7 +1166,10 @@ func (context *VMHooksImpl) ManagedExecuteOnDestContext(
 		vmInput.destination,
 		vmInput.arguments,
 	)
-	setReturnDataIfExists(host, lenReturnData, resultHandle)
+	err = setReturnDataIfExists(host, lenReturnData, resultHandle)
+	if WithFaultAndHost(host, err, host.Runtime().BaseOpsErrorShouldFailExecution()) {
+		return -1
+	}
 	return returnVal
 }
 
@@ -918,7 +1183,6 @@ func (context *VMHooksImpl) ManagedMultiTransferKDANFTExecute(
 	argumentsHandle int32,
 ) int32 {
 	host := context.GetVMHost()
-	managedType := host.ManagedTypes()
 	runtime := host.Runtime()
 	metering := host.Metering()
 	metering.StartGasTracing(managedMultiTransferKDANFTExecuteName)
@@ -928,7 +1192,7 @@ func (context *VMHooksImpl) ManagedMultiTransferKDANFTExecute(
 		return -1
 	}
 
-	transfers, err := readKDATransfers(managedType, tokenTransfersHandle)
+	transfers, err := readKDATransfers(host, tokenTransfersHandle)
 	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
 		return -1
 	}
@@ -1024,11 +1288,23 @@ func ManagedGetCodeMetadataWithHost(host vmhost.VMHost, addressHandle int32, res
 	metering := host.Metering()
 	managedType := host.ManagedTypes()
 
-	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetCodeMetadata
-	metering.UseGasAndAddTracedGas(managedGetCodeMetadataName, gasToUse)
+	// from FixAuditChangesV6 the flat gas is bounded, and the address is charged per byte before
+	// it is cloned. It is still looked up whatever its length: an account can live under an
+	// address that is not vmhost.AddressLen long. A missing handle is not charged, so the clone
+	// reports it as before the fork
+	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetCodeMetadata +
+		metering.GasSchedule().ManagedBufferAPICost.MBufferSetBytes
+	err := startTracingAndUseGas(host, managedGetCodeMetadataName, gasToUse)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return
+	}
 
-	gasToUse = metering.GasSchedule().ManagedBufferAPICost.MBufferSetBytes
-	metering.UseGasAndAddTracedGas(managedGetCodeMetadataName, gasToUse)
+	if host.ForkController().FixAuditChangesV6() {
+		err = consumeGasForBufferLenBounded(managedType, addressHandle)
+		if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return
+		}
+	}
 
 	mBuffAddress, err := managedType.GetBytes(addressHandle)
 	if err != nil {
@@ -1054,10 +1330,10 @@ func (context *VMHooksImpl) ManagedIsBuiltinFunction(functionNameHandle int32) i
 	return ManagedIsBuiltinFunctionWithHost(host, functionNameHandle)
 }
 
-// maxBuiltinFunctionNameLength mirrors maxLengthOfFunctionName (contexts/validator.go),
-// the existing protocol limit for contract-exported function names - a built-in function
-// name is the same kind of identifier and can never legitimately exceed it. Uses >=, not >,
-// to actually mirror it: validator.go rejects at exactly 256, so a real maximum is 255.
+// maxBuiltinFunctionNameLength is vmhost.MaxFunctionNameLength, the protocol limit that
+// verifyValidFunctionName (contexts/validator.go) puts on contract-exported function names - a
+// built-in function name is the same kind of identifier and can never legitimately exceed it.
+// Uses >=, not >, to actually mirror it: validator.go rejects at exactly 256, so a real maximum is 255.
 //
 // The >= vs > distinction is cosmetic rather than consensus-observable. Since this hook now
 // returns 0 instead of reverting, both spellings produce the same result and the same gas at
@@ -1065,7 +1341,7 @@ func (context *VMHooksImpl) ManagedIsBuiltinFunction(functionNameHandle int32) i
 // capped gas but would GetBytes (clone), convert to string, and map-lookup; >= skips all three.
 // CapsGas cannot pin the spelling without asserting on that implementation detail - see
 // TestManagedIsBuiltinFunctionWithHost_CapsGasAndReturnsFalseAboveMax.
-const maxBuiltinFunctionNameLength = 256
+const maxBuiltinFunctionNameLength = vmhost.MaxFunctionNameLength
 
 func ManagedIsBuiltinFunctionWithHost(host vmhost.VMHost, functionNameHandle int32) int32 {
 	runtime := host.Runtime()
@@ -1151,28 +1427,43 @@ func ManagedGetSftMetadataWithHost(
 	nonce int64,
 	dataHandle int32,
 ) {
-	runtime := host.Runtime()
 	metering := host.Metering()
 	blockchain := host.Blockchain()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedGetSftMetadataName)
 
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.GetSFTMetadata
-	metering.UseAndTraceGas(gasToUse)
-
-	ticker, err := managedType.GetBytes(tickerHandle)
+	err := startTracingAndUseGas(host, managedGetSftMetadataName, gasToUse)
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
+		return
+	}
+
+	ticker, err := loadMBufferBytes(host, tickerHandle, 0, metering.GasSchedule().BaseOperationCost.DataCopyPerByte)
+	if err != nil {
+		faultKDAArg(host, err)
 		return
 	}
 
 	meta, err := blockchain.GetSFTMeta(ticker, uint64(nonce)) // #nosec G115
 	if err != nil {
-		_ = WithFaultAndHost(host, vmhost.ErrArgOutOfRange, runtime.BaseOpsErrorShouldFailExecution())
+		faultKDAArg(host, err)
 		return
 	}
 
-	metadata := writeSFTMeta(managedType, meta)
+	// from FixAuditChangesV6 the name, hash and attributes are paid for, bounded, before they are
+	// written: the amount writeSFTMeta charged while writing them before the fork, which it then does
+	// not charge again
+	chargeAfter := managedType
+	if host.ForkController().FixAuditChangesV6() {
+		err = managedType.ConsumeGasForByteLenBounded(sftMetaChargedLen(meta))
+		if err != nil {
+			faultKDAArg(host, err)
+			return
+		}
+		chargeAfter = unchargedManagedTypes{managedType}
+	}
+
+	metadata := writeSFTMeta(chargeAfter, meta)
 	managedType.SetBytes(dataHandle, metadata)
 }
 
@@ -1199,11 +1490,20 @@ func ManagedAccHasPermWithHost(
 	metering := host.Metering()
 	blockchain := host.Blockchain()
 	managedType := host.ManagedTypes()
-	metering.StartGasTracing(managedAccHasPermName)
 
+	// from FixAuditChangesV6 the flat gas is bounded, and each address is charged per byte right
+	// before it is cloned, the source first, so a missing source handle is never charged the target;
+	// an unknown source account still is, as it is looked up after both clones, where it always was.
+	// Both are still answered whatever their length: an account can live under an address that is
+	// not vmhost.AddressLen long. A missing handle is not charged, so the clone reports it as
+	// before the fork
 	gasToUse := metering.GasSchedule().BaseOpsAPICost.Int64Finish +
 		metering.GasSchedule().BaseOpsAPICost.GetOwnerAddress
-	metering.UseAndTraceGas(gasToUse)
+	err := startTracingAndUseGas(host, managedAccHasPermName, gasToUse)
+	if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+		return 0
+	}
+	fixAuditChangesV6 := host.ForkController().FixAuditChangesV6()
 
 	// check if valid ops
 	if ops < 0 {
@@ -1215,6 +1515,13 @@ func ManagedAccHasPermWithHost(
 		return 0
 	}
 
+	if fixAuditChangesV6 {
+		err = consumeGasForBufferLenBounded(managedType, sourceAccAddr)
+		if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return 0
+		}
+	}
+
 	srcAddBytes, err := managedType.GetBytes(sourceAccAddr)
 	if err != nil {
 		_ = WithFaultAndHost(
@@ -1223,6 +1530,13 @@ func ManagedAccHasPermWithHost(
 			runtime.BaseOpsErrorShouldFailExecution(),
 		)
 		return 0
+	}
+
+	if fixAuditChangesV6 {
+		err = consumeGasForBufferLenBounded(managedType, targetAccAddr)
+		if WithFaultAndHost(host, err, runtime.BaseOpsErrorShouldFailExecution()) {
+			return 0
+		}
 	}
 
 	tgtAddBytes, err := managedType.GetBytes(targetAccAddr)

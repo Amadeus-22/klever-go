@@ -49,19 +49,26 @@ func consumeGasForBuffersBounded(host vmhost.VMHost, mBufferHandles ...int32) er
 
 	managedType := host.ManagedTypes()
 	for _, mBufferHandle := range mBufferHandles {
-		length := managedType.GetLength(mBufferHandle)
-		if length <= 0 {
-			continue
-		}
-
-		// #nosec G115
-		err := managedType.ConsumeGasForByteLenBounded(uint64(length))
+		err := consumeGasForBufferLenBounded(managedType, mBufferHandle)
 		if err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// consumeGasForBufferLenBounded charges the per-byte copy of the buffer at mBufferHandle before
+// it is cloned, returning ErrNotEnoughGas instead of overdrawing. A missing handle charges
+// nothing and is left for the following GetBytes to report.
+func consumeGasForBufferLenBounded(managedType vmhost.ManagedTypesContext, mBufferHandle int32) error {
+	length := managedType.GetLength(mBufferHandle)
+	if length <= 0 {
+		return nil
+	}
+
+	// #nosec G115
+	return managedType.ConsumeGasForByteLenBounded(uint64(length))
 }
 
 // validateCappedLength rejects a caller-supplied length that is negative or above the
@@ -725,6 +732,14 @@ func (context *VMHooksImpl) MBufferToBigFloat(mBufferHandle, bigFloatHandle int3
 		return 1
 	}
 
+	// reject by length before the bytes are copied or decoded: GobDecode would keep trailing
+	// zero padding as extra mantissa words
+	if context.host.ForkController().FixAuditChangesV6() &&
+		managedType.EncodedBigFloatLenIsNotValid(managedType.GetLength(mBufferHandle)) {
+		_ = context.WithFault(vmhost.ErrBigFloatNonCanonicalEncoding, runtime.BigFloatAPIErrorShouldFailExecution())
+		return 1
+	}
+
 	managedBuffer, err := managedType.GetBytes(mBufferHandle)
 	if context.WithFault(err, runtime.ManagedBufferAPIErrorShouldFailExecution()) {
 		return 1
@@ -788,6 +803,10 @@ func (context *VMHooksImpl) MBufferFromBigFloat(mBufferHandle, bigFloatHandle in
 	value, err := managedType.GetBigFloat(bigFloatHandle)
 	if context.WithFault(err, runtime.BigFloatAPIErrorShouldFailExecution()) {
 		return 1
+	}
+
+	if context.host.ForkController().FixAuditChangesV6() {
+		value = new(big.Float).Set(value)
 	}
 
 	encodedFloat, err := value.GobEncode()

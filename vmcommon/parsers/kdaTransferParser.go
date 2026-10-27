@@ -54,19 +54,24 @@ func (e *kdaTransferParser) parseMultiKDANFTTransfer(rcvAddr []byte, args [][]by
 		CallFunction: "",
 	}
 
-	numOfTransfer := big.NewInt(0).SetBytes(args[0])
+	countArgument := args[0]
 	startIndex := uint64(1)
 	isTxAtSender := false
 
-	isFirstArgumentAnAddress := len(args[0]) == len(rcvAddr) && !numOfTransfer.IsUint64()
+	isFirstArgumentAnAddress := len(args[0]) == len(rcvAddr) && !big.NewInt(0).SetBytes(args[0]).IsUint64()
 	if isFirstArgumentAnAddress {
 		kdaTransfers.RcvAddr = args[0]
-		numOfTransfer.SetBytes(args[1])
+		countArgument = args[1]
 		startIndex = 2
 		isTxAtSender = true
 	}
 
-	minLenArgs := ArgsPerTransfer*numOfTransfer.Uint64() + startIndex
+	numOfTransfer := vmcommon.Argument(countArgument).Uint64()
+	if numOfTransfer > uint64(len(args))/ArgsPerTransfer {
+		return nil, ErrNotEnoughArguments
+	}
+
+	minLenArgs := ArgsPerTransfer*numOfTransfer + startIndex
 	if uint64(len(args)) < minLenArgs {
 		return nil, ErrNotEnoughArguments
 	}
@@ -79,8 +84,8 @@ func (e *kdaTransferParser) parseMultiKDANFTTransfer(rcvAddr []byte, args [][]by
 	}
 
 	var err error
-	kdaTransfers.KDATransfers = make([]*vmcommon.KDATransfer, numOfTransfer.Uint64())
-	for i := uint64(0); i < numOfTransfer.Uint64(); i++ {
+	kdaTransfers.KDATransfers = make([]*vmcommon.KDATransfer, numOfTransfer)
+	for i := uint64(0); i < numOfTransfer; i++ {
 		tokenStartIndex := startIndex + i*ArgsPerTransfer
 		kdaTransfers.KDATransfers[i], err = e.createNewKDATransfer(tokenStartIndex, args, isTxAtSender)
 		if err != nil {
@@ -96,11 +101,16 @@ func (e *kdaTransferParser) createNewKDATransfer(
 	args [][]byte,
 	isTxAtSender bool,
 ) (*vmcommon.KDATransfer, error) {
+	nonce := big.NewInt(0).SetBytes(args[tokenStartIndex+1])
+	if !nonce.IsUint64() {
+		return nil, ErrNonceOutOfRange
+	}
+
 	kdaTransfer := &vmcommon.KDATransfer{
 		KDAValue:      big.NewInt(0).SetBytes(args[tokenStartIndex+2]),
 		KDATokenName:  args[tokenStartIndex],
 		KDATokenType:  uint32(core.Fungible),
-		KDATokenNonce: big.NewInt(0).SetBytes(args[tokenStartIndex+1]).Uint64(),
+		KDATokenNonce: nonce.Uint64(),
 	}
 	if kdaTransfer.KDATokenNonce > 0 {
 		kdaTransfer.KDATokenType = uint32(core.NonFungible)
