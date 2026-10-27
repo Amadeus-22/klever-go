@@ -984,21 +984,27 @@ func (sc *scProcessor) checkUpgradePermission(contract state.UserAccountHandler,
 	if !isUpgradeCalled {
 		return nil
 	}
-	if check.IfNil(contract) {
-		return process.ErrUpgradeNotAllowed
+	// Only the code metadata decides "is a contract" here: an account that was
+	// never deployed to has none, and a deleted contract keeps its metadata so it
+	// is still recognised. The account itself is never nil at this point; the
+	// callers load it with GetExistingUser and prepareExecution rejects nil first.
+	if len(contract.GetCodeMetadata()) == 0 {
+		return process.ErrUpgradeContractNotFound
 	}
 
+	// Each refusal names its own cause so an owner upgrading a non-upgradeable
+	// contract is not sent looking at keys. Not-upgradeable is checked before
+	// ownership because it is the condition no caller can work around.
 	codeMetadata := vmcommon.CodeMetadataFromBytes(contract.GetCodeMetadata())
-	isUpgradeable := codeMetadata.Upgradeable
-	callerAddress := vmInput.CallerAddr
-	ownerAddress := contract.GetOwnerAddress()
-	isCallerOwner := bytes.Equal(callerAddress, ownerAddress)
-
-	if isUpgradeable && isCallerOwner {
-		return nil
+	if !codeMetadata.Upgradeable {
+		return process.ErrUpgradeContractNotUpgradeable
 	}
 
-	return process.ErrUpgradeNotAllowed
+	if !bytes.Equal(vmInput.CallerAddr, contract.GetOwnerAddress()) {
+		return process.ErrUpgradeCallerNotOwner
+	}
+
+	return nil
 }
 
 func (sc *scProcessor) createCompleteEventLogIfNoMoreAction(
